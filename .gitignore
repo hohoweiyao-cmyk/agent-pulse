@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+macos/.build/
+macos/.swiftpm/
+dist/
+*.app/
+*.icns
+*.iconset/
+*.log
+.env
+.env.*
+docs/versions/
