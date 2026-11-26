@@ -28,7 +28,7 @@ flowchart LR
     subgraph App["Native macOS App (SwiftUI + AppKit)"]
         STORE["ClockStore\nFast 15s · Slow 300s · UI 1s"]
         WIDGET["Desktop HUD Widget\n340pt / 276pt · 3 Layers"]
-        POP["Menu Bar + 4-Tab Popover\nOverview / Quotas / History / Settings"]
+        POP["Menu Bar + 5-Tab Popover\nDetails / Dashboard / Projects / Quotas / Settings"]
         SIT["SitReminderManager\nSleep-Aware Notifications"]
     end
 
@@ -47,8 +47,8 @@ flowchart LR
 | Track | Cadence | Target Latency | Scope | Failure Strategy |
 |---|---:|---:|---|---|
 | **UI Tick** | `1s` (in-memory) | `< 1 ms` | Live agent timers `+1s`, sit reminder countdown `-1s` | Zero I/O |
-| **Fast Track** | `15s` (100% local) | `< 200 ms` | Work hours, live active detection, incremental tokens/cost, ledger update | Keep previous snapshot; never blank UI |
-| **Slow Track** | `300s` (or manual) | `< 3 s` | Subscription quotas (Codex API/JSONL, Claude statusline/Desktop cache, snapshots) | Silent fallback to cached reading + stale status |
+| **Fast Track** | `15s` (local) | `< 200 ms` warm-cache target | Work hours, live active detection, incremental tokens/cost, ledger update | Retain the last snapshot and surface refresh errors |
+| **Slow Track** | `300s` (or manual) | `< 3 s` network timeout | Local subscription snapshots and opt-in Codex API | Keep the last successful result and show errors or stale state |
 
 ---
 
@@ -96,27 +96,31 @@ When T3 Code runs Codex as a provider, Codex still writes session JSONL files un
 Newer Codex builds can emit both `token_usage_record` (per-response usage + `response_id`) and legacy `event_msg` (`token_count` cumulative snapshots) inside the same JSONL file. `usage_collector.py`:
 - Tracks `response_id` within a file to ignore duplicate records.
 - Tracks cumulative `prev_total` tuples `(input, cached, cache_write, output, reasoning)` to compute exact deltas and skip echoed snapshots regardless of whether old or new events appear first.
+- When a response has a delta and lacks cumulative counters, pairs it with at most one legacy event in the same turn and model with identical counts within two seconds. Compressed archives and duplicate IDs across separate files are outside this parser's coverage.
 
 ### Ledger Reconciliation (`~/.agent-pulse/ledger.json`)
 
-`engine/ledger.py` keeps two separate namespaces:
+`engine/ledger.py` keeps separate namespaces:
 - `imported_tools`: Historical daily totals migrated from Tokei (`scripts/import_tokei.py`).
 - `live_tools`: Daily totals incrementally computed by AgentPulse.
+- `work_days`: Daily work-hour summaries. An initial scan attempts up to 182 days of recoverable history. Subsequent scans store new summaries and carry old ones forward.
 
 Reconciliation order (`_reconcile_merged_tools`):
-1. Start from `imported_tools` (skipping imported `codex` on any day that already has live `codex` or `t3_codex` records).
-2. Overlay persisted `live_tools` (preserves live days older than the 14-day active scan window).
-3. Overlay fresh `live_usage` (authoritative for the active scan window).
+1. Overlay fresh observations on previously recorded native usage.
+2. Prefer the imported summary when the native total for an overlapping day is smaller. For Codex, compare Tokei against the combined native Codex and T3 Codex total.
+3. On equal or greater native coverage, use the native buckets. The comparison is a conservative heuristic because imported aggregates lack per-response identifiers.
+
+Writers lock the ledger across the read–modify–write cycle. A successful transaction uses a uniquely named temporary file and retains the previous ledger in `ledger.previous.json`. Corrupt JSON is preserved for recovery. A legacy day with an invalid date is omitted from aggregation and reported in ledger metadata.
 
 ---
 
 ## 4. Caching & SQLite Safety
 
 - **JSONL Incremental Caches**:
-  - Work hours: `~/.agent-pulse/cache.json` (`CACHE_VERSION = 3`), keyed by `file_path -> (mtime_ns, size)`. Files modified within the last `105s` bypass cache to ensure real-time accuracy.
-  - Token usage: `~/.agent-pulse/usage_cache.json` (`USAGE_CACHE_VERSION = 2`), keyed by `file_path -> (mtime_ns, size)`.
-- **SQLite WAL-Safe Snapshots**:
-  - `open_sqlite_readonly_snapshot()` copies `<db>`, `<db>-wal`, and `<db>-shm` into a private `tempfile.mkdtemp()` folder, opens it read-only, runs queries, closes the handle, and removes the temp directory in a `finally` block.
+  - Work hours: `cache.json` uses hashed paths, file modification time and size. It stores intervals without session titles.
+  - Token usage: `usage_cache.json` also fingerprints the resolved pricing table. Both caches discard entries outside the files visited by the scan.
+- **SQLite Snapshots**:
+  - `sqlite_snapshot()` copies the database and WAL into a private temporary directory. If file identity changes during the copy, it retries once and can skip an unstable source. SQLite opens only the private result, using read-only mode.
 
 ---
 

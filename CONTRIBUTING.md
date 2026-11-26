@@ -6,7 +6,7 @@ Thank you for your interest in contributing to **AgentPulse**! Contributions of 
 
 Before opening a PR, please keep these non-negotiable guardrails in mind:
 
-1. **Strictly Read-Only on Client Data**: Never write to, lock, or mutate any external AI client's logs or SQLite databases. All SQLite reads must use temporary WAL-safe snapshots (`open_sqlite_readonly_snapshot`).
+1. **Strictly Read-Only on Client Data**: Never write to or lock any AI client's logs or databases. Use `sqlite_snapshot` for queries.
 2. **Zero External Dependencies**:
    - The Python engine (`engine/`) uses **Python 3.9+ standard library only** (`sqlite3`, `json`, `urllib`, `ctypes`, etc.). Do not add third-party `pip` dependencies.
    - The macOS app (`macos/`) uses native **SwiftUI + AppKit + UserNotifications** only. Do not add heavy SwiftPM dependencies unless discussed first.
@@ -33,7 +33,10 @@ python3 engine/collector.py --days 14 --pretty
 python3 engine/collector.py --markdown
 
 # Build the Swift executable (debug)
-cd macos && swift build
+swift build --package-path macos
+
+# Run the native subprocess and directory regression tests
+swift test --package-path macos
 
 # Build full Release .app bundle (dist/AgentPulse.app)
 bash scripts/build_app.sh
@@ -63,6 +66,8 @@ Adding a new AI tool typically touches 2–4 small places:
 ---
 
 ## Pull Request Checklist
+
+The Verify workflow runs Python tests, native tests and the local app build on Apple Silicon and Intel runners. Repository administrators can require both Verify jobs before merging to the default branch. Tag releases from a verified commit.
 
 - [ ] `python3 -m unittest discover -s tests -v` passes completely.
 - [ ] `bash scripts/build_app.sh` succeeds without warnings or errors (if `macos/` or `scripts/` changed).

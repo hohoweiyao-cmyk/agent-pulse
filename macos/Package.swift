@@ -11,6 +11,7 @@ let package = Package(
         .executableTarget(
             name: "AgentPulse",
             path: "Sources/AgentPulse"
-        )
+        ),
+        .testTarget(name: "AgentPulseTests", dependencies: ["AgentPulse"])
     ]
 )

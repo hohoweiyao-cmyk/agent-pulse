@@ -28,8 +28,8 @@ All paths below are accessed **strictly read-only**. If a client is not installe
 ## 2. Subscription Quota Configuration
 
 ### Codex Quota
-- **Automatic**: If you are signed into official Codex (`~/.codex/auth.json`) and `~/.codex/config.toml` does not set a custom non-OpenAI `model_provider`, AgentPulse polls `https://chatgpt.com/backend-api/wham/usage` at most once every 4–5 minutes.
-- **Offline / Fallback**: If the network is unreachable or the API fails, AgentPulse falls back to the latest `rate_limits` entry found in `~/.codex/sessions/**/*.jsonl`, and then to `~/.agent-pulse/quota_cache.json`.
+- **Local by default**: AgentPulse reads `rate_limits` from local Codex sessions. It labels the result as a historical snapshot with an unverified account.
+- **Enable live quota**: Turn on live Codex quota in the Quotas tab, or use `--live-codex`. Live checks read the local Codex credential and query `https://chatgpt.com/backend-api/wham/usage`. A cached live result is usable only for the same account. Manual refresh bypasses the freshness window and respects the failure backoff.
 - **Custom API Provider**: When `model_provider` in `~/.codex/config.toml` is set to a custom third-party provider, AgentPulse skips the official endpoint cleanly.
 
 ### Claude Code CLI Quota (Statusline)
@@ -114,7 +114,7 @@ python3 scripts/import_tokei.py
 Or click **"重新导入 Tokei 历史"** inside **Menu Bar Popover → Settings (设置)**.
 
 Safety guarantees:
-- Always creates a full read-only backup of `~/.tokei/` and any existing `~/.agent-pulse/ledger.json` under `~/.agent-pulse/backups/tokei-import-<timestamp>/` before writing.
+- Validates dates and usage, then creates a private backup of the source ledger and affected AgentPulse files under `~/.agent-pulse/backups/`. Run the collector with `--restore-ledger` and the backup filename to restore an AgentPulse ledger.
 - Never modifies `~/.tokei/`.
 - Rejects corrupted or empty ledgers without overwriting existing AgentPulse history.
 - Fully idempotent: safe to re-run at any time without double counting.

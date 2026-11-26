@@ -1,0 +1,37 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test Python engine in an isolated home
+        run: |
+          export HOME="$(mktemp -d)"
+          /usr/bin/python3 -B -m unittest discover -s tests -v
+      - name: Test macOS code
+        run: swift test --package-path macos
+      - name: Build and verify the local app bundle
+        run: |
+          bash scripts/build_app.sh
+          codesign --verify --deep --strict dist/AgentPulse.app
+          export HOME="$(mktemp -d)"
+          /usr/bin/python3 -I -B dist/AgentPulse.app/Contents/Resources/collector.py --json >/dev/null
+          /usr/bin/python3 -I -B dist/AgentPulse.app/Contents/Resources/quota_collector.py --json >/dev/null

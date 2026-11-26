@@ -5,24 +5,20 @@ Maintains ~/.agent-pulse/ledger.json with separate `imported_tools` (from Tokei
 historical ledger) and `live_tools` (incrementally updated by AgentPulse).
 Automatically seeds from legacy ~/.agent-clock/ (read-only) if present.
 
-Reconciliation rule:
-- Days within the active live scan window (or present in live_tools) are authoritative
-  from `live_tools`, EXCEPT when a tool has combined T3+Codex historical records in
-  `imported_tools` on older days outside the live scan window.
-- Specifically: for any day >= `live_cutoff_day`, `live_tools` wins; for older days,
-  `live_tools` wins if recorded, otherwise `imported_tools` is preserved intact.
-  This guarantees zero double counting and zero historical data loss.
+Imported and native histories are kept separately. Reconciliation picks one
+source for overlapping usage rather than summing potentially identical events.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import time
-from datetime import datetime, timedelta, timezone
+import math
+import tempfile
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from storage import copy_private, private_directory, protect_existing_file, state_lock, write_json
 
 BIZ_TZ = timezone(timedelta(hours=8))
 LEDGER_VERSION = 1
@@ -36,6 +32,7 @@ _LEGACY_MIGRATE_FILES = (
     "claude_statusline_quota.json",
     "migrated_prefs.json",
 )
+_HISTORY_FILES = ("quota_history.json", "quota_cycles.json")
 
 
 def resolve_data_dir(home: Optional[Path] = None, create: bool = True) -> Path:
@@ -44,25 +41,35 @@ def resolve_data_dir(home: Optional[Path] = None, create: bool = True) -> Path:
     data_dir = home_dir / DATA_DIR_NAME
     legacy_dir = home_dir / LEGACY_DATA_DIR_NAME
 
-    if not data_dir.exists() and legacy_dir.is_dir():
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-            for fname in _LEGACY_MIGRATE_FILES:
-                src = legacy_dir / fname
-                dst = data_dir / fname
-                if src.is_file() and not dst.exists():
-                    shutil.copy2(src, dst)
-            src_hist = legacy_dir / "history"
-            dst_hist = data_dir / "history"
-            if src_hist.is_dir() and not dst_hist.exists():
-                shutil.copytree(src_hist, dst_hist, dirs_exist_ok=True)
-        except OSError:
-            pass
-    elif create:
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
+    if not create:
+        return data_dir
+
+    private_directory(data_dir)
+    marker = data_dir / ".data-layout-v1"
+    if not marker.is_file():
+        with state_lock(marker):
+            if not marker.is_file():
+                for fname in (*_LEGACY_MIGRATE_FILES, "cache.json", "usage_cache.json"):
+                    protect_existing_file(data_dir / fname)
+                for name in ("history", "backups"):
+                    directory = data_dir / name
+                    if directory.exists():
+                        private_directory(directory)
+                if legacy_dir.is_dir():
+                    for name in _LEGACY_MIGRATE_FILES[1:]:
+                        src, dst = legacy_dir / name, data_dir / name
+                        if src.is_file() and not dst.exists():
+                            copy_private(src, dst)
+                    for name in _HISTORY_FILES:
+                        src = legacy_dir / "history" / name
+                        dst = data_dir / "history" / name
+                        if src.is_file() and not dst.exists():
+                            private_directory(dst.parent)
+                            copy_private(src, dst)
+                    src, dst = legacy_dir / "ledger.json", data_dir / "ledger.json"
+                    if src.is_file() and not dst.exists():
+                        copy_private(src, dst)
+                write_json(marker, {"version": 1})
     return data_dir
 
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -101,14 +108,14 @@ def _safe_int(v: Any) -> int:
     try:
         n = int(v)
         return n if n > 0 else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
 def _safe_float(v: Any) -> float:
     try:
         n = float(v)
-        return n if n > 0 else 0.0
+        return n if n > 0 and math.isfinite(n) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -123,26 +130,25 @@ def _bucket_total_tokens(b: Dict[str, Any]) -> int:
     )
 
 
-def load_ledger(path: Path) -> Dict[str, Any]:
-    if not path.is_file():
-        return {
-            "version": LEDGER_VERSION,
-            "updated_at": None,
-            "tokei_import_meta": None,
-            "imported_tools": {},
-            "live_tools": {},
-            "projects": {},
-        }
+def _unpriced_tokens(bucket: Dict[str, Any], tokens: int, cost: float) -> int:
+    if "unpriced_tokens" in bucket:
+        return min(tokens, _safe_int(bucket["unpriced_tokens"]))
+    # Old summaries had no way to distinguish zero cost from a missing estimate.
+    return tokens if cost == 0 else 0
+
+
+class LedgerError(ValueError):
+    """The ledger could not be read, validated or restored safely."""
+
+
+def valid_day(value: str) -> bool:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            raw.setdefault("version", LEDGER_VERSION)
-            raw.setdefault("imported_tools", {})
-            raw.setdefault("live_tools", {})
-            raw.setdefault("projects", {})
-            return raw
-    except Exception:
-        pass
+        return date.fromisoformat(value).isoformat() == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _empty_ledger() -> Dict[str, Any]:
     return {
         "version": LEDGER_VERSION,
         "updated_at": None,
@@ -150,17 +156,60 @@ def load_ledger(path: Path) -> Dict[str, Any]:
         "imported_tools": {},
         "live_tools": {},
         "projects": {},
+        "work_days": {},
     }
 
 
-def save_ledger(path: Path, ledger: Dict[str, Any]) -> None:
+def load_ledger(path: Path, *, required: bool = False) -> Dict[str, Any]:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(ledger, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise OSError("expected a regular ledger file")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        if required:
+            raise LedgerError("找不到指定的账本备份") from exc
+        return _empty_ledger()
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise LedgerError("账本无法读取，已保留原文件。请检查数据目录或恢复有效备份。") from exc
+
+    if (not isinstance(raw, dict) or raw.get("version", LEDGER_VERSION) != LEDGER_VERSION
+        or not raw.keys() & {"imported_tools", "live_tools", "projects", "work_days"}):
+        raise LedgerError("账本格式或版本不受支持，已保留原文件。")
+    for key in ("imported_tools", "live_tools", "projects", "work_days"):
+        if not isinstance(raw.setdefault(key, {}), dict):
+            raise LedgerError("账本结构无效，已保留原文件。")
+        day_maps = (raw[key],) if key == "work_days" else raw[key].values()
+        if any(not isinstance(days, dict) or any(not isinstance(bucket, dict)
+               for bucket in days.values()) for days in day_maps):
+            raise LedgerError("账本日记录结构无效，已保留原文件。")
+    raw.setdefault("version", LEDGER_VERSION)
+    return raw
+
+
+def save_ledger(path: Path, ledger: Dict[str, Any]) -> None:
+    """Commit a validated transaction while the caller holds the ledger lock."""
+    if path.is_file():
+        copy_private(path, path.with_name("ledger.previous.json"))
+    write_json(path, ledger)
+
+
+def restore_ledger(path: Path, backup: Path) -> Optional[Path]:
+    """Restore a validated backup and preserve the current ledger separately."""
+    with state_lock(path):
+        replacement = load_ledger(backup, required=True)
+        for key in ("imported_tools", "live_tools", "projects", "work_days"):
+            groups = (replacement[key],) if key == "work_days" else replacement[key].values()
+            if any(not valid_day(day) for days in groups for day in days):
+                raise LedgerError("备份包含无效日期，原账本未替换。")
+        saved = None
+        if path.is_file():
+            backups = path.parent / "backups"
+            private_directory(backups)
+            folder = Path(tempfile.mkdtemp(prefix="before-restore-", dir=backups))
+            saved = folder / path.name
+            copy_private(path, saved)
+        write_json(path, replacement)
+        return saved
 
 
 def update_ledger_with_live(
@@ -174,8 +223,8 @@ def update_ledger_with_live(
     live_tools = ledger.setdefault("live_tools", {})
     changed = False
 
-    # Clear stale live entries in the live scan window for tools that are actively scanned
-    # so deleted/rewritten logs don't leave ghost numbers, while preserving older live days.
+    # A missing source can be temporary. Keep previously observed days unless a
+    # collector supplies a replacement for that same tool and day.
     for tool_key, day_map in live_usage.items():
         t_dst = live_tools.setdefault(tool_key, {})
         for day_key, bucket in day_map.items():
@@ -209,43 +258,36 @@ def _reconcile_merged_tools(
     imported = ledger.get("imported_tools") or {}
     persisted_live = ledger.get("live_tools") or {}
 
-    # Track which days have live codex/t3_codex records so imported `codex` doesn't double-count them
-    live_codex_days = set((live_usage.get("codex") or {}).keys()) | set((live_usage.get("t3_codex") or {}).keys())
-    live_codex_days |= set((persisted_live.get("codex") or {}).keys()) | set((persisted_live.get("t3_codex") or {}).keys())
+    native: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for source in (persisted_live, live_usage):
+        for tool, days in source.items():
+            native.setdefault(tool, {}).update({
+                day: bucket for day, bucket in days.items() if valid_day(day)
+            })
 
-    merged: Dict[str, Dict[str, Dict[str, Any]]] = {}
-
-    # 1. Start with imported historical days
+    merged = {tool: dict(days) for tool, days in native.items()}
     for raw_tool, day_map in imported.items():
         if not isinstance(day_map, dict):
             continue
         tool = canonical_tool_key(raw_tool)
         dst = merged.setdefault(tool, {})
         for day_key, bucket in day_map.items():
-            if not isinstance(bucket, dict):
+            if not isinstance(bucket, dict) or not valid_day(day_key):
                 continue
-            # If live scan covers this day for codex/t3_codex, skip imported codex on that day
-            if tool == "codex" and day_key in live_codex_days:
+            native_bucket = native.get(tool, {}).get(day_key, {})
+            if tool == "codex":
+                # Tokei combines standalone and T3 Codex. A smaller live day
+                # cannot establish full coverage. Keep the imported day intact
+                # until live usage meets it, without summing overlapping data.
+                t3 = native.get("t3_codex", {}).get(day_key, {})
+                tokens = _bucket_total_tokens(native_bucket) + _bucket_total_tokens(t3)
+                if (native_bucket or t3) and tokens >= _bucket_total_tokens(bucket):
+                    continue
+                if t3:
+                    merged["t3_codex"].pop(day_key, None)
+            elif native_bucket and _bucket_total_tokens(native_bucket) >= _bucket_total_tokens(bucket):
                 continue
             dst[day_key] = bucket
-
-    # 2. Overlay persisted live_tools (days outside current live scan window)
-    for tool, day_map in persisted_live.items():
-        if not isinstance(day_map, dict):
-            continue
-        dst = merged.setdefault(tool, {})
-        for day_key, bucket in day_map.items():
-            if isinstance(bucket, dict):
-                dst[day_key] = bucket
-
-    # 3. Overlay fresh live_usage (authoritative for current scan window)
-    for tool, day_map in live_usage.items():
-        if not isinstance(day_map, dict):
-            continue
-        dst = merged.setdefault(tool, {})
-        for day_key, bucket in day_map.items():
-            if isinstance(bucket, dict):
-                dst[day_key] = bucket
 
     return merged
 
@@ -305,6 +347,7 @@ def _build_period_summary(
             t_entry["cw"] += b_cw
             t_entry["thoughts"] += b_th
             t_entry["cost_usd"] += b_cost
+            t_entry["unpriced_tokens"] = t_entry.get("unpriced_tokens", 0) + _unpriced_tokens(b, b_tok, b_cost)
             t_entry["sessions"] += b_sess if b_sess > 0 else 1
             t_entry["active_days"].add(day_key)
 
@@ -320,7 +363,11 @@ def _build_period_summary(
                 m_dst["cr"] += _safe_int(m_val.get("cr", m_val.get("cached")))
                 m_dst["cw"] += _safe_int(m_val.get("cw"))
                 m_dst["thoughts"] += _safe_int(m_val.get("thoughts", m_val.get("reason")))
-                m_dst["cost_usd"] += _safe_float(m_val.get("cost_usd", m_val.get("cost")))
+                model_cost = _safe_float(m_val.get("cost_usd", m_val.get("cost")))
+                m_dst["cost_usd"] += model_cost
+                m_dst["unpriced_tokens"] = m_dst.get("unpriced_tokens", 0) + _unpriced_tokens(
+                    m_val, _bucket_total_tokens(m_val), model_cost
+                )
 
     # Merge work-hours per tool in the same date range (for unified cards!)
     work_seconds_total = 0.0
@@ -334,6 +381,8 @@ def _build_period_summary(
             if day_key < start_day or day_key > end_day:
                 continue
             work_seconds_total += float(wday.get("agent_seconds", 0.0) or 0.0)
+            if _safe_float(wday.get("agent_seconds")) >= 60:
+                active_days_set.add(day_key)
             work_wall_total += float(wday.get("wall_seconds", 0.0) or 0.0)
             work_runs_total += int(wday.get("runs", 0) or 0)
             for wt in wday.get("tools") or []:
@@ -394,6 +443,7 @@ def _build_period_summary(
                 "reasoning_tokens": mv["thoughts"],
                 "total_tokens": m_tok,
                 "cost_usd": round(mv["cost_usd"], 4),
+                "unpriced_tokens": mv.get("unpriced_tokens", 0),
                 "cache_hit_rate": m_hit,
                 "rate_in": round(rates["in"], 4) if rates else None,
                 "rate_out": round(rates["out"], 4) if rates else None,
@@ -432,6 +482,7 @@ def _build_period_summary(
                 "reasoning_tokens": v["thoughts"],
                 "total_tokens": tok,
                 "cost_usd": round(v["cost_usd"], 2),
+                "unpriced_tokens": v.get("unpriced_tokens", 0),
                 "cache_hit_rate": t_hit,
                 "sessions": t_sessions,
                 "active_days": len(v["active_days"]),
@@ -461,6 +512,7 @@ def _build_period_summary(
         "reasoning_tokens": total_thoughts,
         "total_tokens": total_tokens,
         "cost_usd": round(total_cost, 2),
+        "unpriced_tokens": sum(t["unpriced_tokens"] for t in tools_list),
         "cache_hit_rate": cache_hit_rate,
         "active_days": len(active_days_set),
         "agent_seconds": round(work_seconds_total, 1),
@@ -522,7 +574,7 @@ def _build_projects_list(
     combined: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for proj_path, day_map in (ledger.get("projects") or {}).items():
         if isinstance(day_map, dict):
-            combined[proj_path] = {dk: bv for dk, bv in day_map.items() if isinstance(bv, dict)}
+            combined[proj_path] = {dk: bv for dk, bv in day_map.items() if valid_day(dk)}
     if live_projects:
         for proj_path, day_map in live_projects.items():
             dst = combined.setdefault(proj_path, {})
@@ -611,7 +663,7 @@ def _build_projects_list(
         )
 
     out.sort(key=lambda x: (x["last_active_date"], x["cost_usd"], x["total_tokens"]), reverse=True)
-    return out[:40]
+    return out
 
 
 def build_usage_payload(
@@ -624,23 +676,34 @@ def build_usage_payload(
     pricing: Optional[Any] = None,
     live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     home: Optional[Path] = None,
+    work_history_from: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     """Update ledger, reconcile with imported history, and return (usage_payload, daily_usage_map)."""
-    ledger = load_ledger(ledger_path) if ledger_path else {
-        "version": LEDGER_VERSION,
-        "updated_at": None,
-        "tokei_import_meta": None,
-        "imported_tools": {},
-        "live_tools": {},
-        "projects": {},
+    observed_work = {
+        day["date"]: {
+            key: day[key] for key in ("agent_seconds", "agent_hours", "wall_seconds", "runs", "tools")
+        }
+        for day in work_daily_list or []
+        if day["agent_seconds"] > 0 or day["runs"] > 0
     }
-
     if persist and ledger_path:
-        changed = update_ledger_with_live(
-            ledger, live_usage, live_cutoff_day, now_ts, live_projects=live_projects
-        )
-        if changed or not ledger_path.is_file():
-            save_ledger(ledger_path, ledger)
+        private_directory(ledger_path.parent)
+        with state_lock(ledger_path):
+            ledger = load_ledger(ledger_path)
+            changed = update_ledger_with_live(
+                ledger, live_usage, live_cutoff_day, now_ts, live_projects=live_projects
+            )
+            for day, record in observed_work.items():
+                if ledger["work_days"].get(day) != record:
+                    ledger["work_days"][day] = record
+                    changed = True
+            if work_history_from and not ledger.get("work_history_from"):
+                ledger["work_history_from"] = work_history_from
+                changed = True
+            if changed or not ledger_path.is_file():
+                save_ledger(ledger_path, ledger)
+    else:
+        ledger = load_ledger(ledger_path) if ledger_path else _empty_ledger()
 
     merged = _reconcile_merged_tools(ledger, live_usage)
 
@@ -656,10 +719,8 @@ def build_usage_payload(
     month_start_str = today_dt.strftime("%Y-%m-01")
     year_start_str = today_dt.strftime("%Y-01-01")
 
-    work_by_day: Dict[str, Dict[str, Any]] = {}
-    if work_daily_list:
-        for d in work_daily_list:
-            work_by_day[d["date"]] = d
+    work_by_day = {day: value for day, value in ledger["work_days"].items() if valid_day(day)}
+    work_by_day.update(observed_work)
 
     # Daily usage map for all known days (for joining onto DayStats, 30d history, and 182d heatmap)
     daily_usage_map: Dict[str, Dict[str, Any]] = {}
@@ -685,6 +746,7 @@ def build_usage_payload(
                     "thoughts": 0,
                     "total_tokens": 0,
                     "cost_usd": 0.0,
+                    "unpriced_tokens": 0,
                     "sessions": 0,
                     "tools": {},
                 },
@@ -696,6 +758,7 @@ def build_usage_payload(
             d_acc["thoughts"] += b_th
             d_acc["total_tokens"] += b_tok
             d_acc["cost_usd"] = round(d_acc["cost_usd"] + b_cost, 4)
+            d_acc["unpriced_tokens"] += _unpriced_tokens(b, b_tok, b_cost)
             d_acc["sessions"] += b_sess
             t_cur = d_acc["tools"].setdefault(tool, {"tokens": 0, "cost_usd": 0.0})
             t_cur["tokens"] += b_tok
@@ -783,8 +846,7 @@ def build_usage_payload(
         )
 
     earliest_day = min(
-        (min(v.keys()) for v in merged.values() if isinstance(v, dict) and v),
-        default=today_str,
+        (*work_by_day, *(min(days) for days in merged.values() if days), today_str),
     )
 
     periods = {
@@ -806,6 +868,12 @@ def build_usage_payload(
     )
 
     projects_list = _build_projects_list(ledger, live_projects, today_dt, home or Path.home())
+    bad_days = sum(
+        not valid_day(day)
+        for tool_groups in (ledger["imported_tools"], ledger["live_tools"], ledger["projects"], {"work": ledger["work_days"]})
+        for days in tool_groups.values()
+        for day in days
+    )
 
     usage_payload = {
         "source": "agent_pulse_native",
@@ -824,6 +892,8 @@ def build_usage_payload(
             "imported_tool_count": imported_tool_count,
             "max_tool_days": max_history_days,
             "earliest_day": earliest_day,
+            "work_history_from": ledger.get("work_history_from"),
+            "skipped_invalid_days": bad_days,
             "tokei_import_meta": ledger.get("tokei_import_meta"),
         },
     }

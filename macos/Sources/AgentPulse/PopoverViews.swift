@@ -36,6 +36,18 @@ struct PopoverRootView: View {
         VStack(alignment: .leading, spacing: 11) {
             topHeader
             segmentedTabBar
+            if let error = store.lastError, store.selectedPopoverTab != .quotas {
+                Label(store.snapshot == nil ? error : "\(error) 上次成功 \(store.lastUpdatedTimeString)。",
+                      systemImage: "exclamationmark.circle")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(amberAccent)
+            }
+            if let skipped = store.snapshot?.usage?.ledgerMeta.skippedInvalidDays, skipped > 0,
+               store.selectedPopoverTab == .overview || store.selectedPopoverTab == .dashboard {
+                Label("已保留 \(skipped) 条日期无效的历史记录，未纳入统计。", systemImage: "exclamationmark.circle")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(amberAccent)
+            }
 
             Group {
                 switch store.selectedPopoverTab {
@@ -82,7 +94,7 @@ struct PopoverRootView: View {
                     .font(.system(size: 13.5, weight: .bold))
                     .foregroundStyle(.primary)
 
-                Text("v0.5")
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.6.0")")
                     .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 5)
@@ -142,6 +154,7 @@ struct PopoverRootView: View {
             }
             .buttonStyle(.plain)
             .help("立即刷新数据与额度")
+            .accessibilityLabel("立即刷新数据与额度")
         }
     }
 
@@ -189,7 +202,12 @@ struct PopoverRootView: View {
         let providers = store.quotaSnapshot?.providers ?? []
 
         return VStack(alignment: .leading, spacing: 9) {
-            if providers.isEmpty {
+            if let error = store.quotaError {
+                Label(providers.isEmpty ? error : "\(error) 仍在显示上次成功的额度。", systemImage: "exclamationmark.circle")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(amberAccent)
+            }
+            if providers.isEmpty && store.quotaError == nil {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("正在读取本地与订阅额度…")
@@ -198,7 +216,7 @@ struct PopoverRootView: View {
                 }
                 .padding(.vertical, 24)
                 .frame(maxWidth: .infinity)
-            } else {
+            } else if !providers.isEmpty {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 8) {
                         ForEach(providers) { p in
@@ -266,9 +284,11 @@ struct PopoverRootView: View {
             }
 
             HStack {
-                Text("刷新 Codex 查询与本地额度缓存")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
+                Toggle("联网读取 Codex 额度", isOn: $store.allowLiveCodexQuota)
+                    .font(.system(size: 10.5))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .help("开启后才使用本机 Codex 登录凭据向 chatgpt.com 查询额度。")
                 Spacer()
                 Button {
                     store.refreshQuotas(force: true)

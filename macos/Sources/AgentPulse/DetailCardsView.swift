@@ -32,8 +32,18 @@ struct DetailCardsView: View {
         VStack(alignment: .leading, spacing: 10) {
             periodHeaderRow(periodStats: periodStats)
             compactSummaryStrip(periodStats: periodStats)
+            if let count = periodStats?.unpricedTokens, count > 0 {
+                Text("\(Formatters.compactTokens(count)) Token 未计入费用。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(amberAccent)
+            }
 
-            if tools.isEmpty {
+            if store.snapshot == nil && store.isRefreshing {
+                ProgressView("正在读取本地用量…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
+            } else if tools.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "tray")
                         .font(.system(size: 18))
@@ -184,7 +194,7 @@ struct DetailCardsView: View {
                         Text(Formatters.compactTokens(tok))
                             .font(.system(size: 17, weight: .bold, design: .rounded))
                             .monospacedDigit()
-                        Text(Formatters.usd(cost))
+                        Text(Formatters.estimatedUSD(cost, unpricedTokens: periodStats?.unpricedTokens ?? 0))
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundStyle(accentPurple)
                         if hitPct > 0 {
@@ -273,7 +283,8 @@ struct DetailCardsView: View {
                 Spacer(minLength: 4)
 
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text(tool.costUsd > 0 ? Formatters.usd(tool.costUsd) : (tool.totalTokens == 0 ? "订阅内" : "$0.00"))
+                    Text(tool.totalTokens == 0 ? "无用量记录" :
+                            Formatters.estimatedUSD(tool.costUsd, unpricedTokens: tool.unpricedTokens ?? 0))
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(.primary)
@@ -512,7 +523,7 @@ struct DetailCardsView: View {
                             .padding(.vertical, 1)
                             .background(Color.primary.opacity(0.07), in: Capsule())
                     }
-                    Text(Formatters.usd(model.costUsd))
+                    Text(Formatters.estimatedUSD(model.costUsd, unpricedTokens: model.unpricedTokens ?? 0))
                         .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(.primary)
                         .frame(minWidth: 38, alignment: .trailing)
@@ -568,7 +579,7 @@ struct DetailCardsView: View {
         if let rCW = model.rateCacheWrite, rCW > 0 {
             parts.append("CW \(Formatters.rate(rCW))")
         }
-        return "参考单价 ($/1M): " + parts.joined(separator: " · ")
+        return "当前参考单价 ($/1M) " + parts.joined(separator: " · ")
     }
 
     private func miniKV(_ k: String, _ v: String) -> some View {

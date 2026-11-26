@@ -92,8 +92,8 @@ struct DashboardViews: View {
                     }
                     .buttonStyle(.plain)
 
-                    if let meta = store.snapshot?.usage?.ledgerMeta, meta.importedTokei {
-                        Text("已承接历史账本 · 最早 \(meta.earliestDay)")
+                    if let start = store.snapshot?.usage?.ledgerMeta.workHistoryFrom {
+                        Text("工时回溯始于 \(start)")
                             .font(.system(size: 9.5))
                             .foregroundStyle(.tertiary)
                     }
@@ -124,13 +124,16 @@ struct DashboardViews: View {
             : (periodStats?.agentHours ?? 0.0)
         let tok = periodStats?.totalTokens ?? 0
         let cost = periodStats?.costUsd ?? 0.0
+        let unpriced = periodStats?.unpricedTokens ?? 0
         let hitPct = Int(round((periodStats?.cacheHitRate ?? 0.0) * 100))
         let activeDays = periodStats?.activeDays ?? 0
 
         return HStack(spacing: 8) {
             kpiBox(title: "AI 有效工时", value: String(format: "%.2fh", hrs), sub: String(format: "%.2f 员工日", hrs / 8.0), tint: liveEmerald)
             kpiBox(title: "总 Token", value: Formatters.compactTokens(tok), sub: "Cache Hit \(hitPct)%", tint: Color(hex: "#38BDF8"))
-            kpiBox(title: "估算 API 成本", value: Formatters.usd(cost), sub: "\(periodStats?.tools.count ?? 0) 个工具", tint: accentPurple)
+            kpiBox(title: "估算 API 成本", value: Formatters.estimatedUSD(cost, unpricedTokens: unpriced),
+                   sub: unpriced > 0 ? "\(Formatters.compactTokens(unpriced)) Token 未计价" : "\(periodStats?.tools.count ?? 0) 个工具",
+                   tint: accentPurple)
             kpiBox(title: "活跃天数", value: "\(activeDays) 天", sub: "累计 \(heatmap?.totalActiveDays ?? activeDays) 天", tint: Color(hex: "#FB923C"))
         }
     }

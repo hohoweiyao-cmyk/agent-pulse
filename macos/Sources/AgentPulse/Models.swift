@@ -225,6 +225,7 @@ struct PeriodStats: Codable, Equatable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let cacheHitRate: Double
     let activeDays: Int
     let agentSeconds: Double
@@ -246,6 +247,7 @@ struct PeriodStats: Codable, Equatable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
         case activeDays = "active_days"
         case agentSeconds = "agent_seconds"
@@ -272,6 +274,7 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let cacheHitRate: Double?
     let sessions: Int?
     let activeDays: Int
@@ -303,6 +306,7 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
         case sessions
         case activeDays = "active_days"
@@ -324,6 +328,7 @@ struct ModelUsageStats: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let cacheHitRate: Double?
     let rateIn: Double?
     let rateOut: Double?
@@ -345,6 +350,7 @@ struct ModelUsageStats: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
         case rateIn = "rate_in"
         case rateOut = "rate_out"
@@ -522,6 +528,8 @@ struct LedgerMeta: Codable, Equatable {
     let importedToolCount: Int
     let maxToolDays: Int
     let earliestDay: String
+    let workHistoryFrom: String?
+    let skippedInvalidDays: Int?
 
     enum CodingKeys: String, CodingKey {
         case ledgerPath = "ledger_path"
@@ -529,6 +537,8 @@ struct LedgerMeta: Codable, Equatable {
         case importedToolCount = "imported_tool_count"
         case maxToolDays = "max_tool_days"
         case earliestDay = "earliest_day"
+        case workHistoryFrom = "work_history_from"
+        case skippedInvalidDays = "skipped_invalid_days"
     }
 }
 
@@ -774,6 +784,11 @@ enum Formatters {
             return String(format: "$%.1f", amount)
         }
         return String(format: "$%.2f", amount)
+    }
+
+    static func estimatedUSD(_ amount: Double, unpricedTokens: Int) -> String {
+        guard unpricedTokens > 0 else { return usd(amount) }
+        return amount > 0 ? "\(usd(amount))+" : "未计价"
     }
 
     static func rate(_ amount: Double) -> String {

@@ -42,7 +42,7 @@ When you work with multiple AI coding agents in parallel — **T3 Code**, **Code
   - Sessions launched inside T3 Code (`originator == "T3 Code"`) are attributed to `T3 · Codex` and excluded from standalone `Codex` for **both** work hours and token/cost accounting — zero double counting.
 - **Fast / Slow Dual-Track Architecture**:
   - **Fast track (every 15s, 100% local)**: Work hours, live running agents, incremental tokens, cost & project trail.
-  - **Slow track (every 5 min, non-blocking)**: Subscription quotas for Codex (official API or local JSONL fallback) and Claude (Claude Code CLI statusline hook + Claude Desktop cache), plus snapshot display for Antigravity / Kimi / Grok.
+  - **Slow track (every 5 min, non-blocking)**: Codex quota uses local logs by default. You can enable live Codex quota in the Quotas tab. Claude uses its CLI statusline or desktop cache, and Antigravity, Kimi and Grok use local snapshots.
 - **Native macOS Aesthetic (SwiftUI + AppKit)**:
   - **Desktop Widget Card**: Frosted HUD glass (`340pt` full / `276pt` compact), 3 window layers (*Desktop* / *Floating* / *Normal*), draggable top header with position memory, live agent timer, interactive 7-day bar chart, optional high-quota alert bar (≥ 70%), and one-click Markdown daily report copy.
   - **Single Menu Bar Icon & Adaptive 5-Tab Popover**: Live hours, active agent count, daily cost, and quota badges. Left-click opens a dynamic-width 5-tab native `NSPopover` (**Detail Cards / Dashboard & Heatmap / Projects / Quotas / Settings**):
@@ -51,7 +51,7 @@ When you work with multiple AI coding agents in parallel — **T3 Code**, **Code
     - **Projects**: Searchable, pinnable project usage tracker grouped by activity recency with Finder & Terminal quick-open actions.
   - **Built-in Sit Reminder**: 30 / 45 / 60 / 90 min intervals, automatic reset after > 5 min lock/sleep, and native macOS notifications with *Reset* and *Snooze 10m* actions.
 - **Strictly Read-Only & Privacy-First**:
-  - Never modifies or locks any AI client database (SQLite files are read via WAL-safe temporary snapshots).
+  - Reads AI client SQLite databases through private temporary snapshots, without opening the live database through SQLite.
   - Zero telemetry, zero analytics, zero cloud sync. See [SECURITY.md](SECURITY.md) for the complete privacy & network audit.
 
 ---
@@ -61,7 +61,7 @@ When you work with multiple AI coding agents in parallel — **T3 Code**, **Code
 | AI Client | Work Hours | Live Active | Tokens & Cost | Quota | Local Source |
 |---|:---:|:---:|:---:|:---:|---|
 | **T3 Code** (Antigravity / Codex / Claude) | ✅ | ✅ | ✅ (via Codex dedup) | — | `~/.t3/userdata/statev2.sqlite` |
-| **Codex** (CLI / Desktop) | ✅ | ✅ | ✅ | ✅ Live / JSONL | `~/.codex/sessions/**/*.jsonl` |
+| **Codex** (CLI / Desktop) | ✅ | ✅ | ✅ | ✅ Local logs / opt-in live | `~/.codex/sessions/**/*.jsonl` |
 | **Claude Code** | ✅ | ✅ | ✅ | ✅ Statusline / Cache | `~/.claude/projects/**/*.jsonl` |
 | **WorkBuddy** | ✅ | ✅ | ✅ | — | `~/.workbuddy/projects/**/*.jsonl` |
 | **Hermes** (Main + Profiles) | ✅ | ✅ | ✅ | — | `~/.hermes/state.db` & `profiles/*/state.db` |
@@ -103,7 +103,7 @@ cp -R dist/AgentPulse.app /Applications/AgentPulse.app
 open /Applications/AgentPulse.app
 ```
 
-> **First-launch tip**: `build_app.sh` ad-hoc signs the local build (`codesign --force --deep --sign -`) with bundle identifier `dev.agentpulse.app` (override with `AGENTPULSE_BUNDLE_ID=...`). Drag the desktop card by holding the top-left **"AgentPulse"** title or top blank area. Left-click the menu bar icon for the 4-tab detail panel; right-click for quick actions.
+> **First-launch tip**: `build_app.sh` ad-hoc signs the local build (`codesign --force --deep --sign -`) with bundle identifier `dev.agentpulse.app` (override with `AGENTPULSE_BUNDLE_ID=...`). Drag the desktop card by holding the top-left **"AgentPulse"** title or top blank area. Left-click the menu bar icon for the five-tab panel, or right-click for quick actions.
 
 ### CLI Usage (Headless / Scripting)
 
@@ -119,8 +119,11 @@ python3 engine/collector.py --markdown --date 2026-11-25
 # Pretty-printed JSON snapshot (Schema v3)
 python3 engine/collector.py --days 14 --pretty
 
-# Run slow-track quota probe manually
-python3 engine/quota_collector.py --pretty --force
+# Read local quota data
+python3 engine/quota_collector.py --pretty
+
+# Opt in to a live Codex quota request
+python3 engine/quota_collector.py --pretty --live-codex --force
 ```
 
 ---
@@ -161,13 +164,19 @@ Create `~/.agent-pulse/pricing_overrides.json` to add custom models, aliases, or
 
 ### Migrating Historical Data from Tokei
 
-If you previously used Tokei (`~/.tokei/`), AgentPulse includes a safe, idempotent migration tool that creates a full backup before importing:
+If you previously used Tokei (`~/.tokei/`), AgentPulse can validate and import its ledger:
 
 ```bash
 python3 scripts/import_tokei.py
 ```
 
-It backs up `~/.tokei/` into `~/.agent-pulse/backups/`, imports historical daily token/cost records into `imported_tools` (without double-counting live-scanned days), seeds quota caches, and migrates sit-reminder preferences.
+It backs up the source ledger and affected AgentPulse records in `~/.agent-pulse/backups/`. A smaller native Codex total leaves the combined Tokei day visible until native coverage meets it.
+
+Quit AgentPulse before restoring. The CLI validates the backup and preserves the current file in a separate restore backup:
+
+```bash
+python3 engine/collector.py --restore-ledger ~/.agent-pulse/ledger.previous.json
+```
 
 > **Upgrading from earlier AgentClock builds (`~/.agent-clock/`)?** On first run, AgentPulse automatically copies your existing ledger, pricing overrides, quota caches, and preferences from `~/.agent-clock/` into `~/.agent-pulse/` (leaving `~/.agent-clock/` untouched as a backup).
 
@@ -187,7 +196,7 @@ agent-pulse/
 │   └── quota_collector.py    # Independent slow-track subscription quota prober
 ├── macos/
 │   ├── Package.swift         # SwiftPM manifest (macOS 13+, zero external packages)
-│   └── Sources/AgentPulse/   # Native SwiftUI + AppKit widget, 4-tab popover & sit reminder
+│   └── Sources/AgentPulse/   # Native SwiftUI and AppKit views, five-tab popover and sit reminder
 ├── scripts/
 │   ├── build_app.sh          # Release build + vector icon generator + .app bundler + ad-hoc signing
 │   ├── generate_icon.swift   # Programmatic CoreGraphics macOS squircle icon generator
@@ -209,6 +218,8 @@ Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete algorithm bre
 - **Business Timezone**: Daily boundaries currently default to `Asia/Shanghai (UTC+8)`.
 - **Cached-Only Quotas**: Antigravity, Kimi, and Grok quotas currently display cached snapshots only (no live polling, and stale snapshots never trigger live alerts).
 - **Codex Edge Cases**: Compressed Codex archives and cross-file duplicate `response_id` deduplication are not yet covered.
+- **Historical Work Hours**: The first refresh attempts to backfill up to 182 days from available logs. Daily work summaries are kept after the scan window moves. Usage history may extend further back than available work hours.
+- **Cost Estimates**: Unpriced usage is shown separately. Price changes recalculate available logs in the usage scan window. Older ledger estimates retain their recorded values.
 
 ### Roadmap
 - [ ] Configurable timezone (system local timezone by default, with explicit override)

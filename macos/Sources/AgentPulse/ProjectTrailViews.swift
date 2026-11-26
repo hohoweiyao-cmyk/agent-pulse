@@ -71,6 +71,7 @@ struct ProjectTrailViews: View {
                             .foregroundStyle(.tertiary)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("清除搜索")
                 }
                 Text("\(items.count) 个项目")
                     .font(.system(size: 10, weight: .medium))
@@ -81,6 +82,12 @@ struct ProjectTrailViews: View {
             .padding(.vertical, 6.5)
             .background(cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
+
+            if let error = store.projectActionError {
+                Label(error, systemImage: "exclamationmark.circle")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(amberAccent)
+            }
 
             if items.isEmpty {
                 VStack(spacing: 6) {
@@ -216,7 +223,7 @@ struct ProjectTrailViews: View {
                         Button {
                             store.openProjectInFinder(proj.path)
                         } label: {
-                            Label("访达打开", systemImage: "folder")
+                            Label("在访达中显示", systemImage: "folder")
                                 .font(.system(size: 9.5, weight: .semibold))
                                 .foregroundStyle(.primary)
                                 .padding(.horizontal, 7)

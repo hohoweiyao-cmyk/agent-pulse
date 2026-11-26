@@ -16,12 +16,12 @@ import ctypes
 import ctypes.util
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -34,6 +34,7 @@ if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
 from ledger import resolve_data_dir  # noqa: E402
+from storage import state_lock, write_json  # noqa: E402
 
 BIZ_TZ = timezone(timedelta(hours=8))
 
@@ -53,14 +54,9 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _iso_to_epoch(val: Any) -> Optional[int]:
@@ -105,7 +101,8 @@ def _codex_is_custom_provider(home: Path) -> bool:
         text = cfg_path.read_text(encoding="utf-8", errors="ignore")[:65536]
     except OSError:
         return False
-    hit = re.search(r'^\s*model_provider\s*=\s*["\']([^"\']+)["\']', text, re.M)
+    root = re.split(r"^\s*\[", text, maxsplit=1, flags=re.M)[0]
+    hit = re.search(r'^\s*model_provider\s*=\s*["\']([^"\']+)["\']', root, re.M)
     provider = hit.group(1).strip() if hit else None
     return bool(provider) and provider != "openai"
 
@@ -144,8 +141,8 @@ def _codex_auth_context(home: Path) -> Dict[str, Any]:
 def _codex_window_from_live(win: Any, now: float) -> Optional[Dict[str, Any]]:
     if not isinstance(win, dict):
         return None
-    used = win.get("used_percent")
-    if used is None:
+    used = float(win.get("used_percent", -1))
+    if not math.isfinite(used) or not 0 <= used <= 100:
         return None
     reset_at = win.get("reset_at")
     if reset_at is None and win.get("reset_after_seconds") is not None:
@@ -228,8 +225,9 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
     }
 
 
-def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool = False) -> Dict[str, Any]:
-    if _codex_is_custom_provider(home):
+def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool = False,
+                      allow_live: bool = False) -> Dict[str, Any]:
+    if allow_live and _codex_is_custom_provider(home):
         return {
             "id": "codex",
             "name": "Codex",
@@ -241,8 +239,10 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
             "windows": [],
         }
 
-    cached = cache.get("codex") if isinstance(cache.get("codex"), dict) else {}
-    auth_ctx = _codex_auth_context(home)
+    auth_ctx = _codex_auth_context(home) if allow_live else {}
+    account_key = auth_ctx.get("account_key")
+    saved = cache.get("codex")
+    cached = saved if account_key and isinstance(saved, dict) and saved.get("account_key") == account_key else {}
 
     # Return fresh cache if within TTL and not forced
     if (
@@ -255,17 +255,17 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
         )
 
     last_fail = float(cached.get("last_failure_at") or 0)
-    should_call_live = bool(auth_ctx.get("access_token")) and (force or (now - last_fail) >= CODEX_FAILURE_BACKOFF)
+    should_call_live = bool(account_key) and (not last_fail or now - last_fail >= CODEX_FAILURE_BACKOFF)
 
     if should_call_live:
         try:
             req = urllib.request.Request(CODEX_USAGE_URL)
             req.add_header("Accept", "application/json")
-            req.add_header("User-Agent", "AgentPulse/0.4")
+            req.add_header("User-Agent", "AgentPulse/0.6")
             req.add_unredirected_header("Authorization", f"Bearer {auth_ctx['access_token']}")
             if auth_ctx.get("account_id"):
                 req.add_unredirected_header("ChatGPT-Account-Id", auth_ctx["account_id"])
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
+            with urllib.request.build_opener(_NoRedirect()).open(req, timeout=3.0) as resp:
                 final = urlparse(resp.geturl())
                 if final.scheme != "https" or final.hostname != "chatgpt.com":
                     raise ValueError("unexpected redirect")
@@ -280,28 +280,25 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
                     "plan_type": data.get("plan_type"),
                 }
                 cache["codex"] = {
+                    "account_key": account_key,
                     "fetched_at": now,
                     "limits": limits,
                     "plan": data.get("plan_type"),
                     "source": "live",
                 }
                 return _format_codex_provider(limits, data.get("plan_type"), now, "ok", "实时探测")
+            raise ValueError("missing Codex quota windows")
         except Exception:
             cached["last_failure_at"] = now
+            cached["account_key"] = account_key
             cache["codex"] = cached
 
-    # Fallback 1: Local Codex session JSONL rate_limits
+    # Local logs carry historical quota observations whose account may be unknown.
     local_rl = _scan_codex_local_rate_limits(home)
     if local_rl:
         rl_obj, rl_ts = local_rl
         if rl_ts >= float(cached.get("fetched_at") or 0):
-            cache["codex"] = {
-                "fetched_at": rl_ts,
-                "limits": rl_obj,
-                "plan": rl_obj.get("plan_type") or cached.get("plan"),
-                "source": "local_jsonl",
-            }
-            return _format_codex_provider(rl_obj, rl_obj.get("plan_type") or cached.get("plan"), rl_ts, "ok", "本地会话日志")
+            return _format_codex_provider(rl_obj, rl_obj.get("plan_type"), rl_ts, "stale", "本地会话日志 · 账号未经核对")
 
     # Fallback 2: Cached snapshot (including migrated snapshot)
     if cached.get("limits"):
@@ -313,9 +310,9 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
         "id": "codex",
         "name": "Codex",
         "color": "#10B981",
-        "plan": "未登录",
+        "plan": "未同步",
         "status": "unavailable",
-        "status_text": "未检测到 Codex 本地凭据",
+        "status_text": "未取得当前账号额度" if allow_live else "仅本地模式，暂无会话额度记录",
         "fetched_at": int(now),
         "windows": [],
     }
@@ -438,9 +435,7 @@ def capture_claude_statusline(home: Path, payload: Any, now: float) -> None:
     if "q5" not in snapshot and "q7" not in snapshot:
         return
     folder = resolve_data_dir(home, create=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as stream:
-        json.dump(snapshot, stream)
-    os.replace(stream.name, folder / "claude_statusline_quota.json")
+    write_json(folder / "claude_statusline_quota.json", snapshot)
 
 
 def probe_claude_quota(home: Path, cache: Dict[str, Any], now: float) -> Dict[str, Any]:
@@ -637,21 +632,21 @@ def collect_quotas(
     home: Optional[Path] = None,
     force: bool = False,
     now_ts: Optional[float] = None,
+    allow_live: bool = False,
 ) -> Dict[str, Any]:
     home_dir = home or Path.home()
     now = now_ts if now_ts is not None else time.time()
     cache_path = resolve_data_dir(home_dir, create=True) / "quota_cache.json"
-    cache = _load_json(cache_path)
-
-    providers: List[Dict[str, Any]] = [
-        probe_codex_quota(home_dir, cache, now, force=force),
-        probe_claude_quota(home_dir, cache, now),
-        probe_antigravity_quota(cache, now),
-    ]
-    providers.append(probe_kimi_quota(cache))
-    providers.append(probe_grok_quota(cache, now))
-
-    _save_json_atomic(cache_path, cache)
+    with state_lock(cache_path):
+        cache = _load_json(cache_path)
+        providers: List[Dict[str, Any]] = [
+            probe_codex_quota(home_dir, cache, now, force=force, allow_live=allow_live),
+            probe_claude_quota(home_dir, cache, now),
+            probe_antigravity_quota(cache, now),
+            probe_kimi_quota(cache),
+            probe_grok_quota(cache, now),
+        ]
+        write_json(cache_path, cache)
 
     # Extract top alert window (highest used_percent across current providers)
     highest_win: Optional[Dict[str, Any]] = None
@@ -682,14 +677,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="AgentPulse slow-track quota collector")
     parser.add_argument("--json", action="store_true", help="Output compact JSON")
     parser.add_argument("--pretty", action="store_true", help="Output pretty JSON")
-    parser.add_argument("--force", action="store_true", help="Bypass TTL and re-probe live endpoints")
+    parser.add_argument("--force", action="store_true", help="Bypass the freshness TTL for an enabled live check")
+    parser.add_argument("--live-codex", action="store_true", help="Allow a Codex quota request using local credentials")
     parser.add_argument("--claude-statusline", action="store_true", help="Read quota windows from Claude Code status line JSON on stdin")
     args = parser.parse_args()
     if args.claude_statusline:
         capture_claude_statusline(Path.home(), json.load(sys.stdin), time.time())
         return 0
 
-    payload = collect_quotas(force=args.force)
+    try:
+        payload = collect_quotas(force=args.force, allow_live=args.live_codex)
+    except (OSError, ValueError, OverflowError, TypeError):
+        print("无法刷新额度，请检查本地额度文件与数据目录。", file=sys.stderr)
+        return 1
     if args.pretty:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

@@ -8,7 +8,9 @@ at ~/.agent-pulse/pricing_overrides.json (with read-only fallback to ~/.agent-cl
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -20,7 +22,7 @@ _VERSION_CLEAN_RE = re.compile(r"[:@].*$")
 def _safe_float(val: Any, default: float = 0.0) -> float:
     try:
         v = float(val)
-        return v if v >= 0 else default
+        return v if v >= 0 and math.isfinite(v) else default
     except (TypeError, ValueError):
         return default
 
@@ -53,6 +55,9 @@ class PricingTable:
         for k, target in (aliases or {}).items():
             if isinstance(k, str) and isinstance(target, str):
                 self.aliases[k.strip().lower()] = target.strip().lower()
+
+        normalized = json.dumps([self.models, self.aliases, self.short_index], sort_keys=True)
+        self.signature = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     @classmethod
     def load(cls, home: Optional[Path] = None, engine_dir: Optional[Path] = None) -> "PricingTable":

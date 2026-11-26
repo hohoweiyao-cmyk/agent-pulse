@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """AgentPulse — Safe, idempotent migration tool from Tokei (~/.tokei).
 
-Always takes a read-only full backup of ~/.tokei/ (and existing ~/.agent-pulse/
-state) before writing anything to ~/.agent-pulse/. Never modifies ~/.tokei/.
+Backs up the source ledger and affected AgentPulse files before importing.
 
 Migrates:
 1. ~/.tokei/ledger.json -> ~/.agent-pulse/ledger.json (`imported_tools`, preserving
@@ -19,10 +18,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import math
 import plistlib
-import shutil
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -33,7 +32,8 @@ for _p in (str(SCRIPT_DIR), str(ROOT / "engine")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ledger import LEDGER_VERSION, canonical_tool_key, load_ledger, resolve_data_dir  # noqa: E402
+from ledger import canonical_tool_key, load_ledger, resolve_data_dir, save_ledger, valid_day  # noqa: E402
+from storage import copy_private, private_directory, state_lock, write_json  # noqa: E402
 
 BIZ_TZ = timezone(timedelta(hours=8))
 
@@ -64,16 +64,23 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+def _validate_usage(record: Dict[str, Any]) -> None:
+    for name in ("in", "out", "cr", "cached", "cw", "thoughts", "reason", "cost", "requests", "sessions"):
+        value = record.get(name)
+        if value is None:
+            continue
+        try:
+            number = float(value) if name == "cost" else int(value)
+            if isinstance(value, bool) or number < 0 or not math.isfinite(number):
+                raise ValueError
+            if name != "cost" and isinstance(value, float) and value != number:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Tokei 字段 {name} 不是有效的非负用量") from exc
 
 
 def _normalize_tokei_day(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not isinstance(raw, dict):
-        return None
+    _validate_usage(raw)
     inp = _safe_int(raw.get("in"))
     out = _safe_int(raw.get("out"))
     cr = _safe_int(raw.get("cr", raw.get("cached")))
@@ -87,10 +94,13 @@ def _normalize_tokei_day(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     models_out: Dict[str, Dict[str, Any]] = {}
     raw_models = raw.get("models")
+    if raw_models is not None and not isinstance(raw_models, dict):
+        raise ValueError("Tokei 模型明细格式无效")
     if isinstance(raw_models, dict):
         for m_name, mv in raw_models.items():
             if not isinstance(mv, dict):
-                continue
+                raise ValueError("Tokei 模型用量格式无效")
+            _validate_usage(mv)
             m_in = _safe_int(mv.get("in"))
             m_out = _safe_int(mv.get("out"))
             m_cr = _safe_int(mv.get("cr", mv.get("cached")))
@@ -119,8 +129,8 @@ def _normalize_tokei_day(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             cr += mv["cr"]
             cw += mv["cw"]
             thoughts += mv["thoughts"]
-            if cost <= 0:
-                cost += mv["cost_usd"]
+        if cost <= 0:
+            cost = sum(mv["cost_usd"] for mv in models_out.values())
 
     if inp + out + cr + cw + thoughts <= 0 and cost <= 0:
         return None
@@ -141,11 +151,6 @@ def _normalize_tokei_day(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def migrate_from_tokei(home: Optional[Path] = None, skip_backup: bool = False) -> Dict[str, Any]:
     home_dir = home or Path.home()
     tokei_dir = home_dir / ".tokei"
-    ac_dir = resolve_data_dir(home_dir, create=True)
-
-    now_dt = datetime.now(tz=BIZ_TZ)
-    ts_tag = now_dt.strftime("%Y%m%d-%H%M%S")
-
     if not tokei_dir.is_dir():
         return {
             "ok": False,
@@ -162,54 +167,47 @@ def migrate_from_tokei(home: Optional[Path] = None, skip_backup: bool = False) -
         if any(not isinstance(days, dict) or any(not isinstance(day, dict) for day in days.values())
                for days in raw_tools.values()):
             raise ValueError("工具日记录格式错误")
+        imported_tools: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for raw_tool, raw_days in sorted(raw_tools.items()):
+            days = imported_tools.setdefault(canonical_tool_key(raw_tool), {})
+            for day_key, raw in sorted(raw_days.items()):
+                if not valid_day(day_key):
+                    raise ValueError("Tokei 账本包含无效日期")
+                norm = _normalize_tokei_day(raw)
+                if norm is not None:
+                    days[day_key] = norm
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": f"无法读取 Tokei 账本：{exc}"}
 
-    # 1. Backup ~/.tokei and existing ~/.agent-pulse/ledger.json
-    backup_dir: Optional[Path] = None
-    if not skip_backup:
-        backup_dir = ac_dir / "backups" / f"tokei-import-{ts_tag}"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(tokei_dir, backup_dir / "tokei", dirs_exist_ok=True)
-        existing_ledger = ac_dir / "ledger.json"
-        if existing_ledger.is_file():
-            shutil.copy2(existing_ledger, backup_dir / "agent-pulse-ledger-before.json")
-
-    # 2. Import ledger.json (idempotent replacement of `imported_tools`, untouched `live_tools`)
-
-    ac_ledger_path = ac_dir / "ledger.json"
-    ac_ledger = load_ledger(ac_ledger_path)
-    imported_tools: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    total_days = 0
-    tool_summary: Dict[str, int] = {}
-
-    for raw_tool, raw_days in sorted(raw_tools.items()):
-        if not isinstance(raw_days, dict):
-            continue
-        canon = canonical_tool_key(raw_tool)
-        dst_days = imported_tools.setdefault(canon, {})
-        for day_key, day_val in sorted(raw_days.items()):
-            norm = _normalize_tokei_day(day_val)
-            if norm is None:
-                continue
-            dst_days[str(day_key)] = norm
-            total_days += 1
-        if dst_days:
-            tool_summary[canon] = len(dst_days)
-
+    tool_summary = {tool: len(days) for tool, days in imported_tools.items() if days}
+    total_days = sum(tool_summary.values())
     if not total_days:
         return {"ok": False, "error": "Tokei 账本没有可导入的日记录"}
 
-    ac_ledger["version"] = LEDGER_VERSION
-    ac_ledger["imported_tools"] = imported_tools
-    ac_ledger["tokei_import_meta"] = {
-        "imported_at": now_dt.isoformat(),
-        "backup_dir": str(backup_dir) if backup_dir else None,
-        "tools_count": len(tool_summary),
-        "days_count": total_days,
-        "tools_days": tool_summary,
-    }
-    _save_json_atomic(ac_ledger_path, ac_ledger)
+    ac_dir = resolve_data_dir(home_dir)
+    ac_ledger_path = ac_dir / "ledger.json"
+    with state_lock(ac_ledger_path), state_lock(ac_dir / "quota_cache.json"):
+        return _write_import(home_dir, tokei_dir, ac_dir, imported_tools, tool_summary, skip_backup)
+
+
+def _write_import(home_dir, tokei_dir, ac_dir, imported_tools, tool_summary, skip_backup):
+    now_dt = datetime.now(tz=BIZ_TZ)
+    total_days = sum(tool_summary.values())
+    ac_ledger_path = ac_dir / "ledger.json"
+    ac_ledger = load_ledger(ac_ledger_path)
+
+    backup_dir: Optional[Path] = None
+    if not skip_backup:
+        root = ac_dir / "backups"
+        private_directory(root)
+        stamp = now_dt.strftime("%Y%m%d-%H%M%S")
+        backup_dir = Path(tempfile.mkdtemp(prefix=f"tokei-import-{stamp}-", dir=root))
+        copy_private(tokei_dir / "ledger.json", backup_dir / "tokei-ledger.json")
+        for relative in ("ledger.json", "quota_cache.json", "migrated_prefs.json",
+                         "history/quota_history.json", "history/quota_cycles.json"):
+            original = ac_dir / relative
+            if original.is_file():
+                copy_private(original, backup_dir / f"agent-pulse-{original.stem}-before.json")
 
     # 3. Seed quota_cache.json from Tokei caches (only if newer than existing AgentPulse cache)
     quota_cache_path = ac_dir / "quota_cache.json"
@@ -255,20 +253,18 @@ def migrate_from_tokei(home: Optional[Path] = None, skip_backup: bool = False) -
                 "plan": t_kimi.get("plan"),
             }
 
-    _save_json_atomic(quota_cache_path, q_cache)
-
     # 4. Copy historical quota files & pricing overrides
     hist_dir = ac_dir / "history"
-    hist_dir.mkdir(parents=True, exist_ok=True)
+    private_directory(hist_dir)
     for fname in ("quota_history.json", "quota_cycles.json"):
         src = tokei_dir / fname
         if src.is_file():
-            shutil.copy2(src, hist_dir / fname)
+            copy_private(src, hist_dir / fname)
 
     dst_overrides = ac_dir / "pricing_overrides.json"
     src_overrides = tokei_dir / "pricing_overrides.json"
     if src_overrides.is_file() and not dst_overrides.is_file():
-        shutil.copy2(src_overrides, dst_overrides)
+        copy_private(src_overrides, dst_overrides)
 
     # 5. Extract non-sensitive Tokei user preferences (sit reminder & menu bar quota flags)
     plist_path = home_dir / "Library" / "Preferences" / "com.tokei.app.plist"
@@ -290,7 +286,21 @@ def migrate_from_tokei(home: Optional[Path] = None, skip_backup: bool = False) -
                 migrated_prefs["menu_bar_quota_grok"] = bool(pref.get("menuBarQuotaGrok", False))
         except Exception:
             pass
-    _save_json_atomic(ac_dir / "migrated_prefs.json", migrated_prefs)
+    write_json(ac_dir / "migrated_prefs.json", migrated_prefs)
+    write_json(quota_cache_path, q_cache)
+
+    # Commit the authoritative ledger last. A failure in optional imports
+    # leaves the old ledger in place and the pre-import copies available.
+    for tool, days in imported_tools.items():
+        ac_ledger["imported_tools"].setdefault(tool, {}).update(days)
+    ac_ledger["tokei_import_meta"] = {
+        "imported_at": now_dt.isoformat(),
+        "backup_dir": str(backup_dir) if backup_dir else None,
+        "tools_count": len(tool_summary),
+        "days_count": total_days,
+        "tools_days": tool_summary,
+    }
+    save_ledger(ac_ledger_path, ac_ledger)
 
     return {
         "ok": True,
@@ -314,6 +324,8 @@ def main() -> int:
         res = {"ok": False, "error": str(exc)}
     if args.json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
+        if not res.get("ok"):
+            print(f"导入失败：{res.get('error')}", file=sys.stderr)
     else:
         if res.get("ok"):
             print(f"迁移成功：共导入 {res['imported_tools']} 个工具、{res['imported_days']} 条历史日记录。")

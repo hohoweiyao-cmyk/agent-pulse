@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0] Unreleased
+
+- Keep existing local data private, preserve unreadable ledgers, serialize concurrent writes and validate Tokei imports before committing them. The CLI can restore a validated backup and retain the replaced file.
+- Start Codex quota in local mode. Live checks require opt-in, scope cached results to the account, and honor network failure backoff.
+- Keep daily work history, account for additional Codex log mirrors and avoid replacing larger Tokei days with partial native data. Recompute recent estimates after a price change and show unpriced usage.
+- Bound collector runtime, show refresh failures, and validate directory actions in Project Trail.
+- Run engine, native and build checks in the Verify workflow for macOS on Apple Silicon and Intel.
+
 All notable changes to **AgentPulse** (formerly *AgentClock*) are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).

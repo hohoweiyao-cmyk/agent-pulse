@@ -41,7 +41,7 @@
   - 无论工时还是 Token/费用，Codex 日志中 `originator == "T3 Code"` 的会话均精准归属 `T3 · Codex`，与独立 `Codex` 零重复计数。
 - **快慢双轨刷新架构**：
   - **快轨（15 秒，纯本地）**：AI 工时、实时在岗检测、增量 Token / 费用与项目账本更新。
-  - **慢轨（5 分钟，异步非阻塞）**：Codex（官方接口或本地 JSONL 回退）与 Claude（Claude Code CLI 状态栏入口 + Claude 桌面端缓存）额度探测；Antigravity / Kimi / Grok 展示已有本地缓存快照，过期快照不触发高额度预警。
+  - **慢轨（5 分钟，异步非阻塞）**：Codex 默认读取本地日志，可在「额度」页启用联网查询。Claude 读取 CLI 状态栏或桌面端缓存，其他供应商展示本地额度快照。
 - **macOS 原生视觉与双层交互**：
   - **桌面挂件卡片**：HUD 毛玻璃材质（完整 `340pt` / 紧凑 `276pt` 双视图）、三档窗口层级（贴附桌面层 / 悬浮置顶 / 正常窗口）、按住顶部标题区自由拖动并记忆位置、实时在岗计时、可点击近 7 天柱状图（联动展示该日工时与 Token/费用）、可选高额度预警条（≥ 70% 浮现）、一键复制一体化 Markdown 日报。
   - **菜单栏单图标 + 宽幅 5 页签原生 Popover**：实时展示工时·在岗数、今日估算费用与常用额度徽章；**左键**打开动态宽幅 5 页签面板（**明细 / 大屏 / 项目 / 额度 / 设置**），**右键**呼出快捷菜单：
@@ -60,7 +60,7 @@
 | AI 客户端 | AI 工时 | 实时在岗 | Token 与费用 | 订阅额度 | 本地读取路径 |
 |---|:---:|:---:|:---:|:---:|---|
 | **T3 Code**（Antigravity / Codex / Claude） | ✅ | ✅ | ✅（与 Codex 双向去重） | — | `~/.t3/userdata/statev2.sqlite` |
-| **Codex**（CLI / Desktop） | ✅ | ✅ | ✅ | ✅ 实时 / JSONL | `~/.codex/sessions/**/*.jsonl` |
+| **Codex**（CLI / Desktop） | ✅ | ✅ | ✅ | ✅ 本地日志 / 可开启联网 | `~/.codex/sessions/**/*.jsonl` |
 | **Claude Code** | ✅ | ✅ | ✅ | ✅ 状态栏 / 缓存 | `~/.claude/projects/**/*.jsonl` |
 | **WorkBuddy** | ✅ | ✅ | ✅ | — | `~/.workbuddy/projects/**/*.jsonl` |
 | **Hermes**（主库 + 多 Profiles） | ✅ | ✅ | ✅ | — | `~/.hermes/state.db` 及 `profiles/*/state.db` |
@@ -119,7 +119,10 @@ python3 engine/collector.py --markdown --date 2026-11-25
 python3 engine/collector.py --days 14 --pretty
 
 # 手动执行慢轨额度探测
-python3 engine/quota_collector.py --pretty --force
+python3 engine/quota_collector.py --pretty
+
+# 明确允许一次 Codex 联网额度查询
+python3 engine/quota_collector.py --pretty --live-codex --force
 ```
 
 ---
@@ -166,7 +169,13 @@ Claude Code 的状态栏命令可以将官方状态栏 JSON（含 5 小时与 7 
 python3 scripts/import_tokei.py
 ```
 
-脚本会先完整备份 `~/.tokei/` 至 `~/.agent-pulse/backups/`，再将历史日账本导入 `imported_tools`（与实采数据自动防重合并），并同步迁移额度缓存基线与久坐提醒偏好。
+脚本会备份 Tokei 来源账本和受影响的 AgentPulse 文件至 `~/.agent-pulse/backups/`。当天 Codex 实采总量小于 Tokei 汇总时，继续展示导入汇总，避免历史用量突然变少。
+
+如需恢复账本，可先退出 AgentPulse，再执行下方命令。CLI 会检查备份并另存当前账本。
+
+```bash
+python3 engine/collector.py --restore-ledger ~/.agent-pulse/ledger.previous.json
+```
 
 > **从早期 AgentClock（`~/.agent-clock/`）升级？** 首次运行 AgentPulse 时会自动只读拷贝旧目录下的账本、定价覆盖、额度缓存与偏好到 `~/.agent-pulse/`，原有 `~/.agent-clock/` 保持不动作为备份。
 
@@ -206,6 +215,8 @@ agent-pulse/
 - **统计时区**：按自然日切分默认显式采用 `Asia/Shanghai (UTC+8)`。
 - **仅缓存快照的额度源**：Antigravity / Kimi / Grok 目前仅展示本地已有缓存快照，暂未实现独立实时拉取，过期快照不触发高额度预警。
 - **Codex 边缘场景**：压缩归档和跨文件重复 `response_id` 去重暂未覆盖。
+- **工时回溯**：首次刷新尝试从仍可读取的日志回溯最多 182 天，后续保留每日工时。已有用量历史可能比工时更早。
+- **费用估算**：未计价用量会单独提示。价格变更会重算近 14 天内可读取的日志，较早账本保留当时记录的费用。
 
 ### 后续路线图
 - [ ] 支持自定义业务时区（默认跟随系统本地时区，可显式覆盖）

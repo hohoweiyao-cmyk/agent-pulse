@@ -15,27 +15,29 @@ Key guarantees:
 
 from __future__ import annotations
 
-import contextlib
+import hashlib
 import json
+import math
 import os
-import shutil
 import sqlite3
-import tempfile
 import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pricing import PricingTable
+from storage import sqlite_snapshot, write_json
 
 BIZ_TZ = timezone(timedelta(hours=8))
-USAGE_CACHE_VERSION = 3
+USAGE_CACHE_VERSION = 4
 
 
 def _normalize_project_path(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
-    s = raw.strip().rstrip("/")
+    s = raw.rstrip("/")
     if not s or not s.startswith("/") or s in ("/", "/tmp", "/private/tmp", "/var/tmp"):
         return ""
     return s
@@ -102,49 +104,24 @@ def _safe_float(val: Any) -> float:
         return 0.0
 
 
-@contextlib.contextmanager
-def _open_sqlite_readonly_snapshot(db_path: Path) -> Iterator[Optional[sqlite3.Connection]]:
-    if not db_path.is_file():
-        yield None
-        return
-    tmp_dir = tempfile.mkdtemp(prefix="agentpulse_u_")
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        dst = Path(tmp_dir) / db_path.name
-        shutil.copy2(db_path, dst)
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(str(db_path) + suffix)
-            if sidecar.is_file():
-                try:
-                    shutil.copy2(sidecar, Path(str(dst) + suffix))
-                except OSError:
-                    pass
-        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True, timeout=2.0)
-        conn.row_factory = sqlite3.Row
-        yield conn
-    except Exception:
-        yield None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 class UsageCache:
     """Caches parsed daily token deltas per source file using mtime_ns + size."""
 
-    def __init__(self, path: Optional[Path]):
+    def __init__(self, path: Optional[Path], pricing_signature: str = ""):
         self.path = path
+        self.pricing_signature = pricing_signature
         self.dirty = False
         self.files: Dict[str, Dict[str, Any]] = {}
+        self.seen: set = set()
         if path and path.is_file():
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-                if raw.get("version") == USAGE_CACHE_VERSION and isinstance(raw.get("files"), dict):
+                if (raw.get("version") == USAGE_CACHE_VERSION
+                    and raw.get("pricing_signature") == self.pricing_signature
+                    and isinstance(raw.get("files"), dict)):
                     self.files = raw["files"]
+                else:
+                    self.dirty = True
             except Exception:
                 self.files = {}
 
@@ -153,7 +130,9 @@ class UsageCache:
             st = file_path.stat()
         except OSError:
             return None
-        entry = self.files.get(str(file_path))
+        key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
+        self.seen.add(key)
+        entry = self.files.get(key)
         if entry and entry.get("mtime_ns") == st.st_mtime_ns and entry.get("size") == st.st_size:
             return entry.get("rows")
         return None
@@ -163,7 +142,9 @@ class UsageCache:
             st = file_path.stat()
         except OSError:
             return
-        self.files[str(file_path)] = {
+        key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
+        self.seen.add(key)
+        self.files[key] = {
             "mtime_ns": st.st_mtime_ns,
             "size": st.st_size,
             "rows": rows,
@@ -171,16 +152,15 @@ class UsageCache:
         self.dirty = True
 
     def save(self) -> None:
-        if not self.path or not self.dirty:
+        if not self.path or (not self.dirty and self.files.keys() <= self.seen):
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            payload = {"version": USAGE_CACHE_VERSION, "files": self.files}
-            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            os.replace(tmp, self.path)
-            self.dirty = False
-        except OSError:
+            write_json(self.path, {
+                "version": USAGE_CACHE_VERSION,
+                "pricing_signature": self.pricing_signature,
+                "files": {key: value for key, value in self.files.items() if key in self.seen},
+            })
+        except (OSError, ValueError):
             pass
 
 
@@ -359,15 +339,51 @@ def _acc_add(
 # 1. Codex (with T3 Code <-> Codex bidirectional deduplication)
 # ---------------------------------------------------------------------------
 
+CodexTokens = Tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class CodexUsageEvent:
+    timestamp: float
+    model: str
+    turn: int
+    tokens: CodexTokens
+    total: Optional[CodexTokens]
+    response: bool
+
+
+def _codex_mirrored_events(events: List[CodexUsageEvent], response_totals: set) -> set:
+    """Pair a delta-only response with at most one nearby legacy mirror."""
+    legacy = defaultdict(deque)
+    ordered = sorted(enumerate(events), key=lambda entry: entry[1].timestamp)
+    for idx, event in ordered:
+        if not event.response and (event.turn, event.total) not in response_totals:
+            legacy[event.turn, event.model, event.tokens].append((idx, event.timestamp))
+
+    duplicates = set()
+    for _, event in ordered:
+        if not event.response or event.total is not None:
+            continue
+        candidates = legacy.get((event.turn, event.model, event.tokens))
+        if candidates is None:
+            continue
+        while candidates and candidates[0][1] < event.timestamp - 2:
+            candidates.popleft()
+        if candidates and candidates[0][1] <= event.timestamp + 2:
+            duplicates.add(candidates.popleft()[0])
+    return duplicates
+
 
 def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
     originator = ""
     project_cwd = ""
     session_id = None
     response_ids = set()
-    current_model = "gpt-5"
-    prev_total: Optional[Tuple[int, int, int, int, int]] = None
-    acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    current_model = "unknown"
+    prev_total: Optional[CodexTokens] = None
+    turn = 0
+    events: List[CodexUsageEvent] = []
+    response_totals: set = set()
 
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
@@ -400,6 +416,7 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
                     continue
 
                 if typ == "turn_context":
+                    turn += 1
                     m = payload.get("model")
                     if isinstance(m, str) and m.strip():
                         current_model = m.strip()
@@ -431,6 +448,7 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
                     continue
 
                 d_in = d_cr = d_cw = d_out = d_reason = 0
+                cur_tuple = None
                 if isinstance(total, dict):
                     cur_in = _safe_int(total.get("input_tokens"))
                     cur_cr = _safe_int(total.get("cached_input_tokens"))
@@ -438,6 +456,8 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
                     cur_out = _safe_int(total.get("output_tokens"))
                     cur_r = _safe_int(total.get("reasoning_output_tokens"))
                     cur_tuple = (cur_in, cur_cr, cur_cw, cur_out, cur_r)
+                    if is_response:
+                        response_totals.add((turn, cur_tuple))
                     if prev_total is not None:
                         if cur_tuple == prev_total:
                             continue  # Duplicate snapshot echo
@@ -476,36 +496,24 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
 
                 if d_in + d_out + d_cr + d_cw + d_reason <= 0:
                     continue
-
-                # OpenAI input_tokens includes cached_input_tokens -> separate non-cached input
-                non_cached_in = max(0, d_in - d_cr - d_cw)
-                # OpenAI output_tokens already includes reasoning_output_tokens
-                non_reason_out = max(0, d_out - d_reason)
-
-                cost = pricing.estimate_cost(
-                    current_model,
-                    input_tokens=non_cached_in,
-                    output_tokens=non_reason_out,
-                    cache_read_tokens=d_cr,
-                    cache_write_tokens=d_cw,
-                    reasoning_tokens=d_reason,
-                )
-                tool_key = "t3_codex" if originator == "T3 Code" else "codex"
-                _acc_add(
-                    acc,
-                    tool=tool_key,
-                    day=_ts_to_day(ts),
-                    model=current_model,
-                    inp=non_cached_in,
-                    out=non_reason_out,
-                    cr=d_cr,
-                    cw=d_cw,
-                    thoughts=d_reason,
-                    cost_usd=cost,
-                    requests=1,
+                events.append(
+                    CodexUsageEvent(ts, current_model, turn, (d_in, d_cr, d_cw, d_out, d_reason), cur_tuple, is_response)
                 )
     except OSError:
         return []
+
+    acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    duplicates = _codex_mirrored_events(events, response_totals)
+    tool_key = "t3_codex" if originator == "T3 Code" else "codex"
+    for index, event in enumerate(events):
+        if index in duplicates:
+            continue
+        inp, cr, cw, out, reasoning = event.tokens
+        non_cached_in = max(0, inp - cr - cw)
+        non_reason_out = max(0, out - reasoning)
+        cost = pricing.estimate_cost(event.model, non_cached_in, non_reason_out, cr, cw, reasoning)
+        _acc_add(acc, tool_key, _ts_to_day(event.timestamp), event.model,
+                 non_cached_in, non_reason_out, cr, cw, reasoning, cost)
     return _compact_rows(acc, project=project_cwd)
 
 
@@ -955,7 +963,7 @@ def collect_hermes_usage(
                 continue
         except OSError:
             continue
-        with _open_sqlite_readonly_snapshot(db_path) as conn:
+        with sqlite_snapshot(db_path) as conn:
             if conn is None:
                 continue
             try:
@@ -1051,7 +1059,7 @@ def collect_opencode_usage(
             return
     except OSError:
         return
-    with _open_sqlite_readonly_snapshot(db_path) as conn:
+    with sqlite_snapshot(db_path) as conn:
         if conn is None:
             return
         acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -1159,7 +1167,7 @@ def collect_zcode_usage(
     db_path: Path, cutoff_ts: float, cutoff_day: str, pricing: PricingTable, result: Dict[str, Any]
 ) -> None:
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    with _open_sqlite_readonly_snapshot(db_path) as conn:
+    with sqlite_snapshot(db_path) as conn:
         if conn is None:
             return
         try:
@@ -1209,8 +1217,8 @@ def collect_live_usage(
 
     data_dir = resolve_data_dir(home_dir, create=use_cache)
     eff_cache_path = None if not use_cache else (cache_path or (data_dir / "usage_cache.json"))
-    cache = UsageCache(eff_cache_path)
     pricing_tbl = pricing or PricingTable.load(home=home_dir)
+    cache = UsageCache(eff_cache_path, pricing_tbl.signature)
 
     result: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
@@ -1224,6 +1232,15 @@ def collect_live_usage(
     collect_gemini_usage(home_dir / ".gemini", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
 
     collect_zcode_usage(home_dir / ".zcode" / "cli" / "db" / "db.sqlite", cutoff_ts, cutoff_day, pricing_tbl, result)
+
+    for tool_days in result.values():
+        for bucket in tool_days.values():
+            for name, model in bucket["models"].items():
+                missing_price = model["cost_usd"] == 0 and pricing_tbl.resolve(name) is None
+                model["unpriced_tokens"] = (
+                    sum(model[key] for key in ("in", "out", "cr", "cw", "thoughts")) if missing_price else 0
+                )
+            bucket["unpriced_tokens"] = sum(model["unpriced_tokens"] for model in bucket["models"].values())
 
     cache.save()
     return result

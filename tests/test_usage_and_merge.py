@@ -180,7 +180,7 @@ class TestAgentPulseEngine(unittest.TestCase):
                 "tools": {
                     "codex": {
                         "2026-06-01": {"in": 100000, "out": 10000, "cr": 50000, "cw": 0, "cost": 1.25},
-                        "2026-11-26": {"in": 999999, "out": 99999, "cr": 0, "cw": 0, "cost": 99.0},
+                        "2026-11-26": {"in": 1000, "out": 200, "cr": 500, "cw": 0, "cost": 99.0},
                     },
                     "claude": {
                         "2026-09-10": {"in": 50000, "out": 5000, "cr": 20000, "cw": 1000, "cost": 0.80},
@@ -287,10 +287,10 @@ class TestAgentPulseEngine(unittest.TestCase):
             snap = qc.collect_quotas(home=home, force=False, now_ts=now_ts)
             self.assertEqual(snap["schema_version"], 1)
             by_id = {p["id"]: p for p in snap["providers"]}
-            self.assertEqual(by_id["codex"]["status"], "ok")
-            self.assertEqual(by_id["codex"]["windows"][0]["used_percent"], 12.0)
+            self.assertEqual(by_id["codex"]["status"], "unavailable")
+            self.assertEqual(by_id["codex"]["windows"], [])
             self.assertEqual(by_id["claude"]["windows"][1]["used_percent"], 15.0)
-            self.assertEqual(snap["highest_window"]["used_percent"], 34.0)
+            self.assertEqual(snap["highest_window"]["used_percent"], 15.0)
 
     def test_collector_v3_independent_without_tokei_dir(self):
         with tempfile.TemporaryDirectory() as td:

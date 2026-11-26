@@ -18,25 +18,24 @@ Strictly read-only on all AI client logs and SQLite databases (WAL-safe temp sna
 from __future__ import annotations
 
 import argparse
-import contextlib
+import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _ENGINE_DIR = str(Path(__file__).resolve().parent)
 if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
-from ledger import build_usage_payload, resolve_data_dir  # noqa: E402
+from ledger import LedgerError, build_usage_payload, load_ledger, resolve_data_dir, restore_ledger  # noqa: E402
 from pricing import PricingTable  # noqa: E402
+from storage import sqlite_snapshot, write_json  # noqa: E402
 from usage_collector import collect_live_usage  # noqa: E402
 
 # Explicit business timezone: Asia/Shanghai (UTC+8)
@@ -49,7 +48,7 @@ MIN_TURN_SECONDS = 0.5         # Filter sub-0.5s metadata echoes
 WORKDAY_SECONDS = 8.0 * 3600.0 # 1 AI Workday = 8 cumulative agent hours
 LIVE_STALE_SECONDS = 90.0      # JSONL mtime freshness window for live active detection
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 TOOL_META: Dict[str, Dict[str, str]] = {
     "t3_antigravity": {"name": "T3 · Antigravity", "short": "T3 Agy", "color": "#7C6BF5"},
@@ -128,42 +127,6 @@ def parse_ts(value: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
-
-
-@contextlib.contextmanager
-def open_sqlite_readonly_snapshot(db_path: Path) -> Iterator[Optional[sqlite3.Connection]]:
-    """Copy SQLite db (+ -wal/-shm) into a private temp dir and open safely.
-
-    Never touches or locks the live client database.
-    """
-    if not db_path.is_file():
-        yield None
-        return
-    tmp_dir = tempfile.mkdtemp(prefix="agent_pulse_db_")
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        try:
-            tmp_db = Path(tmp_dir) / db_path.name
-            shutil.copy2(db_path, tmp_db)
-            for suffix in ("-wal", "-shm"):
-                side = Path(str(db_path) + suffix)
-                if side.is_file():
-                    try:
-                        shutil.copy2(side, Path(str(tmp_db) + suffix))
-                    except OSError:
-                        pass
-            conn = sqlite3.connect(str(tmp_db), timeout=5.0)
-            conn.row_factory = sqlite3.Row
-        except Exception:
-            conn = None
-        yield conn
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def merge_raw_intervals(intervals: Iterable[Tuple[float, float]], bridge_gap: float = 0.5) -> List[Tuple[float, float]]:
@@ -321,6 +284,7 @@ class SegmentCache:
     def __init__(self, path: Optional[Path]):
         self.path = path
         self.files: Dict[str, Dict[str, Any]] = {}
+        self.seen: set = set()
         self.dirty = False
         if path and path.is_file():
             try:
@@ -329,6 +293,8 @@ class SegmentCache:
                     files = raw.get("files")
                     if isinstance(files, dict):
                         self.files = files
+                else:
+                    self.dirty = True
             except Exception:
                 self.files = {}
 
@@ -339,7 +305,9 @@ class SegmentCache:
             return None
         if now_ts - st.st_mtime <= LIVE_STALE_SECONDS + 15.0:
             return None
-        entry = self.files.get(str(file_path))
+        key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
+        self.seen.add(key)
+        entry = self.files.get(key)
         if not entry:
             return None
         if entry.get("mtime_ns") != st.st_mtime_ns or entry.get("size") != st.st_size:
@@ -352,9 +320,7 @@ class SegmentCache:
                     start_ts=float(row[1]),
                     end_ts=float(row[2]),
                     is_active=False,
-                    run_key=row[3],
-                    label=row[4],
-                    is_turn_head=bool(row[5]),
+                    is_turn_head=bool(row[3]),
                 )
             )
         return segs
@@ -368,29 +334,26 @@ class SegmentCache:
             return
         if any(s.is_active for s in segs):
             return
-        self.files[str(file_path)] = {
+        key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
+        self.seen.add(key)
+        self.files[key] = {
             "mtime_ns": st.st_mtime_ns,
             "size": st.st_size,
             "segs": [
-                [s.tool, round(s.start_ts, 3), round(s.end_ts, 3), s.run_key, s.label, 1 if s.is_turn_head else 0]
+                [s.tool, round(s.start_ts, 3), round(s.end_ts, 3), 1 if s.is_turn_head else 0]
                 for s in segs
             ],
         }
         self.dirty = True
 
     def save(self) -> None:
-        if not self.path or not self.dirty:
+        if not self.path or (not self.dirty and self.files.keys() <= self.seen):
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps({"v": CACHE_VERSION, "files": self.files}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            os.replace(tmp, self.path)
-            self.dirty = False
-        except Exception:
+            write_json(self.path, {"v": CACHE_VERSION, "files": {
+                key: value for key, value in self.files.items() if key in self.seen
+            }})
+        except (OSError, ValueError):
             pass
 
 
@@ -407,7 +370,7 @@ def collect_t3_code(db_path: Path, cutoff_ts: float, now_ts: float) -> List[Work
     and `orchestration_v2_projection_runtime_requests`).
     """
     segs: List[WorkSegment] = []
-    with open_sqlite_readonly_snapshot(db_path) as conn:
+    with sqlite_snapshot(db_path) as conn:
         if conn is None:
             return segs
 
@@ -857,7 +820,7 @@ def collect_workbuddy(projects_dir: Path, cutoff_ts: float, now_ts: float, cache
 def collect_hermes_db(db_path: Path, cutoff_ts: float, now_ts: float, profile_tag: str = "") -> List[WorkSegment]:
     """Collect step-heartbeat turn spans & active leases from one Hermes state.db."""
     segs: List[WorkSegment] = []
-    with open_sqlite_readonly_snapshot(db_path) as conn:
+    with sqlite_snapshot(db_path) as conn:
         if conn is None:
             return segs
         scan_floor = cutoff_ts - 86400.0
@@ -1285,7 +1248,7 @@ def collect_pi(sessions_dir: Path, cutoff_ts: float, now_ts: float, cache: Segme
 
 def collect_opencode(db_path: Path, cutoff_ts: float) -> List[WorkSegment]:
     segs: List[WorkSegment] = []
-    with open_sqlite_readonly_snapshot(db_path) as conn:
+    with sqlite_snapshot(db_path) as conn:
         if conn is None:
             return segs
         try:
@@ -1490,6 +1453,7 @@ def aggregate_segments(
                 "hourly_seconds": [round(x, 1) for x in hourly],
                 "tokens": int(day_u.get("total_tokens", 0)),
                 "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 2),
+                "unpriced_tokens": int(day_u.get("unpriced_tokens", 0)),
                 "cache_hit_rate": round(float(day_u.get("cache_hit_rate", 0.0)), 4),
             }
         )
@@ -1545,11 +1509,13 @@ def collect_all(
     home_dir = home or Path.home()
     now = now_ts if now_ts is not None else time.time()
     now_dt = datetime.fromtimestamp(now, tz=BIZ_TZ)
-    cutoff_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=BIZ_TZ) - timedelta(days=days - 1)
-    cutoff_ts = cutoff_dt.timestamp()
-    cutoff_day = cutoff_dt.strftime("%Y-%m-%d")
-
     data_dir = resolve_data_dir(home_dir, create=True)
+    ledger_path = data_dir / "ledger.json"
+    ledger = load_ledger(ledger_path)
+    work_days = days if ledger.get("work_history_from") else max(days, 182)
+    today = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_ts = (today - timedelta(days=work_days - 1)).timestamp()
+    cutoff_day = (today - timedelta(days=days - 1)).date().isoformat()
     if not use_cache:
         effective_cache_path = None
     else:
@@ -1569,7 +1535,7 @@ def collect_all(
     cache.save()
 
     # Build base work-hours daily list first so ledger can unify work-hours + token/cost per tool
-    base_payload = aggregate_segments(all_segments, days=days, now_ts=now)
+    base_payload = aggregate_segments(all_segments, days=work_days, now_ts=now)
 
     # Native incremental Token, Cost & Project collection (zero runtime dependency on ~/.tokei)
     pricing_tbl = PricingTable.load(home=home_dir)
@@ -1582,7 +1548,6 @@ def collect_all(
         pricing=pricing_tbl,
         projects_out=live_projects,
     )
-    ledger_path = data_dir / "ledger.json"
     usage_payload, daily_usage_map = build_usage_payload(
         ledger_path=ledger_path,
         live_usage=live_usage,
@@ -1593,6 +1558,7 @@ def collect_all(
         pricing=pricing_tbl,
         live_projects=live_projects,
         home=home_dir,
+        work_history_from=(today - timedelta(days=work_days - 1)).date().isoformat(),
     )
 
     today_u = (usage_payload.get("periods") or {}).get("today") or {}
@@ -1653,6 +1619,8 @@ def render_markdown_report(payload: Dict[str, Any], target_date: Optional[str] =
         lines.append(
             f"- **Token 与估算费用**：**{_format_tokens_short(day_tok)} tokens**（估算 **${day_cost:.2f}** · 缓存命中 {cache_pct}%）"
         )
+        if day.get("unpriced_tokens"):
+            lines.append(f"- 另有 {_format_tokens_short(day['unpriced_tokens'])} Token 未计价。")
 
     if day["tools"]:
         lines.append("")
@@ -1686,10 +1654,22 @@ def main() -> int:
     parser.add_argument("--markdown", action="store_true", help="Output Markdown daily report")
     parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD for --markdown")
     parser.add_argument("--no-cache", action="store_true", help="Bypass incremental file cache")
+    parser.add_argument("--restore-ledger", type=Path, metavar="BACKUP", help="Restore a validated ledger backup")
     args = parser.parse_args()
 
     t0 = time.perf_counter()
-    payload = collect_all(days=max(7, min(args.days, 60)), use_cache=(not args.no_cache))
+    try:
+        if args.restore_ledger:
+            saved = restore_ledger(resolve_data_dir() / "ledger.json", args.restore_ledger)
+            print("账本已恢复。" + (f"恢复前副本：{saved}" if saved else ""))
+            return 0
+        payload = collect_all(days=max(7, min(args.days, 60)), use_cache=(not args.no_cache))
+    except LedgerError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except OSError:
+        print("无法读写 AgentPulse 本地数据，请检查文件权限和可用磁盘空间。", file=sys.stderr)
+        return 1
     payload["elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
 
     if args.markdown:

@@ -20,6 +20,8 @@ final class ClockStore: ObservableObject {
     @Published var isMigrating: Bool = false
     @Published var migrationMessage: String?
     @Published var lastError: String?
+    @Published var quotaError: String?
+    @Published var projectActionError: String?
     @Published var nowEpoch: Double = Date().timeIntervalSince1970
     @Published var copiedToast: Bool = false
 
@@ -66,6 +68,14 @@ final class ClockStore: ObservableObject {
     }
 
     @Published var launchAtLogin: Bool = false
+    @Published var allowLiveCodexQuota: Bool {
+        didSet {
+            UserDefaults.standard.set(allowLiveCodexQuota, forKey: Keys.allowLiveCodexQuota)
+            quotaSnapshot = nil
+            quotaError = nil
+            refreshQuotas()
+        }
+    }
     @Published var pinnedProjectPaths: Set<String> = []
     @Published var copiedToolId: String?
 
@@ -94,6 +104,7 @@ final class ClockStore: ObservableObject {
         static let menuBarShowQuotas = "agentPulse.menuBar.showQuotas"
         static let cardShowQuotaAlert = "agentPulse.card.showQuotaAlert"
         static let pinnedProjects = "agentPulse.projects.pinned"
+        static let allowLiveCodexQuota = "agentPulse.quota.allowLiveCodex"
     }
 
     static let launchAgentLabel = "dev.agentpulse.app"
@@ -115,6 +126,7 @@ final class ClockStore: ObservableObject {
         self.menuBarShowCost = defaults.object(forKey: Keys.menuBarShowCost) as? Bool ?? true
         self.menuBarShowQuotas = defaults.object(forKey: Keys.menuBarShowQuotas) as? Bool ?? true
         self.cardShowQuotaAlert = defaults.object(forKey: Keys.cardShowQuotaAlert) as? Bool ?? false
+        self.allowLiveCodexQuota = defaults.bool(forKey: Keys.allowLiveCodexQuota)
         self.launchAtLogin = FileManager.default.fileExists(atPath: Self.launchAgentURL.path)
         let savedPins = defaults.stringArray(forKey: Keys.pinnedProjects) ?? []
         self.pinnedProjectPaths = Set(savedPins)
@@ -264,7 +276,7 @@ final class ClockStore: ObservableObject {
         let pythonPath = locatePython()
 
         workQueue.async { [weak self] in
-            let result = Self.runScript(pythonPath: pythonPath, scriptURL: scriptURL, args: ["--days", "14", "--json"])
+            let result = ScriptRunner.run(pythonPath: pythonPath, scriptURL: scriptURL, args: ["--days", "14", "--json"], timeout: 90)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isRefreshing = false
@@ -282,7 +294,7 @@ final class ClockStore: ObservableObject {
                             self.onLayoutChanged?()
                         }
                     } catch {
-                        self.lastError = "解析失败: \(error.localizedDescription)"
+                        self.lastError = "无法读取采集结果，请检查本地数据后刷新。"
                     }
                 case .failure(let err):
                     self.lastError = err.localizedDescription
@@ -294,21 +306,35 @@ final class ClockStore: ObservableObject {
     func refreshQuotas(force: Bool = false) {
         guard !isRefreshingQuotas else { return }
         guard let scriptURL = locateScript(named: "quota_collector.py", devSubpath: "engine/quota_collector.py") else {
+            quotaError = "未找到额度采集器，请重新安装 AgentPulse。"
             return
         }
         isRefreshingQuotas = true
         let pythonPath = locatePython()
-        let args = force ? ["--json", "--force"] : ["--json"]
+        let live = allowLiveCodexQuota
+        let args = ["--json"] + (force ? ["--force"] : []) + (live ? ["--live-codex"] : [])
 
         quotaQueue.async { [weak self] in
-            let result = Self.runScript(pythonPath: pythonPath, scriptURL: scriptURL, args: args)
+            let result = ScriptRunner.run(pythonPath: pythonPath, scriptURL: scriptURL, args: args, timeout: 30)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isRefreshingQuotas = false
-                if case .success(let data) = result,
-                   let decoded = try? JSONDecoder().decode(QuotaSnapshot.self, from: data) {
-                    self.quotaSnapshot = decoded
-                    self.onQuotaUpdated?(decoded)
+                guard self.allowLiveCodexQuota == live else {
+                    self.refreshQuotas()
+                    return
+                }
+                switch result {
+                case .success(let data):
+                    do {
+                        let decoded = try JSONDecoder().decode(QuotaSnapshot.self, from: data)
+                        self.quotaSnapshot = decoded
+                        self.quotaError = nil
+                        self.onQuotaUpdated?(decoded)
+                    } catch {
+                        self.quotaError = "额度数据格式无效，请刷新或检查本地额度文件。"
+                    }
+                case .failure(let error):
+                    self.quotaError = error.localizedDescription
                 }
             }
         }
@@ -325,7 +351,7 @@ final class ClockStore: ObservableObject {
         let pythonPath = locatePython()
 
         workQueue.async { [weak self] in
-            let result = Self.runScript(pythonPath: pythonPath, scriptURL: scriptURL, args: ["--json"])
+            let result = ScriptRunner.run(pythonPath: pythonPath, scriptURL: scriptURL, args: ["--json"], timeout: 90)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isMigrating = false
@@ -349,8 +375,15 @@ final class ClockStore: ObservableObject {
 
     func openDataDirectory() {
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".agent-pulse")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(dir)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        } catch CocoaError.fileWriteFileExists {
+            // The collector already initialized the private directory.
+        } catch {
+            lastError = "无法打开数据目录，请检查目录权限。"
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([dir])
     }
 
     func togglePinProject(_ path: String) {
@@ -363,26 +396,44 @@ final class ClockStore: ObservableObject {
     }
 
     func openProjectInFinder(_ path: String) {
-        let url = URL(fileURLWithPath: path)
-        if FileManager.default.fileExists(atPath: url.path) {
-            NSWorkspace.shared.open(url)
-        }
+        guard let directory = projectDirectory(path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([directory])
     }
 
     func openProjectInTerminal(_ path: String) {
-        let url = URL(fileURLWithPath: path)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let directory = projectDirectory(path) else { return }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        proc.arguments = ["-a", "Terminal", url.path]
-        try? proc.run()
+        proc.arguments = ["-a", "Terminal", directory.path]
+        do {
+            try proc.run()
+        } catch {
+            projectActionError = "无法启动终端。"
+        }
+    }
+
+    private func projectDirectory(_ path: String) -> URL? {
+        guard let directory = Self.validatedProjectDirectory(path) else {
+            projectActionError = "项目目录已移动、不可访问，或不是普通目录。"
+            return nil
+        }
+        projectActionError = nil
+        return directory
+    }
+
+    nonisolated static func validatedProjectDirectory(_ path: String) -> URL? {
+        guard path.hasPrefix("/") else { return nil }
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        return values?.isDirectory == true && values?.isPackage == false ? url : nil
     }
 
     func copyToolSummary(_ tool: UsageToolStats, periodTitle: String) {
         let hitPct = Int(round(tool.effectiveCacheHitRate * 100))
+        let estimate = Formatters.estimatedUSD(tool.costUsd, unpricedTokens: tool.unpricedTokens ?? 0)
         var lines: [String] = [
             "### \(tool.displayName) · \(periodTitle)",
-            "- 总 Token：\(Formatters.compactTokens(tool.totalTokens))（估算 \(Formatters.usd(tool.costUsd)) · Cache Hit \(hitPct)%）",
+            "- 总 Token：\(Formatters.compactTokens(tool.totalTokens))（估算 \(estimate) · Cache Hit \(hitPct)%）",
             "- 构成：输入 \(Formatters.compactTokens(tool.inputTokens)) / 输出 \(Formatters.compactTokens(tool.outputTokens)) / 缓存读 \(Formatters.compactTokens(tool.cacheReadTokens)) / 缓存写 \(Formatters.compactTokens(tool.cacheWriteTokens)) / 推理 \(Formatters.compactTokens(tool.reasoningTokens))",
         ]
         if tool.agentSeconds > 0 {
@@ -392,7 +443,8 @@ final class ClockStore: ObservableObject {
             lines.append("- 模型明细：")
             for m in tool.models.prefix(8) {
                 let mHit = Int(round(m.effectiveCacheHitRate * 100))
-                lines.append("  - `\(m.model)`: \(Formatters.compactTokens(m.totalTokens)) tok · \(mHit)% · \(Formatters.usd(m.costUsd))")
+                let amount = Formatters.estimatedUSD(m.costUsd, unpricedTokens: m.unpricedTokens ?? 0)
+                lines.append("  - `\(m.model)`: \(Formatters.compactTokens(m.totalTokens)) tok · \(mHit)% · \(amount)")
             }
         }
         let pb = NSPasteboard.general
@@ -415,7 +467,7 @@ final class ClockStore: ObservableObject {
             args.append(contentsOf: ["--date", target])
         }
         workQueue.async { [weak self] in
-            let result = Self.runScript(pythonPath: pythonPath, scriptURL: scriptURL, args: args)
+            let result = ScriptRunner.run(pythonPath: pythonPath, scriptURL: scriptURL, args: args, timeout: 90)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if case .success(let data) = result,
@@ -490,6 +542,7 @@ final class ClockStore: ObservableObject {
            FileManager.default.fileExists(atPath: res.path) {
             return res
         }
+        if Bundle.main.bundleURL.pathExtension == "app" { return nil }
         let exeDir = Bundle.main.executableURL?.deletingLastPathComponent()
         let devCandidates: [URL] = [
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(devSubpath),
@@ -501,27 +554,4 @@ final class ClockStore: ObservableObject {
         return devCandidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    private nonisolated static func runScript(pythonPath: String, scriptURL: URL, args: [String]) -> Result<Data, Error> {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: pythonPath)
-        proc.arguments = [scriptURL.path] + args
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-
-        do {
-            try proc.run()
-            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            if proc.terminationStatus == 0 {
-                return .success(data)
-            }
-            let errMsg = String(data: errData, encoding: .utf8) ?? "exit \(proc.terminationStatus)"
-            return .failure(NSError(domain: "AgentPulse", code: Int(proc.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errMsg]))
-        } catch {
-            return .failure(error)
-        }
-    }
 }
