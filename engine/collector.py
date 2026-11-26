@@ -36,6 +36,7 @@ if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
 
 from ledger import build_usage_payload, resolve_data_dir  # noqa: E402
+from pricing import PricingTable  # noqa: E402
 from usage_collector import collect_live_usage  # noqa: E402
 
 # Explicit business timezone: Asia/Shanghai (UTC+8)
@@ -1570,12 +1571,16 @@ def collect_all(
     # Build base work-hours daily list first so ledger can unify work-hours + token/cost per tool
     base_payload = aggregate_segments(all_segments, days=days, now_ts=now)
 
-    # Native incremental Token & Cost collection (zero runtime dependency on ~/.tokei)
+    # Native incremental Token, Cost & Project collection (zero runtime dependency on ~/.tokei)
+    pricing_tbl = PricingTable.load(home=home_dir)
+    live_projects: Dict[str, Dict[str, Dict[str, Any]]] = {}
     live_usage = collect_live_usage(
         home=home_dir,
         days=days,
         use_cache=use_cache,
         now_ts=now,
+        pricing=pricing_tbl,
+        projects_out=live_projects,
     )
     ledger_path = data_dir / "ledger.json"
     usage_payload, daily_usage_map = build_usage_payload(
@@ -1585,6 +1590,9 @@ def collect_all(
         now_ts=now,
         work_daily_list=base_payload["days"],
         persist=True,
+        pricing=pricing_tbl,
+        live_projects=live_projects,
+        home=home_dir,
     )
 
     today_u = (usage_payload.get("periods") or {}).get("today") or {}

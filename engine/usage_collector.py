@@ -29,7 +29,16 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from pricing import PricingTable
 
 BIZ_TZ = timezone(timedelta(hours=8))
-USAGE_CACHE_VERSION = 2
+USAGE_CACHE_VERSION = 3
+
+
+def _normalize_project_path(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip().rstrip("/")
+    if not s or not s.startswith("/") or s in ("/", "/tmp", "/private/tmp", "/var/tmp"):
+        return ""
+    return s
 
 
 def _parse_ts(value: Any) -> Optional[float]:
@@ -184,6 +193,7 @@ def _empty_bucket() -> Dict[str, Any]:
         "thoughts": 0,
         "cost_usd": 0.0,
         "requests": 0,
+        "sessions": 0,
         "models": {},
     }
 
@@ -198,6 +208,7 @@ def _add_to_bucket(
     thoughts: int,
     cost_usd: float,
     requests: int = 1,
+    sessions: int = 0,
 ) -> None:
     bucket["in"] += inp
     bucket["out"] += out
@@ -206,6 +217,7 @@ def _add_to_bucket(
     bucket["thoughts"] += thoughts
     bucket["cost_usd"] = round(bucket["cost_usd"] + cost_usd, 6)
     bucket["requests"] += requests
+    bucket["sessions"] = bucket.get("sessions", 0) + sessions
 
     mkey = (model or "unknown").strip() or "unknown"
     m = bucket["models"].setdefault(
@@ -225,46 +237,94 @@ def _merge_rows_into_result(
     result: Dict[str, Dict[str, Dict[str, Any]]],
     rows: List[Dict[str, Any]],
     cutoff_day: str,
+    projects_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> None:
     for r in rows:
         day = r.get("day")
         if not day or day < cutoff_day:
             continue
         tool = r["tool"]
+        inp = _safe_int(r.get("in"))
+        out = _safe_int(r.get("out"))
+        cr = _safe_int(r.get("cr"))
+        cw = _safe_int(r.get("cw"))
+        thoughts = _safe_int(r.get("thoughts"))
+        cost_usd = _safe_float(r.get("cost_usd"))
+        reqs = _safe_int(r.get("requests") or 1)
+        sess = _safe_int(r.get("sessions"))
+
         day_map = result.setdefault(tool, {})
         bucket = day_map.setdefault(day, _empty_bucket())
         _add_to_bucket(
             bucket,
             model=r.get("model", "unknown"),
-            inp=_safe_int(r.get("in")),
-            out=_safe_int(r.get("out")),
-            cr=_safe_int(r.get("cr")),
-            cw=_safe_int(r.get("cw")),
-            thoughts=_safe_int(r.get("thoughts")),
-            cost_usd=_safe_float(r.get("cost_usd")),
-            requests=_safe_int(r.get("requests") or 1),
+            inp=inp,
+            out=out,
+            cr=cr,
+            cw=cw,
+            thoughts=thoughts,
+            cost_usd=cost_usd,
+            requests=reqs,
+            sessions=sess,
         )
 
+        proj = r.get("project")
+        if projects_out is not None and isinstance(proj, str) and proj:
+            p_days = projects_out.setdefault(proj, {})
+            pb = p_days.setdefault(
+                day,
+                {
+                    "in": 0,
+                    "out": 0,
+                    "cr": 0,
+                    "cw": 0,
+                    "thoughts": 0,
+                    "cost_usd": 0.0,
+                    "sessions": 0,
+                    "tools": [],
+                },
+            )
+            pb["in"] += inp
+            pb["out"] += out
+            pb["cr"] += cr
+            pb["cw"] += cw
+            pb["thoughts"] += thoughts
+            pb["cost_usd"] = round(pb["cost_usd"] + cost_usd, 6)
+            pb["sessions"] += sess
+            if tool not in pb["tools"]:
+                pb["tools"].append(tool)
 
-def _compact_rows(acc: Dict[Tuple[str, str, str], Dict[str, Any]]) -> List[Dict[str, Any]]:
+
+def _compact_rows(
+    acc: Dict[Tuple[str, str, str], Dict[str, Any]],
+    project: str = "",
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    seen_session_days: set = set()
     for (tool, day, model), v in acc.items():
         if v["in"] + v["out"] + v["cr"] + v["cw"] + v["thoughts"] <= 0 and v["cost_usd"] <= 0:
             continue
-        rows.append(
-            {
-                "tool": tool,
-                "day": day,
-                "model": model,
-                "in": v["in"],
-                "out": v["out"],
-                "cr": v["cr"],
-                "cw": v["cw"],
-                "thoughts": v["thoughts"],
-                "cost_usd": round(v["cost_usd"], 6),
-                "requests": v["requests"],
-            }
-        )
+        s_key = (tool, day)
+        sess_inc = 0
+        if s_key not in seen_session_days:
+            seen_session_days.add(s_key)
+            sess_inc = 1
+        row: Dict[str, Any] = {
+            "tool": tool,
+            "day": day,
+            "model": model,
+            "in": v["in"],
+            "out": v["out"],
+            "cr": v["cr"],
+            "cw": v["cw"],
+            "thoughts": v["thoughts"],
+            "cost_usd": round(v["cost_usd"], 6),
+            "requests": v["requests"],
+            "sessions": sess_inc,
+        }
+        if project:
+            row["project"] = project
+        rows.append(row)
     return rows
 
 
@@ -302,6 +362,7 @@ def _acc_add(
 
 def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
     originator = ""
+    project_cwd = ""
     session_id = None
     response_ids = set()
     current_model = "gpt-5"
@@ -334,6 +395,8 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
                     orig = payload.get("originator")
                     if isinstance(orig, str):
                         originator = orig
+                    if not project_cwd:
+                        project_cwd = _normalize_project_path(payload.get("cwd"))
                     continue
 
                 if typ == "turn_context":
@@ -443,11 +506,17 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
                 )
     except OSError:
         return []
-    return _compact_rows(acc)
+    return _compact_rows(acc, project=project_cwd)
 
 
 def collect_codex_usage(
-    sessions_root: Path, cutoff_ts: float, cutoff_day: str, cache: UsageCache, pricing: PricingTable, result: Dict[str, Any]
+    sessions_root: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    cache: UsageCache,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    projects_out: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not sessions_root.is_dir():
         return
@@ -461,7 +530,7 @@ def collect_codex_usage(
         if rows is None:
             rows = _parse_codex_file(path, pricing)
             cache.put(path, rows)
-        _merge_rows_into_result(result, rows, cutoff_day)
+        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
 
 
 # ---------------------------------------------------------------------------
@@ -487,16 +556,21 @@ def _detail_int(d: Any, *keys: str) -> int:
 def _parse_workbuddy_file(path: Path, tool_key: str, pricing: PricingTable) -> List[Dict[str, Any]]:
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     seen_dedup: set = set()
+    project_cwd = ""
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
             for line_no, line in enumerate(fh, 1):
-                if '"usage"' not in line and '"rawUsage"' not in line:
+                if '"usage"' not in line and '"rawUsage"' not in line and (project_cwd or '"cwd"' not in line):
                     continue
                 try:
                     item = json.loads(line)
                 except Exception:
                     continue
                 if not isinstance(item, dict):
+                    continue
+                if not project_cwd:
+                    project_cwd = _normalize_project_path(item.get("cwd"))
+                if '"usage"' not in line and '"rawUsage"' not in line:
                     continue
                 ts = _parse_ts(item.get("timestamp") or item.get("createdAt") or item.get("ts"))
                 if ts is None:
@@ -624,11 +698,18 @@ def _parse_workbuddy_file(path: Path, tool_key: str, pricing: PricingTable) -> L
                 )
     except OSError:
         return []
-    return _compact_rows(acc)
+    return _compact_rows(acc, project=project_cwd)
 
 
 def collect_workbuddy_usage(
-    root: Path, tool_key: str, cutoff_ts: float, cutoff_day: str, cache: UsageCache, pricing: PricingTable, result: Dict[str, Any]
+    root: Path,
+    tool_key: str,
+    cutoff_ts: float,
+    cutoff_day: str,
+    cache: UsageCache,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    projects_out: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not root.is_dir():
         return
@@ -642,7 +723,7 @@ def collect_workbuddy_usage(
         if rows is None:
             rows = _parse_workbuddy_file(path, tool_key, pricing)
             cache.put(path, rows)
-        _merge_rows_into_result(result, rows, cutoff_day)
+        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
 
 
 # ---------------------------------------------------------------------------
@@ -654,16 +735,21 @@ def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]
     # Deduplicate streaming chunks by message.id, retaining the final (max output) snapshot
     by_msg: Dict[str, Tuple[float, str, int, int, int, int, int]] = {}
     fallback_seq = 0
+    project_cwd = ""
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
-                if '"usage"' not in line:
+                if '"usage"' not in line and (project_cwd or '"cwd"' not in line):
                     continue
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
                 if not isinstance(obj, dict):
+                    continue
+                if not project_cwd:
+                    project_cwd = _normalize_project_path(obj.get("cwd"))
+                if '"usage"' not in line:
                     continue
                 msg = obj.get("message")
                 if not isinstance(msg, dict):
@@ -719,11 +805,17 @@ def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]
             cost_usd=cost,
             requests=1,
         )
-    return _compact_rows(acc)
+    return _compact_rows(acc, project=project_cwd)
 
 
 def collect_claude_usage(
-    projects_root: Path, cutoff_ts: float, cutoff_day: str, cache: UsageCache, pricing: PricingTable, result: Dict[str, Any]
+    projects_root: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    cache: UsageCache,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    projects_out: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not projects_root.is_dir():
         return
@@ -737,7 +829,7 @@ def collect_claude_usage(
         if rows is None:
             rows = _parse_claude_file(path, pricing)
             cache.put(path, rows)
-        _merge_rows_into_result(result, rows, cutoff_day)
+        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
 
 
 # ---------------------------------------------------------------------------
@@ -747,16 +839,21 @@ def collect_claude_usage(
 
 def _parse_pi_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    project_cwd = ""
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
-                if '"usage"' not in line:
+                if '"usage"' not in line and (project_cwd or '"session"' not in line):
                     continue
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
                 if not isinstance(obj, dict):
+                    continue
+                if not project_cwd and obj.get("type") == "session":
+                    project_cwd = _normalize_project_path(obj.get("cwd"))
+                if '"usage"' not in line:
                     continue
                 msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
                 usage = msg.get("usage") or obj.get("usage")
@@ -805,11 +902,17 @@ def _parse_pi_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
                 )
     except OSError:
         return []
-    return _compact_rows(acc)
+    return _compact_rows(acc, project=project_cwd)
 
 
 def collect_pi_usage(
-    sessions_root: Path, cutoff_ts: float, cutoff_day: str, cache: UsageCache, pricing: PricingTable, result: Dict[str, Any]
+    sessions_root: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    cache: UsageCache,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    projects_out: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not sessions_root.is_dir():
         return
@@ -823,7 +926,7 @@ def collect_pi_usage(
         if rows is None:
             rows = _parse_pi_file(path, pricing)
             cache.put(path, rows)
-        _merge_rows_into_result(result, rows, cutoff_day)
+        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1195,7 @@ def collect_live_usage(
     use_cache: bool = True,
     now_ts: Optional[float] = None,
     pricing: Optional[PricingTable] = None,
+    projects_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Scan local AI logs for the last `days` days and return {tool: {YYYY-MM-DD: bucket}}."""
     home_dir = home or Path.home()
@@ -1110,11 +1214,11 @@ def collect_live_usage(
 
     result: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
-    collect_codex_usage(home_dir / ".codex" / "sessions", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
-    collect_workbuddy_usage(home_dir / ".workbuddy" / "projects", "workbuddy", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
-    collect_workbuddy_usage(home_dir / ".codebuddy" / "projects", "codebuddy", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
-    collect_claude_usage(home_dir / ".claude" / "projects", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
-    collect_pi_usage(home_dir / ".pi" / "agent" / "sessions", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
+    collect_codex_usage(home_dir / ".codex" / "sessions", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
+    collect_workbuddy_usage(home_dir / ".workbuddy" / "projects", "workbuddy", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
+    collect_workbuddy_usage(home_dir / ".codebuddy" / "projects", "codebuddy", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
+    collect_claude_usage(home_dir / ".claude" / "projects", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
+    collect_pi_usage(home_dir / ".pi" / "agent" / "sessions", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
     collect_hermes_usage(home_dir / ".hermes", cutoff_ts, cutoff_day, pricing_tbl, result)
     collect_opencode_usage(home_dir / ".local" / "share" / "opencode" / "opencode.db", cutoff_ts, cutoff_day, pricing_tbl, result)
     collect_gemini_usage(home_dir / ".gemini", cutoff_ts, cutoff_day, cache, pricing_tbl, result)

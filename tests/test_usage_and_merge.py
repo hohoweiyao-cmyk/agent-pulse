@@ -339,6 +339,128 @@ class TestAgentPulseEngine(unittest.TestCase):
             # Legacy directory must remain untouched as a safety backup
             self.assertTrue((legacy / "ledger.json").is_file())
 
+    def test_v05_seven_periods_model_rates_heatmap_and_projects(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            # 2026-11-26 is Thursday -> Mon this week = 2026-11-23, Last week = 2026-11-16..2026-11-22
+            now_dt = datetime(2026, 11, 26, 18, 0, 0, tzinfo=uc.BIZ_TZ)
+            now_ts = now_dt.timestamp()
+
+            def iso(dt):
+                return dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+            # Today: Codex session inside project A (with T3 Code originator)
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "26"
+            cx_dir.mkdir(parents=True)
+            (cx_dir / "s_today.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"timestamp": iso(now_dt - timedelta(minutes=10)), "type": "session_meta",
+                                "payload": {"originator": "T3 Code", "cwd": str(home / "dev" / "alpha-app")}}),
+                    json.dumps({"timestamp": iso(now_dt - timedelta(minutes=10)), "type": "turn_context",
+                                "payload": {"model": "gpt-6.2-sol"}}),
+                    json.dumps({"timestamp": iso(now_dt - timedelta(minutes=5)), "type": "event_msg",
+                                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                                    "input_tokens": 100000, "cached_input_tokens": 80000,
+                                    "output_tokens": 4000, "reasoning_output_tokens": 1000
+                                }}}}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # Yesterday: Claude Code session inside project B
+            cc_dir = home / ".claude" / "projects" / "beta"
+            cc_dir.mkdir(parents=True)
+            yest_dt = now_dt - timedelta(days=1)
+            (cc_dir / "c_yest.jsonl").write_text(
+                json.dumps({
+                    "timestamp": iso(yest_dt),
+                    "cwd": str(home / "dev" / "beta-service"),
+                    "message": {
+                        "id": "msg_1",
+                        "model": "claude-sonnet-4.5",
+                        "usage": {"input_tokens": 20000, "output_tokens": 2000, "cache_read_input_tokens": 60000, "cache_creation_input_tokens": 5000},
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # Last week (2026-11-18): Codex CLI session in project A
+            lw_dt = datetime(2026, 11, 18, 12, 0, 0, tzinfo=uc.BIZ_TZ)
+            (cx_dir / "s_lastweek.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"timestamp": iso(lw_dt), "type": "session_meta",
+                                "payload": {"originator": "codex_cli_rs", "cwd": str(home / "dev" / "alpha-app")}}),
+                    json.dumps({"timestamp": iso(lw_dt), "type": "turn_context",
+                                "payload": {"model": "gpt-6.2-sol"}}),
+                    json.dumps({"timestamp": iso(lw_dt), "type": "event_msg",
+                                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                                    "input_tokens": 50000, "cached_input_tokens": 25000,
+                                    "output_tokens": 2000, "reasoning_output_tokens": 0
+                                }}}}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            tbl = pr.PricingTable(
+                models={
+                    "openai/gpt-6.2-sol": {"in": 2.0, "out": 10.0, "cache_read": 0.2, "cache_write": 0.0},
+                    "anthropic/claude-sonnet-4.5": {"in": 3.0, "out": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+                },
+                aliases={},
+            )
+            live_projects = {}
+            live_usage = uc.collect_live_usage(
+                home=home, days=14, use_cache=False, now_ts=now_ts, pricing=tbl, projects_out=live_projects
+            )
+            usage_payload, _ = lg.build_usage_payload(
+                ledger_path=home / ".agent-pulse" / "ledger.json",
+                live_usage=live_usage,
+                live_cutoff_day="2026-11-13",
+                now_ts=now_ts,
+                persist=True,
+                pricing=tbl,
+                live_projects=live_projects,
+                home=home,
+            )
+
+            periods = usage_payload["periods"]
+            for pk in ("today", "yesterday", "week", "last_week", "month", "year", "all"):
+                self.assertIn(pk, periods)
+
+            # Today: t3_codex only, 1 session, 80% cache hit, pricing rates populated
+            t_tools = periods["today"]["tools"]
+            self.assertEqual(len(t_tools), 1)
+            self.assertEqual(t_tools[0]["tool"], "t3_codex")
+            self.assertEqual(t_tools[0]["sessions"], 1)
+            self.assertAlmostEqual(t_tools[0]["cache_hit_rate"], 0.8, places=3)
+            m0 = t_tools[0]["models"][0]
+            self.assertAlmostEqual(m0["rate_in"], 2.0, places=3)
+            self.assertAlmostEqual(m0["rate_out"], 10.0, places=3)
+            self.assertAlmostEqual(m0["rate_cache_read"], 0.2, places=3)
+
+            # Yesterday: claude_code only
+            self.assertEqual(periods["yesterday"]["tools"][0]["tool"], "claude_code")
+            # Last week: standalone codex only
+            self.assertEqual(periods["last_week"]["tools"][0]["tool"], "codex")
+            # All period has cross-tool top_models
+            self.assertGreaterEqual(len(periods["all"]["top_models"]), 2)
+
+            # Heatmap: 182 days, 2-day current streak (today + yesterday), 3 total active days
+            hm = usage_payload["heatmap"]
+            self.assertEqual(len(hm["days"]), 182)
+            self.assertEqual(hm["current_streak"], 2)
+            self.assertEqual(hm["longest_streak"], 2)
+            self.assertEqual(hm["total_active_days"], 3)
+
+            # Projects trail: alpha-app (today, 2 sessions across t3_codex + codex) and beta-service (week)
+            projs = {p["name"]: p for p in usage_payload["projects"]}
+            self.assertIn("alpha-app", projs)
+            self.assertIn("beta-service", projs)
+            self.assertEqual(projs["alpha-app"]["group"], "today")
+            self.assertEqual(projs["alpha-app"]["sessions"], 2)
+            self.assertEqual(projs["alpha-app"]["display_path"], "~/dev/alpha-app")
+            self.assertEqual(projs["beta-service"]["group"], "week")
+
 
 if __name__ == "__main__":
     unittest.main()

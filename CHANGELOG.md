@@ -4,6 +4,14 @@ All notable changes to **AgentPulse** (formerly *AgentClock*) are documented in 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-11-26
+
+### Added
+- **Tokei-Grade Per-Tool Detail Cards (`DetailCardsView.swift`)**: Upgraded the menu bar popover to a dynamic-width (`624pt` / `440pt`) 5-tab interface inspired by the MIT open-source project [cclank/tokei](https://github.com/cclank/tokei). Each active AI client gets its own rich card featuring AI work hours, session count, Cache Hit ring, 2×N token grid (`Input / Output / Cache Read / Cache Write / Reasoning`), inline Codex/Claude 5h & 7d quota bars, one-click tool copy, and **2-level expandable model breakdowns** showing per-model token splits and `$/1M` pricing references.
+- **7 Time Periods**: Expanded period switching to `Today / Yesterday / Week (Mon–Today) / Last Week / Month / Year / All`.
+- **Dashboard & 26-Week Interactive Heatmap (`DashboardViews.swift`)**: Added 4 summary KPIs, a clickable 182-day GitHub-style activity heatmap (Cost / Tokens / Hours) with per-day tool bills, active streak tracking (`current_streak` / `longest_streak`), and a cross-tool Top Models cost leaderboard.
+- **Project Trail (`ProjectTrailViews.swift`)**: Automatically aggregates Codex (including T3 Codex), Claude Code, WorkBuddy, CodeBuddy, and Pi usage by `cwd` project directory, persisted in `ledger.json`, with search, pinning, recency grouping, 5-token breakdown, and Finder/Terminal quick-open actions.
+
 ## [0.4.0] - 2026-11-26
 
 ### Changed

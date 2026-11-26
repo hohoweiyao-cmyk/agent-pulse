@@ -6,8 +6,8 @@ DIST="$ROOT/dist"
 APP="$DIST/AgentPulse.app"
 ICONSET="$DIST/AppIcon.iconset"
 BUNDLE_ID="${AGENTPULSE_BUNDLE_ID:-dev.agentpulse.app}"
-VERSION="0.4.0"
-BUILD_NUMBER="7"
+VERSION="0.5.0"
+BUILD_NUMBER="8"
 
 mkdir -p "$DIST"
 

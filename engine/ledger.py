@@ -131,6 +131,7 @@ def load_ledger(path: Path) -> Dict[str, Any]:
             "tokei_import_meta": None,
             "imported_tools": {},
             "live_tools": {},
+            "projects": {},
         }
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -138,6 +139,7 @@ def load_ledger(path: Path) -> Dict[str, Any]:
             raw.setdefault("version", LEDGER_VERSION)
             raw.setdefault("imported_tools", {})
             raw.setdefault("live_tools", {})
+            raw.setdefault("projects", {})
             return raw
     except Exception:
         pass
@@ -147,6 +149,7 @@ def load_ledger(path: Path) -> Dict[str, Any]:
         "tokei_import_meta": None,
         "imported_tools": {},
         "live_tools": {},
+        "projects": {},
     }
 
 
@@ -165,8 +168,9 @@ def update_ledger_with_live(
     live_usage: Dict[str, Dict[str, Dict[str, Any]]],
     live_cutoff_day: str,
     now_ts: float,
+    live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> bool:
-    """Merge live_usage into ledger['live_tools'] for days >= live_cutoff_day. Returns True if changed."""
+    """Merge live_usage & live_projects into ledger for days >= live_cutoff_day. Returns True if changed."""
     live_tools = ledger.setdefault("live_tools", {})
     changed = False
 
@@ -180,6 +184,17 @@ def update_ledger_with_live(
             if t_dst.get(day_key) != bucket:
                 t_dst[day_key] = bucket
                 changed = True
+
+    if live_projects:
+        proj_store = ledger.setdefault("projects", {})
+        for proj_path, day_map in live_projects.items():
+            p_dst = proj_store.setdefault(proj_path, {})
+            for day_key, bucket in day_map.items():
+                if day_key < live_cutoff_day:
+                    continue
+                if p_dst.get(day_key) != bucket:
+                    p_dst[day_key] = bucket
+                    changed = True
 
     if changed or not ledger.get("updated_at"):
         ledger["updated_at"] = datetime.fromtimestamp(now_ts, tz=BIZ_TZ).isoformat()
@@ -240,6 +255,7 @@ def _build_period_summary(
     start_day: str,
     end_day: str,
     work_by_day: Optional[Dict[str, Dict[str, Any]]] = None,
+    pricing: Optional[Any] = None,
 ) -> Dict[str, Any]:
     total_in = total_out = total_cr = total_cw = total_thoughts = 0
     total_cost = 0.0
@@ -256,6 +272,7 @@ def _build_period_summary(
             b_cw = _safe_int(b.get("cw"))
             b_th = _safe_int(b.get("thoughts"))
             b_cost = _safe_float(b.get("cost_usd", b.get("cost")))
+            b_sess = _safe_int(b.get("sessions"))
             b_tok = b_in + b_out + b_cr + b_cw + b_th
             if b_tok <= 0 and b_cost <= 0:
                 continue
@@ -277,6 +294,7 @@ def _build_period_summary(
                     "cw": 0,
                     "thoughts": 0,
                     "cost_usd": 0.0,
+                    "sessions": 0,
                     "active_days": set(),
                     "models": {},
                 },
@@ -287,6 +305,7 @@ def _build_period_summary(
             t_entry["cw"] += b_cw
             t_entry["thoughts"] += b_th
             t_entry["cost_usd"] += b_cost
+            t_entry["sessions"] += b_sess if b_sess > 0 else 1
             t_entry["active_days"].add(day_key)
 
             for m_name, m_val in (b.get("models") or {}).items():
@@ -303,7 +322,7 @@ def _build_period_summary(
                 m_dst["thoughts"] += _safe_int(m_val.get("thoughts", m_val.get("reason")))
                 m_dst["cost_usd"] += _safe_float(m_val.get("cost_usd", m_val.get("cost")))
 
-    # Merge work-hours per tool in the same date range (for unified table!)
+    # Merge work-hours per tool in the same date range (for unified cards!)
     work_seconds_total = 0.0
     work_wall_total = 0.0
     work_runs_total = 0
@@ -331,6 +350,7 @@ def _build_period_summary(
                         "cw": 0,
                         "thoughts": 0,
                         "cost_usd": 0.0,
+                        "sessions": 0,
                         "active_days": set(),
                         "models": {},
                     },
@@ -341,23 +361,52 @@ def _build_period_summary(
     cache_hit_rate = round(total_cr / denom_in, 4) if denom_in > 0 else 0.0
 
     tools_list: List[Dict[str, Any]] = []
+    cross_models: List[Dict[str, Any]] = []
     for tool, v in tool_acc.items():
         tok = v["in"] + v["out"] + v["cr"] + v["cw"] + v["thoughts"]
         w_sec = tool_work_sec.get(tool, 0.0)
         if tok <= 0 and v["cost_usd"] <= 0 and w_sec <= 0:
             continue
         meta = USAGE_TOOL_META.get(tool, {"name": tool, "short": tool, "color": "#94A3B8"})
+        t_denom = v["in"] + v["cr"] + v["cw"]
+        t_hit = round(v["cr"] / t_denom, 4) if t_denom > 0 else 0.0
+        t_runs = tool_work_runs.get(tool, 0)
+        t_sessions = v["sessions"] if v["sessions"] > 0 else max(t_runs, len(v["active_days"]))
+
         models_out = []
         for m_name, mv in sorted(
             v["models"].items(),
             key=lambda kv: (kv[1]["cost_usd"], kv[1]["in"] + kv[1]["out"] + kv[1]["cr"]),
             reverse=True,
-        )[:6]:
+        )[:20]:
             m_tok = mv["in"] + mv["out"] + mv["cr"] + mv["cw"] + mv["thoughts"]
             if m_tok <= 0 and mv["cost_usd"] <= 0:
                 continue
-            models_out.append(
+            m_denom = mv["in"] + mv["cr"] + mv["cw"]
+            m_hit = round(mv["cr"] / m_denom, 4) if m_denom > 0 else 0.0
+            rates = pricing.resolve(m_name) if pricing is not None else None
+            m_obj = {
+                "model": m_name,
+                "input_tokens": mv["in"],
+                "output_tokens": mv["out"],
+                "cache_read_tokens": mv["cr"],
+                "cache_write_tokens": mv["cw"],
+                "reasoning_tokens": mv["thoughts"],
+                "total_tokens": m_tok,
+                "cost_usd": round(mv["cost_usd"], 4),
+                "cache_hit_rate": m_hit,
+                "rate_in": round(rates["in"], 4) if rates else None,
+                "rate_out": round(rates["out"], 4) if rates else None,
+                "rate_cache_read": round(rates["cache_read"], 4) if rates else None,
+                "rate_cache_write": round(rates["cache_write"], 4) if rates else None,
+            }
+            models_out.append(m_obj)
+            cross_models.append(
                 {
+                    "tool": tool,
+                    "display_name": meta["name"],
+                    "short_name": meta["short"],
+                    "color": meta["color"],
                     "model": m_name,
                     "input_tokens": mv["in"],
                     "output_tokens": mv["out"],
@@ -366,8 +415,10 @@ def _build_period_summary(
                     "reasoning_tokens": mv["thoughts"],
                     "total_tokens": m_tok,
                     "cost_usd": round(mv["cost_usd"], 4),
+                    "cache_hit_rate": m_hit,
                 }
             )
+
         tools_list.append(
             {
                 "tool": tool,
@@ -381,10 +432,12 @@ def _build_period_summary(
                 "reasoning_tokens": v["thoughts"],
                 "total_tokens": tok,
                 "cost_usd": round(v["cost_usd"], 2),
+                "cache_hit_rate": t_hit,
+                "sessions": t_sessions,
                 "active_days": len(v["active_days"]),
                 "agent_seconds": round(w_sec, 1),
                 "agent_hours": round(w_sec / 3600.0, 2),
-                "runs": tool_work_runs.get(tool, 0),
+                "runs": t_runs,
                 "share_tokens": round(tok / total_tokens, 4) if total_tokens > 0 else 0.0,
                 "models": models_out,
             }
@@ -395,6 +448,7 @@ def _build_period_summary(
         key=lambda x: (x["cost_usd"], x["agent_seconds"], x["total_tokens"]),
         reverse=True,
     )
+    cross_models.sort(key=lambda x: (x["cost_usd"], x["total_tokens"]), reverse=True)
 
     leverage = round(work_seconds_total / work_wall_total, 2) if work_wall_total >= 1.0 else 1.0
     return {
@@ -416,7 +470,148 @@ def _build_period_summary(
         "leverage": leverage,
         "runs": work_runs_total,
         "tools": tools_list,
+        "top_models": cross_models[:12],
     }
+
+
+def _compute_streaks(active_dates: set, today_dt: datetime) -> Tuple[int, int]:
+    if not active_dates:
+        return 0, 0
+    sorted_days = sorted(active_dates)
+    longest = 1
+    run = 1
+    prev_dt = datetime.strptime(sorted_days[0], "%Y-%m-%d")
+    for ds in sorted_days[1:]:
+        cur_dt = datetime.strptime(ds, "%Y-%m-%d")
+        if (cur_dt - prev_dt).days == 1:
+            run += 1
+            if run > longest:
+                longest = run
+        else:
+            run = 1
+        prev_dt = cur_dt
+
+    today_str = today_dt.strftime("%Y-%m-%d")
+    yest_str = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    anchor = today_dt if today_str in active_dates else (today_dt - timedelta(days=1) if yest_str in active_dates else None)
+    current = 0
+    if anchor is not None:
+        cur = anchor
+        while cur.strftime("%Y-%m-%d") in active_dates:
+            current += 1
+            cur -= timedelta(days=1)
+    return current, longest
+
+
+def _abbreviate_path(path_str: str, home_dir: Optional[Path]) -> str:
+    if home_dir is not None:
+        h = str(home_dir).rstrip("/")
+        if path_str == h:
+            return "~"
+        if path_str.startswith(h + "/"):
+            return "~" + path_str[len(h):]
+    return path_str
+
+
+def _build_projects_list(
+    ledger: Dict[str, Any],
+    live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    today_dt: datetime,
+    home_dir: Optional[Path],
+) -> List[Dict[str, Any]]:
+    combined: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for proj_path, day_map in (ledger.get("projects") or {}).items():
+        if isinstance(day_map, dict):
+            combined[proj_path] = {dk: bv for dk, bv in day_map.items() if isinstance(bv, dict)}
+    if live_projects:
+        for proj_path, day_map in live_projects.items():
+            dst = combined.setdefault(proj_path, {})
+            for dk, bv in day_map.items():
+                dst[dk] = bv
+
+    today_str = today_dt.strftime("%Y-%m-%d")
+    week_floor = (today_dt - timedelta(days=6)).strftime("%Y-%m-%d")
+    month_floor = (today_dt - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    out: List[Dict[str, Any]] = []
+    for proj_path, day_map in combined.items():
+        if not day_map:
+            continue
+        p_in = p_out = p_cr = p_cw = p_th = p_sess = 0
+        p_cost = 0.0
+        tool_keys: List[str] = []
+        last_day = ""
+        for dk, b in day_map.items():
+            b_in = _safe_int(b.get("in"))
+            b_out = _safe_int(b.get("out"))
+            b_cr = _safe_int(b.get("cr"))
+            b_cw = _safe_int(b.get("cw"))
+            b_th = _safe_int(b.get("thoughts"))
+            b_cost = _safe_float(b.get("cost_usd", b.get("cost")))
+            if b_in + b_out + b_cr + b_cw + b_th <= 0 and b_cost <= 0:
+                continue
+            p_in += b_in
+            p_out += b_out
+            p_cr += b_cr
+            p_cw += b_cw
+            p_th += b_th
+            p_cost += b_cost
+            p_sess += _safe_int(b.get("sessions")) or 1
+            if dk > last_day:
+                last_day = dk
+            for tk in b.get("tools") or []:
+                if isinstance(tk, str) and tk not in tool_keys:
+                    tool_keys.append(tk)
+
+        total_tok = p_in + p_out + p_cr + p_cw + p_th
+        if total_tok <= 0 and p_cost <= 0:
+            continue
+        denom = p_in + p_cr + p_cw
+        hit = round(p_cr / denom, 4) if denom > 0 else 0.0
+
+        if last_day >= today_str:
+            grp = "today"
+        elif last_day >= week_floor:
+            grp = "week"
+        elif last_day >= month_floor:
+            grp = "earlier"
+        else:
+            grp = "dormant"
+
+        tools_badges = []
+        for tk in tool_keys:
+            meta = USAGE_TOOL_META.get(tk, {"name": tk, "short": tk, "color": "#94A3B8"})
+            tools_badges.append(
+                {
+                    "tool": tk,
+                    "display_name": meta["name"],
+                    "short_name": meta["short"],
+                    "color": meta["color"],
+                }
+            )
+
+        out.append(
+            {
+                "path": proj_path,
+                "name": Path(proj_path).name or proj_path,
+                "display_path": _abbreviate_path(proj_path, home_dir),
+                "last_active_date": last_day,
+                "group": grp,
+                "input_tokens": p_in,
+                "output_tokens": p_out,
+                "cache_read_tokens": p_cr,
+                "cache_write_tokens": p_cw,
+                "reasoning_tokens": p_th,
+                "total_tokens": total_tok,
+                "cost_usd": round(p_cost, 2),
+                "cache_hit_rate": hit,
+                "sessions": p_sess,
+                "tools": tools_badges,
+            }
+        )
+
+    out.sort(key=lambda x: (x["last_active_date"], x["cost_usd"], x["total_tokens"]), reverse=True)
+    return out[:40]
 
 
 def build_usage_payload(
@@ -426,6 +621,9 @@ def build_usage_payload(
     now_ts: float,
     work_daily_list: Optional[List[Dict[str, Any]]] = None,
     persist: bool = True,
+    pricing: Optional[Any] = None,
+    live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    home: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     """Update ledger, reconcile with imported history, and return (usage_payload, daily_usage_map)."""
     ledger = load_ledger(ledger_path) if ledger_path else {
@@ -434,10 +632,13 @@ def build_usage_payload(
         "tokei_import_meta": None,
         "imported_tools": {},
         "live_tools": {},
+        "projects": {},
     }
 
     if persist and ledger_path:
-        changed = update_ledger_with_live(ledger, live_usage, live_cutoff_day, now_ts)
+        changed = update_ledger_with_live(
+            ledger, live_usage, live_cutoff_day, now_ts, live_projects=live_projects
+        )
         if changed or not ledger_path.is_file():
             save_ledger(ledger_path, ledger)
 
@@ -446,8 +647,12 @@ def build_usage_payload(
     now_dt = datetime.fromtimestamp(now_ts, tz=BIZ_TZ)
     today_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=BIZ_TZ)
     today_str = today_dt.strftime("%Y-%m-%d")
-    # Rolling 7d matches AgentPulse's 7-day window cleanly
-    week_start_str = (today_dt - timedelta(days=6)).strftime("%Y-%m-%d")
+    yesterday_str = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    # Calendar week (Mon -> today) & previous calendar week (prev Mon -> prev Sun)
+    this_mon = today_dt - timedelta(days=today_dt.weekday())
+    week_start_str = this_mon.strftime("%Y-%m-%d")
+    last_week_start_str = (this_mon - timedelta(days=7)).strftime("%Y-%m-%d")
+    last_week_end_str = (this_mon - timedelta(days=1)).strftime("%Y-%m-%d")
     month_start_str = today_dt.strftime("%Y-%m-01")
     year_start_str = today_dt.strftime("%Y-01-01")
 
@@ -456,7 +661,7 @@ def build_usage_payload(
         for d in work_daily_list:
             work_by_day[d["date"]] = d
 
-    # Daily usage map for all known days (for joining onto DayStats and 30d history chart)
+    # Daily usage map for all known days (for joining onto DayStats, 30d history, and 182d heatmap)
     daily_usage_map: Dict[str, Dict[str, Any]] = {}
     for tool, day_map in merged.items():
         for day_key, b in day_map.items():
@@ -466,6 +671,7 @@ def build_usage_payload(
             b_cw = _safe_int(b.get("cw"))
             b_th = _safe_int(b.get("thoughts"))
             b_cost = _safe_float(b.get("cost_usd", b.get("cost")))
+            b_sess = _safe_int(b.get("sessions")) or 1
             b_tok = b_in + b_out + b_cr + b_cw + b_th
             if b_tok <= 0 and b_cost <= 0:
                 continue
@@ -479,6 +685,7 @@ def build_usage_payload(
                     "thoughts": 0,
                     "total_tokens": 0,
                     "cost_usd": 0.0,
+                    "sessions": 0,
                     "tools": {},
                 },
             )
@@ -489,6 +696,7 @@ def build_usage_payload(
             d_acc["thoughts"] += b_th
             d_acc["total_tokens"] += b_tok
             d_acc["cost_usd"] = round(d_acc["cost_usd"] + b_cost, 4)
+            d_acc["sessions"] += b_sess
             t_cur = d_acc["tools"].setdefault(tool, {"tokens": 0, "cost_usd": 0.0})
             t_cur["tokens"] += b_tok
             t_cur["cost_usd"] = round(t_cur["cost_usd"] + b_cost, 4)
@@ -517,11 +725,76 @@ def build_usage_payload(
             }
         )
 
+    # 182-day (26-week) heatmap + streak stats
+    all_active_dates = set(daily_usage_map.keys()) | {
+        dk for dk, wd in work_by_day.items() if float(wd.get("agent_seconds", 0.0) or 0.0) >= 60.0
+    }
+    current_streak, longest_streak = _compute_streaks(all_active_dates, today_dt)
+    heatmap_days: List[Dict[str, Any]] = []
+    for i in range(181, -1, -1):
+        dt = today_dt - timedelta(days=i)
+        dk = dt.strftime("%Y-%m-%d")
+        du = daily_usage_map.get(dk) or {}
+        wd = work_by_day.get(dk) or {}
+        day_tools_map: Dict[str, Dict[str, Any]] = {}
+        for tk, tv in (du.get("tools") or {}).items():
+            meta = USAGE_TOOL_META.get(tk, {"name": tk, "short": tk, "color": "#94A3B8"})
+            day_tools_map[tk] = {
+                "tool": tk,
+                "display_name": meta["name"],
+                "color": meta["color"],
+                "total_tokens": int(tv.get("tokens", 0)),
+                "cost_usd": round(float(tv.get("cost_usd", 0.0)), 2),
+                "agent_hours": 0.0,
+            }
+        for wt in wd.get("tools") or []:
+            tk = wt["tool"]
+            meta = USAGE_TOOL_META.get(tk, {"name": tk, "short": tk, "color": "#94A3B8"})
+            ent = day_tools_map.setdefault(
+                tk,
+                {
+                    "tool": tk,
+                    "display_name": meta["name"],
+                    "color": meta["color"],
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                    "agent_hours": 0.0,
+                },
+            )
+            ent["agent_hours"] = round(float(wt.get("agent_hours", 0.0)), 2)
+
+        day_tools_sorted = sorted(
+            day_tools_map.values(),
+            key=lambda x: (x["cost_usd"], x["agent_hours"], x["total_tokens"]),
+            reverse=True,
+        )[:6]
+        heatmap_days.append(
+            {
+                "date": dk,
+                "short_date": dt.strftime("%m/%d"),
+                "weekday": WEEKDAY_CN[dt.weekday()],
+                "is_today": dk == today_str,
+                "total_tokens": int(du.get("total_tokens", 0)),
+                "cost_usd": round(float(du.get("cost_usd", 0.0)), 2),
+                "agent_hours": round(float(wd.get("agent_hours", 0.0)), 2),
+                "sessions": int(du.get("sessions", 0)),
+                "tools": day_tools_sorted,
+            }
+        )
+
+    earliest_day = min(
+        (min(v.keys()) for v in merged.values() if isinstance(v, dict) and v),
+        default=today_str,
+    )
+
     periods = {
-        "today": _build_period_summary(merged, today_str, today_str, work_by_day),
-        "week": _build_period_summary(merged, week_start_str, today_str, work_by_day),
-        "month": _build_period_summary(merged, month_start_str, today_str, work_by_day),
-        "year": _build_period_summary(merged, year_start_str, today_str, work_by_day),
+        "today": _build_period_summary(merged, today_str, today_str, work_by_day, pricing=pricing),
+        "yesterday": _build_period_summary(merged, yesterday_str, yesterday_str, work_by_day, pricing=pricing),
+        "week": _build_period_summary(merged, week_start_str, today_str, work_by_day, pricing=pricing),
+        "last_week": _build_period_summary(merged, last_week_start_str, last_week_end_str, work_by_day, pricing=pricing),
+        "month": _build_period_summary(merged, month_start_str, today_str, work_by_day, pricing=pricing),
+        "year": _build_period_summary(merged, year_start_str, today_str, work_by_day, pricing=pricing),
+        "all": _build_period_summary(merged, earliest_day, today_str, work_by_day, pricing=pricing),
     }
 
     # Ledger metadata (imported history stats)
@@ -531,15 +804,20 @@ def build_usage_payload(
         (len(v) for v in merged.values() if isinstance(v, dict)),
         default=0,
     )
-    earliest_day = min(
-        (min(v.keys()) for v in merged.values() if isinstance(v, dict) and v),
-        default=today_str,
-    )
+
+    projects_list = _build_projects_list(ledger, live_projects, today_dt, home or Path.home())
 
     usage_payload = {
         "source": "agent_pulse_native",
         "periods": periods,
         "history_30d": history_30d,
+        "heatmap": {
+            "days": heatmap_days,
+            "current_streak": current_streak,
+            "longest_streak": longest_streak,
+            "total_active_days": len(all_active_dates),
+        },
+        "projects": projects_list,
         "ledger_meta": {
             "ledger_path": str(ledger_path) if ledger_path else "",
             "imported_tokei": imported_tool_count > 0,

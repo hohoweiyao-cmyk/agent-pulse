@@ -34,18 +34,21 @@ When you work with multiple AI coding agents in parallel — **T3 Code**, **Code
   - Measures genuine autonomous AI execution across turns using a **5-minute inter-step heartbeat window**.
   - Continuous long autonomous runs (45 min, 2 hours, etc.) are counted in full — no arbitrary 30-minute turn cap.
   - Silent intra-turn pauses > 5 minutes are dropped (`0s`), and explicit human waits in T3 Code (`approval_request`, `user_input_request`, `secret_request`) are subtracted even when shorter than 5 minutes.
-- **Unified Token, Cost & Multi-Period Ledger**:
+- **Unified Token, Cost, Project Trail & Multi-Period Ledger**:
   - Zero-dependency Python 3.9+ incremental parser with file `mtime_ns + size` caching (`< 200ms` per scan).
   - Bundled pricing baseline (`engine/pricing.json`, 600+ models) plus custom user overrides at `~/.agent-pulse/pricing_overrides.json`.
-  - Persistent local ledger at `~/.agent-pulse/ledger.json` supporting **Today / 7-Day / Month / Year** summaries and 30-day history.
+  - Persistent local ledger at `~/.agent-pulse/ledger.json` supporting **7 time periods** (`Today / Yesterday / Week / Last Week / Month / Year / All`), a **26-week activity heatmap** with streak tracking, cross-tool model leaderboards, and **Project Trail** (`cwd`-based project cost & token tracking).
 - **T3 Code ↔ Codex Bidirectional Deduplication**:
   - Sessions launched inside T3 Code (`originator == "T3 Code"`) are attributed to `T3 · Codex` and excluded from standalone `Codex` for **both** work hours and token/cost accounting — zero double counting.
 - **Fast / Slow Dual-Track Architecture**:
-  - **Fast track (every 15s, 100% local)**: Work hours, live running agents, incremental tokens & cost.
+  - **Fast track (every 15s, 100% local)**: Work hours, live running agents, incremental tokens, cost & project trail.
   - **Slow track (every 5 min, non-blocking)**: Subscription quotas for Codex (official API or local JSONL fallback) and Claude (Claude Code CLI statusline hook + Claude Desktop cache), plus snapshot display for Antigravity / Kimi / Grok.
 - **Native macOS Aesthetic (SwiftUI + AppKit)**:
   - **Desktop Widget Card**: Frosted HUD glass (`340pt` full / `276pt` compact), 3 window layers (*Desktop* / *Floating* / *Normal*), draggable top header with position memory, live agent timer, interactive 7-day bar chart, optional high-quota alert bar (≥ 70%), and one-click Markdown daily report copy.
-  - **Single Menu Bar Icon**: Live hours, active agent count, daily cost, and quota badges. Left-click opens a 4-tab native `NSPopover` (**Overview / Quotas / History / Settings**); right-click opens a quick actions menu.
+  - **Single Menu Bar Icon & Adaptive 5-Tab Popover**: Live hours, active agent count, daily cost, and quota badges. Left-click opens a dynamic-width 5-tab native `NSPopover` (**Detail Cards / Dashboard & Heatmap / Projects / Quotas / Settings**):
+    - **Detail Cards**: 2-column per-tool cards showing AI work hours, sessions, Cache Hit ring, full 5-part token grid (`Input / Output / Cache Read / Cache Write / Reasoning`), inline 5h/7d quota bars, and **2-level expandable model breakdowns** with per-1M-token pricing references.
+    - **Dashboard**: 26-week interactive GitHub-style heatmap (click any day for its full tool bill), active streaks, and cross-tool model cost rankings.
+    - **Projects**: Searchable, pinnable project usage tracker grouped by activity recency with Finder & Terminal quick-open actions.
   - **Built-in Sit Reminder**: 30 / 45 / 60 / 90 min intervals, automatic reset after > 5 min lock/sleep, and native macOS notifications with *Reset* and *Snooze 10m* actions.
 - **Strictly Read-Only & Privacy-First**:
   - Never modifies or locks any AI client database (SQLite files are read via WAL-safe temporary snapshots).
@@ -225,6 +228,7 @@ Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete algorithm bre
 
 ---
 
-## License
+## Acknowledgements & License
 
-Released under the [MIT License](LICENSE).
+- UI card granularity, two-level model breakdown, activity heatmap, and project trail concepts are inspired by the open-source MIT project [cclank/tokei](https://github.com/cclank/tokei).
+- Released under the [MIT License](LICENSE).

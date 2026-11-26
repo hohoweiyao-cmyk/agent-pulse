@@ -169,28 +169,48 @@ struct UsagePayload: Codable, Equatable {
     let source: String
     let periods: UsagePeriods
     let history30d: [HistoryDayPoint]
+    let heatmap: HeatmapPayload?
+    let projects: [ProjectTrailItem]?
     let ledgerMeta: LedgerMeta
 
     enum CodingKeys: String, CodingKey {
         case source
         case periods
         case history30d = "history_30d"
+        case heatmap
+        case projects
         case ledgerMeta = "ledger_meta"
     }
 }
 
 struct UsagePeriods: Codable, Equatable {
     let today: PeriodStats
+    let yesterday: PeriodStats?
     let week: PeriodStats
+    let lastWeek: PeriodStats?
     let month: PeriodStats
     let year: PeriodStats
+    let all: PeriodStats?
+
+    enum CodingKeys: String, CodingKey {
+        case today
+        case yesterday
+        case week
+        case lastWeek = "last_week"
+        case month
+        case year
+        case all
+    }
 
     func stats(for key: UsagePeriodKey) -> PeriodStats {
         switch key {
         case .today: return today
+        case .yesterday: return yesterday ?? today
         case .week: return week
+        case .lastWeek: return lastWeek ?? week
         case .month: return month
         case .year: return year
+        case .all: return all ?? year
         }
     }
 }
@@ -214,6 +234,7 @@ struct PeriodStats: Codable, Equatable {
     let leverage: Double
     let runs: Int
     let tools: [UsageToolStats]
+    let topModels: [RankedModelStats]?
 
     enum CodingKeys: String, CodingKey {
         case startDate = "start_date"
@@ -234,6 +255,7 @@ struct PeriodStats: Codable, Equatable {
         case leverage
         case runs
         case tools
+        case topModels = "top_models"
     }
 }
 
@@ -250,12 +272,24 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let cacheHitRate: Double?
+    let sessions: Int?
     let activeDays: Int
     let agentSeconds: Double
     let agentHours: Double
     let runs: Int
     let shareTokens: Double
     let models: [ModelUsageStats]
+
+    var effectiveCacheHitRate: Double {
+        if let r = cacheHitRate { return r }
+        let denom = inputTokens + cacheReadTokens + cacheWriteTokens
+        return denom > 0 ? Double(cacheReadTokens) / Double(denom) : 0.0
+    }
+
+    var effectiveSessions: Int {
+        sessions ?? max(runs, activeDays)
+    }
 
     enum CodingKeys: String, CodingKey {
         case tool
@@ -269,6 +303,8 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case cacheHitRate = "cache_hit_rate"
+        case sessions
         case activeDays = "active_days"
         case agentSeconds = "agent_seconds"
         case agentHours = "agent_hours"
@@ -288,6 +324,17 @@ struct ModelUsageStats: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let cacheHitRate: Double?
+    let rateIn: Double?
+    let rateOut: Double?
+    let rateCacheRead: Double?
+    let rateCacheWrite: Double?
+
+    var effectiveCacheHitRate: Double {
+        if let r = cacheHitRate { return r }
+        let denom = inputTokens + cacheReadTokens + cacheWriteTokens
+        return denom > 0 ? Double(cacheReadTokens) / Double(denom) : 0.0
+    }
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -298,6 +345,153 @@ struct ModelUsageStats: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case cacheHitRate = "cache_hit_rate"
+        case rateIn = "rate_in"
+        case rateOut = "rate_out"
+        case rateCacheRead = "rate_cache_read"
+        case rateCacheWrite = "rate_cache_write"
+    }
+}
+
+struct RankedModelStats: Codable, Equatable, Identifiable {
+    var id: String { "\(tool)::\(model)" }
+    let tool: String
+    let displayName: String
+    let shortName: String
+    let color: String
+    let model: String
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let reasoningTokens: Int
+    let totalTokens: Int
+    let costUsd: Double
+    let cacheHitRate: Double
+
+    enum CodingKeys: String, CodingKey {
+        case tool
+        case displayName = "display_name"
+        case shortName = "short_name"
+        case color
+        case model
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case reasoningTokens = "reasoning_tokens"
+        case totalTokens = "total_tokens"
+        case costUsd = "cost_usd"
+        case cacheHitRate = "cache_hit_rate"
+    }
+}
+
+struct HeatmapPayload: Codable, Equatable {
+    let days: [HeatmapDay]
+    let currentStreak: Int
+    let longestStreak: Int
+    let totalActiveDays: Int
+
+    enum CodingKeys: String, CodingKey {
+        case days
+        case currentStreak = "current_streak"
+        case longestStreak = "longest_streak"
+        case totalActiveDays = "total_active_days"
+    }
+}
+
+struct HeatmapDay: Codable, Equatable, Identifiable {
+    var id: String { date }
+    let date: String
+    let shortDate: String
+    let weekday: String
+    let isToday: Bool
+    let totalTokens: Int
+    let costUsd: Double
+    let agentHours: Double
+    let sessions: Int
+    let tools: [HeatmapDayTool]
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case shortDate = "short_date"
+        case weekday
+        case isToday = "is_today"
+        case totalTokens = "total_tokens"
+        case costUsd = "cost_usd"
+        case agentHours = "agent_hours"
+        case sessions
+        case tools
+    }
+}
+
+struct HeatmapDayTool: Codable, Equatable, Identifiable {
+    var id: String { tool }
+    let tool: String
+    let displayName: String
+    let color: String
+    let totalTokens: Int
+    let costUsd: Double
+    let agentHours: Double
+
+    enum CodingKeys: String, CodingKey {
+        case tool
+        case displayName = "display_name"
+        case color
+        case totalTokens = "total_tokens"
+        case costUsd = "cost_usd"
+        case agentHours = "agent_hours"
+    }
+}
+
+struct ProjectTrailItem: Codable, Equatable, Identifiable {
+    var id: String { path }
+    let path: String
+    let name: String
+    let displayPath: String
+    let lastActiveDate: String
+    let group: String
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let reasoningTokens: Int
+    let totalTokens: Int
+    let costUsd: Double
+    let cacheHitRate: Double
+    let sessions: Int
+    let tools: [ProjectToolBadge]
+
+    enum CodingKeys: String, CodingKey {
+        case path, name
+        case displayPath = "display_path"
+        case lastActiveDate = "last_active_date"
+        case group
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case reasoningTokens = "reasoning_tokens"
+        case totalTokens = "total_tokens"
+        case costUsd = "cost_usd"
+        case cacheHitRate = "cache_hit_rate"
+        case sessions
+        case tools
+    }
+}
+
+struct ProjectToolBadge: Codable, Equatable, Identifiable {
+    var id: String { tool }
+    let tool: String
+    let displayName: String
+    let shortName: String
+    let color: String
+
+    enum CodingKeys: String, CodingKey {
+        case tool
+        case displayName = "display_name"
+        case shortName = "short_name"
+        case color
     }
 }
 
@@ -415,17 +609,19 @@ struct HighestQuotaWindow: Codable, Equatable {
 
 enum PopoverTab: String, CaseIterable, Identifiable {
     case overview
+    case dashboard
+    case projects
     case quotas
-    case history
     case settings
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .overview: return "总览"
+        case .overview: return "明细"
+        case .dashboard: return "大屏"
+        case .projects: return "项目"
         case .quotas: return "额度"
-        case .history: return "历史"
         case .settings: return "设置"
         }
     }
@@ -433,18 +629,24 @@ enum PopoverTab: String, CaseIterable, Identifiable {
 
 enum UsagePeriodKey: String, CaseIterable, Identifiable {
     case today
+    case yesterday
     case week
+    case lastWeek
     case month
     case year
+    case all
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .today: return "今日"
+        case .today: return "今天"
+        case .yesterday: return "昨天"
         case .week: return "本周"
+        case .lastWeek: return "上周"
         case .month: return "本月"
         case .year: return "今年"
+        case .all: return "全部"
         }
     }
 }
@@ -571,6 +773,12 @@ enum Formatters {
         if amount >= 100 {
             return String(format: "$%.1f", amount)
         }
+        return String(format: "$%.2f", amount)
+    }
+
+    static func rate(_ amount: Double) -> String {
+        if amount == 0 { return "$0" }
+        if amount < 0.1 { return String(format: "$%.3f", amount) }
         return String(format: "$%.2f", amount)
     }
 

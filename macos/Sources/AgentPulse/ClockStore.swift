@@ -66,6 +66,8 @@ final class ClockStore: ObservableObject {
     }
 
     @Published var launchAtLogin: Bool = false
+    @Published var pinnedProjectPaths: Set<String> = []
+    @Published var copiedToolId: String?
 
     let sitReminder = SitReminderManager()
 
@@ -91,6 +93,7 @@ final class ClockStore: ObservableObject {
         static let menuBarShowCost = "agentPulse.menuBar.showCost"
         static let menuBarShowQuotas = "agentPulse.menuBar.showQuotas"
         static let cardShowQuotaAlert = "agentPulse.card.showQuotaAlert"
+        static let pinnedProjects = "agentPulse.projects.pinned"
     }
 
     static let launchAgentLabel = "dev.agentpulse.app"
@@ -113,6 +116,8 @@ final class ClockStore: ObservableObject {
         self.menuBarShowQuotas = defaults.object(forKey: Keys.menuBarShowQuotas) as? Bool ?? true
         self.cardShowQuotaAlert = defaults.object(forKey: Keys.cardShowQuotaAlert) as? Bool ?? false
         self.launchAtLogin = FileManager.default.fileExists(atPath: Self.launchAgentURL.path)
+        let savedPins = defaults.stringArray(forKey: Keys.pinnedProjects) ?? []
+        self.pinnedProjectPaths = Set(savedPins)
     }
 
     var displayedDay: DayStats? {
@@ -346,6 +351,60 @@ final class ClockStore: ObservableObject {
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".agent-pulse")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
+    }
+
+    func togglePinProject(_ path: String) {
+        if pinnedProjectPaths.contains(path) {
+            pinnedProjectPaths.remove(path)
+        } else {
+            pinnedProjectPaths.insert(path)
+        }
+        UserDefaults.standard.set(Array(pinnedProjectPaths), forKey: Keys.pinnedProjects)
+    }
+
+    func openProjectInFinder(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func openProjectInTerminal(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = ["-a", "Terminal", url.path]
+        try? proc.run()
+    }
+
+    func copyToolSummary(_ tool: UsageToolStats, periodTitle: String) {
+        let hitPct = Int(round(tool.effectiveCacheHitRate * 100))
+        var lines: [String] = [
+            "### \(tool.displayName) · \(periodTitle)",
+            "- 总 Token：\(Formatters.compactTokens(tool.totalTokens))（估算 \(Formatters.usd(tool.costUsd)) · Cache Hit \(hitPct)%）",
+            "- 构成：输入 \(Formatters.compactTokens(tool.inputTokens)) / 输出 \(Formatters.compactTokens(tool.outputTokens)) / 缓存读 \(Formatters.compactTokens(tool.cacheReadTokens)) / 缓存写 \(Formatters.compactTokens(tool.cacheWriteTokens)) / 推理 \(Formatters.compactTokens(tool.reasoningTokens))",
+        ]
+        if tool.agentSeconds > 0 {
+            lines.append("- AI 有效工时：\(Formatters.shortDuration(tool.agentSeconds))（\(tool.effectiveSessions) 会话）")
+        }
+        if !tool.models.isEmpty {
+            lines.append("- 模型明细：")
+            for m in tool.models.prefix(8) {
+                let mHit = Int(round(m.effectiveCacheHitRate * 100))
+                lines.append("  - `\(m.model)`: \(Formatters.compactTokens(m.totalTokens)) tok · \(mHit)% · \(Formatters.usd(m.costUsd))")
+            }
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(lines.joined(separator: "\n"), forType: .string)
+        copiedToolId = tool.id
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if self.copiedToolId == tool.id {
+                self.copiedToolId = nil
+            }
+        }
     }
 
     func copyMarkdownReport() {
