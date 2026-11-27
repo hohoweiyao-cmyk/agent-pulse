@@ -106,6 +106,8 @@ final class ClockStore: ObservableObject {
     private var lastObservedSentinelIds: [String] = []
     private var lastObservedQuotaBadge: String?
     private var lastObservedHighestQuota: HighestQuotaWindow?
+    private var lastObservedShanghaiDay: String = ""
+    private var lastObservedShanghaiMonth: String = ""
 
     // Injectable hooks for deterministic unit testing
     var commandExecutor: ((String, URL, [String], Double) -> Result<Data, Error>)?
@@ -168,9 +170,18 @@ final class ClockStore: ObservableObject {
         let savedPins = defaults.stringArray(forKey: Keys.pinnedProjects) ?? []
         self.pinnedProjectPaths = Set(savedPins)
         self.subscriptionFeesUSDCents = Self.loadValidatedSubscriptionFees(from: defaults)
+        let initDay = Self.shanghaiDayString(for: self.nowEpoch)
+        self.lastObservedShanghaiDay = initDay
+        self.lastObservedShanghaiMonth = String(initDay.prefix(7))
     }
 
     // MARK: - Shanghai Date Helpers
+
+    private static func shanghaiCalendar() -> Calendar {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = shanghaiTimeZone
+        return cal
+    }
 
     static func shanghaiDayString(for epoch: Double) -> String {
         let formatter = DateFormatter()
@@ -179,6 +190,47 @@ final class ClockStore: ObservableObject {
         formatter.timeZone = shanghaiTimeZone
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: Date(timeIntervalSince1970: epoch))
+    }
+
+    static func shanghaiMonthString(for epoch: Double) -> String {
+        String(shanghaiDayString(for: epoch).prefix(7))
+    }
+
+    static func shanghaiYearString(for epoch: Double) -> String {
+        String(shanghaiDayString(for: epoch).prefix(4))
+    }
+
+    static func shanghaiDayString(addingDays delta: Int, to epoch: Double) -> String {
+        let cal = shanghaiCalendar()
+        let base = cal.startOfDay(for: Date(timeIntervalSince1970: epoch))
+        let target = cal.date(byAdding: .day, value: delta, to: base) ?? base
+        return shanghaiDayString(for: target.timeIntervalSince1970)
+    }
+
+    /// Returns the Monday (YYYY-MM-DD) of the ISO week containing `epoch` in Asia/Shanghai.
+    static func shanghaiWeekStartString(for epoch: Double) -> String {
+        let cal = shanghaiCalendar()
+        let startOfDay = cal.startOfDay(for: Date(timeIntervalSince1970: epoch))
+        let weekday = cal.component(.weekday, from: startOfDay) // 1=Sun, 2=Mon ... 7=Sat
+        let daysFromMonday = (weekday + 5) % 7
+        let monday = cal.date(byAdding: .day, value: -daysFromMonday, to: startOfDay) ?? startOfDay
+        return shanghaiDayString(for: monday.timeIntervalSince1970)
+    }
+
+    var currentShanghaiDay: String {
+        Self.shanghaiDayString(for: nowEpoch)
+    }
+
+    var currentShanghaiMonth: String {
+        Self.shanghaiMonthString(for: nowEpoch)
+    }
+
+    var currentShanghaiYear: String {
+        Self.shanghaiYearString(for: nowEpoch)
+    }
+
+    var currentShanghaiWeekStart: String {
+        Self.shanghaiWeekStartString(for: nowEpoch)
     }
 
     static func canonicalSubscriptionGroup(for rawTool: String) -> String {
@@ -285,21 +337,48 @@ final class ClockStore: ObservableObject {
 
     var displayedDay: DayStats? {
         guard let snap = snapshot else { return nil }
+        if isViewingToday {
+            if isCrossedMidnightFromSnapshot {
+                return DayStats.unknownPlaceholder(forDay: currentShanghaiDay, isToday: true)
+            }
+            return snap.today
+        }
         if let target = selectedDate,
            let matched = snap.days.first(where: { $0.date == target }) {
             return matched
+        }
+        if isCrossedMidnightFromSnapshot {
+            return DayStats.unknownPlaceholder(forDay: currentShanghaiDay, isToday: true)
         }
         return snap.today
     }
 
     var isViewingToday: Bool {
-        guard let snap = snapshot else { return true }
-        return selectedDate == nil || selectedDate == snap.today.date
+        selectedDate == nil || selectedDate == currentShanghaiDay
     }
 
     var isCrossedMidnightFromSnapshot: Bool {
         guard let snap = snapshot else { return false }
-        return Self.shanghaiDayString(for: nowEpoch) != snap.today.date
+        return currentShanghaiDay != snap.today.date
+    }
+
+    var isTodayWorkUnknown: Bool {
+        guard let snap = snapshot else { return true }
+        if isCrossedMidnightFromSnapshot {
+            return true
+        }
+        return snap.today.isWorkUnknown
+    }
+
+    var isDisplayedDayWorkUnknown: Bool {
+        if isViewingToday {
+            return isTodayWorkUnknown
+        }
+        return displayedDay?.isWorkUnknown ?? true
+    }
+
+    var displayedHourlyChartState: HourlyChartState {
+        displayedDay?.hourlyChartState ?? .unknown
     }
 
     var liveBonusSeconds: Double {
@@ -318,12 +397,100 @@ final class ClockStore: ObservableObject {
         return day.agentSeconds + (isViewingToday ? liveBonusSeconds : 0)
     }
 
+    /// Returns nil when the displayed day has no trusted work observation (`workStatus == .unknown`).
+    var displayedAgentSecondsIfKnown: Double? {
+        isDisplayedDayWorkUnknown ? nil : displayedAgentSeconds
+    }
+
     var todayLiveSeconds: Double {
         guard let snap = snapshot else { return 0 }
         if isCrossedMidnightFromSnapshot {
             return 0
         }
         return snap.today.agentSeconds + liveBonusSeconds
+    }
+
+    /// Returns nil when today has no trusted work observation (`workStatus == .unknown` or crossed midnight).
+    var todayLiveSecondsIfKnown: Double? {
+        isTodayWorkUnknown ? nil : todayLiveSeconds
+    }
+
+    var displayedHeroHoursText: String {
+        guard let secs = displayedAgentSecondsIfKnown else { return "—" }
+        return Formatters.heroHours(secs)
+    }
+
+    var todayMenuBarHoursText: String {
+        guard let secs = todayLiveSecondsIfKnown else { return "—" }
+        return Formatters.menuBarHours(secs)
+    }
+
+    // MARK: - Clock-Validated Period Projections (Frozen Contract for DetailCardsView / DashboardViews)
+
+    /// Returns validated `PeriodStats` strictly covering the current Shanghai calendar period for `nowEpoch`.
+    /// Prevents views from displaying yesterday's/last-week's/last-month's totals after a day/month rollover.
+    func periodStats(for period: UsagePeriodKey) -> PeriodStats? {
+        guard let snap = snapshot, let periods = snap.usage?.periods else { return nil }
+        let curDay = currentShanghaiDay
+        let curMonth = currentShanghaiMonth
+        let curYear = currentShanghaiYear
+        let curWeekStart = currentShanghaiWeekStart
+
+        switch period {
+        case .today:
+            guard snap.today.date == curDay,
+                  periods.today.startDate == curDay,
+                  periods.today.endDate == curDay else {
+                return nil
+            }
+            return periods.today
+        case .yesterday:
+            let curYesterday = Self.shanghaiDayString(addingDays: -1, to: nowEpoch)
+            if let y = periods.yesterday, y.endDate == curYesterday {
+                return y
+            }
+            if periods.today.endDate == curYesterday {
+                return periods.today
+            }
+            return nil
+        case .week:
+            guard periods.week.startDate == curWeekStart else { return nil }
+            return periods.week
+        case .lastWeek:
+            let prevWeekStart = Self.shanghaiWeekStartString(for: nowEpoch - 7 * 86400)
+            if let lw = periods.lastWeek, lw.startDate == prevWeekStart {
+                return lw
+            }
+            if periods.week.startDate == prevWeekStart {
+                return periods.week
+            }
+            return nil
+        case .month:
+            guard String(periods.month.startDate.prefix(7)) == curMonth else { return nil }
+            return periods.month
+        case .year:
+            guard String(periods.year.startDate.prefix(4)) == curYear else { return nil }
+            return periods.year
+        case .all:
+            return periods.all ?? periods.year
+        }
+    }
+
+    /// Returns clock-validated `DayStats` for 24h pulse charts in `DetailCardsView` (today / yesterday only).
+    func hourlyDay(for period: UsagePeriodKey) -> DayStats? {
+        guard let snap = snapshot else { return nil }
+        switch period {
+        case .today:
+            if isCrossedMidnightFromSnapshot {
+                return DayStats.unknownPlaceholder(forDay: currentShanghaiDay, isToday: true)
+            }
+            return snap.today
+        case .yesterday:
+            let curYesterday = Self.shanghaiDayString(addingDays: -1, to: nowEpoch)
+            return snap.days.first(where: { $0.date == curYesterday })
+        default:
+            return nil
+        }
     }
 
     var todayTokens: Int {
@@ -394,6 +561,11 @@ final class ClockStore: ObservableObject {
     func quotaWindowIsFresh(provider: QuotaProvider, window: QuotaWindow) -> Bool {
         guard quotaError == nil else { return false }
         guard provider.status == "ok", provider.fetchedAt > 0 else { return false }
+        // Reject future observation timestamps (both vs current wall clock and vs snapshot generatedTs)
+        guard Double(provider.fetchedAt) <= nowEpoch else { return false }
+        if let genTs = quotaSnapshot?.generatedTs, Double(provider.fetchedAt) > genTs {
+            return false
+        }
         guard window.usedPercent.isFinite, window.usedPercent >= 0, window.usedPercent <= 100 else {
             return false
         }
@@ -478,13 +650,36 @@ final class ClockStore: ObservableObject {
         !pinnedProjectPaths.isDisjoint(with: aliasPaths(for: trail))
     }
 
+    var isLegacyProjectFallbackOnlyAll: Bool {
+        guard let usage = snapshot?.usage else { return false }
+        return usage.projectTrails == nil && !(usage.projects?.isEmpty ?? true)
+    }
+
+    private func projectPeriodMatchesCurrentClock(_ stats: ProjectPeriodStats, for period: ProjectPeriodKey, snapshotToday: String) -> Bool {
+        switch period {
+        case .today:
+            return snapshotToday == currentShanghaiDay
+                && stats.startDate == currentShanghaiDay
+                && stats.endDate == currentShanghaiDay
+        case .week:
+            return stats.startDate == currentShanghaiWeekStart
+        case .month:
+            return String(stats.startDate.prefix(7)) == currentShanghaiMonth
+        case .all:
+            return true
+        }
+    }
+
     func projectTrailRows(for period: ProjectPeriodKey) -> [ProjectTrailRow] {
-        guard let usage = snapshot?.usage else { return [] }
+        guard let snap = snapshot, let usage = snap.usage else { return [] }
 
         if let trails = usage.projectTrails {
             var rows: [ProjectTrailRow] = []
             for trail in trails {
                 guard let pStats = trail.periods[period.rawValue] else { continue }
+                guard projectPeriodMatchesCurrentClock(pStats, for: period, snapshotToday: snap.today.date) else {
+                    continue
+                }
                 rows.append(
                     ProjectTrailRow(
                         path: trail.path,
@@ -508,18 +703,11 @@ final class ClockStore: ObservableObject {
             }
         }
 
-        // Legacy v0.6 fallback: project old `usage.projects` only for `.all` or matching group
-        guard let legacy = usage.projects else { return [] }
+        // Legacy v0.6 fallback: `usage.projects` stores multi-day cumulative totals ONLY,
+        // so it must NEVER masquerade as `.today`, `.week`, or `.month` spend — project `.all` only.
+        guard period == .all, let legacy = usage.projects else { return [] }
         var rows: [ProjectTrailRow] = []
         for item in legacy {
-            let matches: Bool
-            switch period {
-            case .today: matches = item.group == "today"
-            case .week: matches = item.group == "today" || item.group == "week"
-            case .month: matches = item.group != "dormant"
-            case .all: matches = true
-            }
-            guard matches else { continue }
             let pStats = ProjectPeriodStats(
                 startDate: item.lastActiveDate,
                 endDate: item.lastActiveDate,
@@ -532,6 +720,8 @@ final class ClockStore: ObservableObject {
                 reasoningTokens: item.reasoningTokens,
                 totalTokens: item.totalTokens,
                 costUsd: item.costUsd,
+                unpricedTokens: item.unpricedTokens,
+                hasCostObservation: item.totalTokens > 0 || item.costUsd > 0 || (item.unpricedTokens ?? 0) > 0,
                 cacheHitRate: item.cacheHitRate,
                 sessions: item.sessions,
                 tools: item.tools,
@@ -593,12 +783,20 @@ final class ClockStore: ObservableObject {
         return true
     }
 
+    /// True only when the loaded snapshot's month period actually covers the current Shanghai calendar month.
+    var currentMonthSubscriptionDataAvailable: Bool {
+        guard let snap = snapshot, let monthPeriod = snap.usage?.periods.month else { return false }
+        return String(snap.today.date.prefix(7)) == currentShanghaiMonth
+            && String(monthPeriod.startDate.prefix(7)) == currentShanghaiMonth
+    }
+
     var subscriptionRows: [SubscriptionRow] {
         var subCandidates: [String: Decimal] = [:]
         var apiActuals: [String: Decimal] = [:]
         var displayNames: [String: String] = Self.subscriptionDisplayNames
 
-        if let monthTools = snapshot?.usage?.periods.month.tools {
+        if currentMonthSubscriptionDataAvailable,
+           let monthTools = snapshot?.usage?.periods.month.tools {
             for toolStats in monthTools {
                 let group = Self.canonicalSubscriptionGroup(for: toolStats.tool)
                 if displayNames[group] == nil {
@@ -694,18 +892,25 @@ final class ClockStore: ObservableObject {
 
     func handleClockTick(_ epoch: Double) {
         nowEpoch = epoch
+        let curDay = currentShanghaiDay
+        let curMonth = currentShanghaiMonth
+        let dayOrMonthChanged = (curDay != lastObservedShanghaiDay) || (curMonth != lastObservedShanghaiMonth)
+
         let curFreshness = fastFreshness
         let curSentinelIds = sentinelTasks.map { "\($0.id):\($0.state)" }
         let curQuotaBadge = menuBarQuotaSummary
         let curHighest = highestFreshQuotaWindow
 
-        let layoutChanged = (curFreshness != lastObservedFreshness)
+        let layoutChanged = dayOrMonthChanged
+            || (curFreshness != lastObservedFreshness)
             || (curSentinelIds != lastObservedSentinelIds)
             || (curHighest != lastObservedHighestQuota)
         let statusBarChanged = layoutChanged
             || (curQuotaBadge != lastObservedQuotaBadge)
             || (curFreshness == .fresh && todayRunningCount > 0)
 
+        lastObservedShanghaiDay = curDay
+        lastObservedShanghaiMonth = curMonth
         lastObservedFreshness = curFreshness
         lastObservedSentinelIds = curSentinelIds
         lastObservedQuotaBadge = curQuotaBadge
@@ -731,8 +936,8 @@ final class ClockStore: ObservableObject {
     }
 
     func selectDate(_ date: String?) {
-        guard let snap = snapshot else { return }
-        if date == snap.today.date || selectedDate == date {
+        guard snapshot != nil else { return }
+        if date == currentShanghaiDay || selectedDate == date {
             selectedDate = nil
         } else {
             selectedDate = date
@@ -760,6 +965,8 @@ final class ClockStore: ObservableObject {
         let prevFreshness = fastFreshness
         snapshot = decoded
         lastError = nil
+        lastObservedShanghaiDay = currentShanghaiDay
+        lastObservedShanghaiMonth = currentShanghaiMonth
         lastObservedFreshness = fastFreshness
         lastObservedSentinelIds = sentinelTasks.map { "\($0.id):\($0.state)" }
         onSnapshotUpdated?(decoded)
@@ -963,13 +1170,20 @@ final class ClockStore: ObservableObject {
         return directory
     }
 
-    nonisolated static func validatedProjectDirectory(_ path: String) -> URL? {
-        guard !path.isEmpty, path.hasPrefix("/") else { return nil }
-        guard !path.contains("://") else { return nil }
+    nonisolated private static func isSafePathString(_ path: String) -> Bool {
+        guard !path.isEmpty, path.hasPrefix("/") else { return false }
+        guard !path.contains("://") else { return false }
         guard !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) else {
-            return nil
+            return false
         }
-        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        return true
+    }
+
+    nonisolated static func validatedProjectDirectory(_ path: String) -> URL? {
+        guard isSafePathString(path) else { return nil }
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+        // Re-validate the canonical resolved path after symlink expansion (blocks control chars / bad targets).
+        guard isSafePathString(url.path) else { return nil }
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {

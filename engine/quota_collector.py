@@ -168,7 +168,7 @@ def _codex_window_from_live(win: Any, now: float) -> Optional[Dict[str, Any]]:
     if win.get("limit_window_seconds") is not None:
         window_min = int(round(float(win["limit_window_seconds"]) / 60.0))
     return {
-        "used_percent": round(float(used), 1),
+        "used_percent": float(used),
         "window_minutes": window_min,
         "resets_at": int(reset_at) if reset_at is not None else None,
     }
@@ -212,6 +212,7 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
                 "label": "5 小时窗口",
                 "short_label": "C5",
                 "used_percent": round(used, 1),
+                "_raw_used_percent": used,
                 "remaining_percent": round(max(0.0, 100.0 - used), 1),
                 "resets_at": primary.get("resets_at"),
                 "window_minutes": primary.get("window_minutes") or 300,
@@ -225,6 +226,7 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
                 "label": "7 天窗口",
                 "short_label": "C7",
                 "used_percent": round(used, 1),
+                "_raw_used_percent": used,
                 "remaining_percent": round(max(0.0, 100.0 - used), 1),
                 "resets_at": secondary.get("resets_at"),
                 "window_minutes": secondary.get("window_minutes") or 10080,
@@ -240,6 +242,18 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
         "fetched_at": int(fetched_at),
         "windows": windows,
     }
+
+
+def _limits_has_unreset_window(limits: Any, now: float) -> bool:
+    if not isinstance(limits, dict):
+        return False
+    for key in ("primary", "secondary"):
+        win = limits.get(key)
+        if isinstance(win, dict) and win.get("used_percent") is not None:
+            reset_at = win.get("resets_at")
+            if reset_at is None or (isinstance(reset_at, (int, float)) and float(reset_at) > now):
+                return True
+    return False
 
 
 def probe_codex_quota(
@@ -267,16 +281,20 @@ def probe_codex_quota(
     saved = cache.get("codex")
     cached = saved if account_key and isinstance(saved, dict) and saved.get("account_key") == account_key else {}
 
-    # Return fresh cache if within TTL and not forced
-    if (
-        not force
-        and cached.get("limits")
-        and (now - float(cached.get("fetched_at") or 0)) < CODEX_QUOTA_TTL
-    ):
+    cached_fetched_at = float(cached.get("fetched_at") or 0)
+    cached_within_ttl = (
+        bool(cached.get("limits"))
+        and cached_fetched_at > 0
+        and 0.0 <= (now - cached_fetched_at) < CODEX_QUOTA_TTL
+        and _limits_has_unreset_window(cached.get("limits"), now)
+    )
+
+    # Return fresh cache if within TTL, not in the future, unreset, and not forced
+    if not force and cached_within_ttl:
         if account_scope_out is not None and account_key:
             account_scope_out["codex"] = account_key
         return _format_codex_provider(
-            cached["limits"], cached.get("plan"), float(cached["fetched_at"]), "ok", "已实时同步"
+            cached["limits"], cached.get("plan"), cached_fetched_at, "ok", "已实时同步"
         )
 
     last_fail = float(cached.get("last_failure_at") or 0)
@@ -313,7 +331,14 @@ def probe_codex_quota(
                 }
                 if account_scope_out is not None and account_key:
                     account_scope_out["codex"] = account_key
-                return _format_codex_provider(limits, data.get("plan_type"), now, "ok", "实时探测")
+                live_ok = _limits_has_unreset_window(limits, now)
+                return _format_codex_provider(
+                    limits,
+                    data.get("plan_type"),
+                    now,
+                    "ok" if live_ok else "stale",
+                    "实时探测" if live_ok else "窗口已重置，待新周期同步",
+                )
             raise ValueError("missing Codex quota windows")
         except Exception:
             cached["last_failure_at"] = now
@@ -324,13 +349,16 @@ def probe_codex_quota(
     local_rl = _scan_codex_local_rate_limits(home)
     if local_rl:
         rl_obj, rl_ts = local_rl
-        if rl_ts >= float(cached.get("fetched_at") or 0):
+        if rl_ts <= now and rl_ts >= cached_fetched_at:
             return _format_codex_provider(rl_obj, rl_obj.get("plan_type"), rl_ts, "stale", "本地会话日志 · 账号未经核对")
 
-    # Fallback 2: Cached snapshot (including migrated snapshot)
+    # Fallback 2: Cached snapshot (retains last readings and original fetched_at even after reset)
     if cached.get("limits"):
+        orig_ts = float(cached.get("fetched_at") or 0)
+        unreset = _limits_has_unreset_window(cached.get("limits"), now)
+        msg = "上次缓存快照" if unreset else "窗口已重置，保留上次读数"
         return _format_codex_provider(
-            cached["limits"], cached.get("plan"), float(cached.get("fetched_at") or now), "stale", "上次缓存快照"
+            cached["limits"], cached.get("plan"), orig_ts if orig_ts > 0 else now, "stale", msg
         )
 
     return {
@@ -395,7 +423,7 @@ def _scan_claude_desktop_cache(home: Path, now: float) -> Optional[Dict[str, Any
     cache_dir = home / "Library" / "Application Support" / "Claude" / "Cache" / "Cache_Data"
     if not cache_dir.is_dir():
         return None
-    horizon_ns = int((now + 300) * 1_000_000_000)
+    horizon_ns = int(now * 1_000_000_000)
     files: List[Tuple[int, Path]] = []
     try:
         for entry in os.scandir(cache_dir):
@@ -466,49 +494,90 @@ def probe_claude_quota(home: Path, cache: Dict[str, Any], now: float) -> Dict[st
     fresh = _scan_claude_desktop_cache(home, now)
     cached = cache.get("claude") if isinstance(cache.get("claude"), dict) else {}
     cli = _load_json(resolve_data_dir(home, create=False) / "claude_statusline_quota.json")
-    snap = max((fresh or {}, cli, cached), key=lambda item: int(item.get("updated") or 0))
-    if snap and snap.get("source") != "cli":
+
+    def _valid_ts(item: Dict[str, Any]) -> int:
+        v = item.get("updated")
+        if isinstance(v, (int, float)) and math.isfinite(float(v)) and float(v) > 0:
+            return int(v)
+        return 0
+
+    candidates = [item for item in (fresh or {}, cli, cached) if isinstance(item, dict) and (item.get("q5") is not None or item.get("q7") is not None)]
+    non_future = [item for item in candidates if 0 < _valid_ts(item) <= now]
+    if non_future:
+        snap = max(non_future, key=_valid_ts)
+    elif candidates:
+        snap = max(candidates, key=_valid_ts)
+    else:
+        snap = {}
+
+    if snap and snap.get("source") != "cli" and _valid_ts(snap) <= now:
         cache["claude"] = snap
 
     windows: List[Dict[str, Any]] = []
     if snap:
-        if snap.get("q5") is not None and (snap.get("q5_reset") or now + 1) > now:
-            used = float(snap["q5"])
-            windows.append(
-                {
-                    "id": "claude_5h",
-                    "label": "5 小时窗口",
-                    "short_label": "CL5",
-                    "used_percent": round(used, 1),
-                    "remaining_percent": round(max(0.0, 100.0 - used), 1),
-                    "resets_at": snap.get("q5_reset"),
-                    "window_minutes": 300,
-                }
-            )
-        if snap.get("q7") is not None and (snap.get("q7_reset") or now + 1) > now:
-            used = float(snap["q7"])
-            windows.append(
-                {
-                    "id": "claude_7d",
-                    "label": "7 天周额度",
-                    "short_label": "CL7",
-                    "used_percent": round(used, 1),
-                    "remaining_percent": round(max(0.0, 100.0 - used), 1),
-                    "resets_at": snap.get("q7_reset"),
-                    "window_minutes": 10080,
-                }
-            )
+        if snap.get("q5") is not None:
+            try:
+                used = float(snap["q5"])
+                if math.isfinite(used) and 0.0 <= used <= 100.0:
+                    windows.append(
+                        {
+                            "id": "claude_5h",
+                            "label": "5 小时窗口",
+                            "short_label": "CL5",
+                            "used_percent": round(used, 1),
+                            "_raw_used_percent": used,
+                            "remaining_percent": round(max(0.0, 100.0 - used), 1),
+                            "resets_at": snap.get("q5_reset"),
+                            "window_minutes": 300,
+                        }
+                    )
+            except (TypeError, ValueError):
+                pass
+        if snap.get("q7") is not None:
+            try:
+                used = float(snap["q7"])
+                if math.isfinite(used) and 0.0 <= used <= 100.0:
+                    windows.append(
+                        {
+                            "id": "claude_7d",
+                            "label": "7 天周额度",
+                            "short_label": "CL7",
+                            "used_percent": round(used, 1),
+                            "_raw_used_percent": used,
+                            "remaining_percent": round(max(0.0, 100.0 - used), 1),
+                            "resets_at": snap.get("q7_reset"),
+                            "window_minutes": 10080,
+                        }
+                    )
+            except (TypeError, ValueError):
+                pass
 
     if windows:
-        updated = int(snap.get("updated") or now)
-        is_fresh = (now - updated) < CLAUDE_DISPLAY_TTL
+        updated = _valid_ts(snap) or int(now)
+        not_future = (updated <= now)
+        any_unreset = any(
+            (w.get("resets_at") is None)
+            or (isinstance(w.get("resets_at"), (int, float)) and float(w["resets_at"]) > now)
+            for w in windows
+        )
+        is_fresh = not_future and any_unreset and (0.0 <= (now - updated) < CLAUDE_DISPLAY_TTL)
+        if not not_future:
+            status_text = "观测时间异常（晚于当前时钟）"
+        elif not any_unreset:
+            status_text = "窗口已重置，保留上次读数"
+        elif snap.get("source") == "cli":
+            status_text = "Claude Code 状态栏"
+        elif snap is fresh:
+            status_text = "桌面端缓存"
+        else:
+            status_text = "上次缓存快照"
         return {
             "id": "claude",
             "name": "Claude",
             "color": "#FB923C",
             "plan": "Pro / Max",
             "status": "ok" if is_fresh else "stale",
-            "status_text": "Claude Code 状态栏" if snap.get("source") == "cli" else ("桌面端缓存" if snap is fresh else "上次缓存快照"),
+            "status_text": status_text,
             "fetched_at": updated,
             "windows": windows,
         }
@@ -656,9 +725,14 @@ def _window_fresh_until(provider: Dict[str, Any], window: Dict[str, Any], now: f
     if provider.get("status") != "ok":
         return None
     fetched_at = provider.get("fetched_at")
-    if not isinstance(fetched_at, (int, float)) or not math.isfinite(float(fetched_at)) or float(fetched_at) <= 0:
+    if (
+        not isinstance(fetched_at, (int, float))
+        or not math.isfinite(float(fetched_at))
+        or float(fetched_at) <= 0
+        or float(fetched_at) > now
+    ):
         return None
-    used = window.get("used_percent")
+    used = window.get("_raw_used_percent", window.get("used_percent"))
     if not isinstance(used, (int, float)) or not math.isfinite(float(used)) or not (0.0 <= float(used) <= 100.0):
         return None
 
@@ -774,7 +848,9 @@ def _compute_pace_for_window(
     pid = str(provider["id"])
     wid = str(window["id"])
     observed_at = int(provider["fetched_at"])
-    used = float(window["used_percent"])
+    if observed_at > now:
+        return {"level": "unknown", "reason": "stale", "sample_count": 0}
+    used = float(window.get("_raw_used_percent", window["used_percent"]))
 
     # Remove rotated-window or switched-account series for this (provider_id, window_id)
     matched: Optional[Dict[str, Any]] = None
@@ -906,7 +982,7 @@ def collect_quotas(
             probe_grok_quota(cache, now),
         ]
 
-        # Annotate every window with fresh_until_ts and pace
+        # Annotate every window with fresh_until_ts and pace, then strip internal raw precision field
         for p in providers:
             scope = account_scopes.get(p["id"])
             for w in p.get("windows") or []:
@@ -914,6 +990,7 @@ def collect_quotas(
                 if fresh_until is not None:
                     w["fresh_until_ts"] = fresh_until
                 w["pace"] = _compute_pace_for_window(series_list, p, w, scope, now)
+                w.pop("_raw_used_percent", None)
 
         pruned_series = _prune_pace_series(series_list, now)
         if pruned_series:

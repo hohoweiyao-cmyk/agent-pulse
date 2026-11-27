@@ -134,7 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let freshness = store.fastFreshness
         let runningCount = store.todayRunningCount
         let waitingCount = store.sentinelTasks.filter { $0.state == .waitingHuman }.count
-        let hrsStr = Formatters.menuBarHours(store.todayLiveSeconds)
+        let hrsStr = store.todayMenuBarHoursText
 
         var segments: [String] = []
         if freshness == .stale || freshness == .unavailable {
@@ -193,14 +193,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 unpricedTokens: store.todayUnpricedTokens,
                 hasObservation: store.todayHasCostObservation
             )
-            let summary = NSMenuItem(
-                title: String(
+            let summaryTitle: String
+            if let liveSecs = store.todayLiveSecondsIfKnown {
+                summaryTitle = String(
                     format: "今日 %.2fh（%.2f 员工日 · %@ · %@）",
-                    store.todayLiveSeconds / 3600.0,
-                    store.todayLiveSeconds / (8.0 * 3600.0),
+                    liveSecs / 3600.0,
+                    liveSecs / (8.0 * 3600.0),
                     Formatters.compactTokens(store.todayTokens),
                     costStr
-                ),
+                )
+            } else {
+                summaryTitle = "今日 —（无可信工时观测 · \(Formatters.compactTokens(store.todayTokens)) · \(costStr)）"
+            }
+            let summary = NSMenuItem(
+                title: summaryTitle,
                 action: nil,
                 keyEquivalent: ""
             )

@@ -293,6 +293,12 @@ enum WorkDayStatus: Codable, Equatable {
     }
 }
 
+enum HourlyChartState: Equatable {
+    case available
+    case unavailable
+    case unknown
+}
+
 struct DayStats: Codable, Equatable, Identifiable {
     var id: String { date }
     let date: String
@@ -315,12 +321,77 @@ struct DayStats: Codable, Equatable, Identifiable {
     let unpricedTokens: Int?
     let cacheHitRate: Double?
 
+    /// Returns true if work hours for this day have no trusted observation (must render "—" instead of 0.00h).
+    var isWorkUnknown: Bool {
+        workStatus == .unknown
+    }
+
+    /// Returns true if work hours come from a retained historical ledger bucket during degraded collection.
+    var isWorkRetained: Bool {
+        workStatus == .retained
+    }
+
     /// Returns true if 24-hour distribution has a trusted source (compatible with v0.6 native buckets).
     var hasHourlyDistribution: Bool {
+        if workStatus == .unknown {
+            return false
+        }
         if let avail = hourlyAvailable {
             return avail && hourlySeconds.count == 24
         }
         return hourlySeconds.count == 24
+    }
+
+    /// Three-state hourly chart availability for WidgetViews / DetailCardsView.
+    var hourlyChartState: HourlyChartState {
+        if isWorkUnknown {
+            return .unknown
+        }
+        if hasHourlyDistribution {
+            return .available
+        }
+        return .unavailable
+    }
+
+    /// Synthesizes an explicit unknown-observation placeholder for a new Shanghai day after midnight.
+    static func unknownPlaceholder(forDay dateStr: String, isToday: Bool = true) -> DayStats {
+        let shortDate = dateStr.count >= 10
+            ? String(dateStr.dropFirst(5)).replacingOccurrences(of: "-", with: "/")
+            : dateStr
+        let weekday: String = {
+            let f = DateFormatter()
+            f.calendar = Calendar(identifier: .gregorian)
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? TimeZone(secondsFromGMT: 8 * 3600)!
+            f.dateFormat = "yyyy-MM-dd"
+            guard let dt = f.date(from: dateStr) else { return "" }
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = f.timeZone
+            let wd = cal.component(.weekday, from: dt) // 1=Sun ... 7=Sat
+            let cn = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+            return cn[(wd - 1) % 7]
+        }()
+        return DayStats(
+            date: dateStr,
+            shortDate: shortDate,
+            weekday: weekday,
+            isToday: isToday,
+            agentSeconds: 0,
+            agentHours: 0,
+            workdays: 0,
+            wallSeconds: 0,
+            wallHours: 0,
+            leverage: 1.0,
+            runs: 0,
+            tools: [],
+            hourlySeconds: Array(repeating: 0.0, count: 24),
+            hourlyAvailable: false,
+            workStatus: .unknown,
+            tokens: 0,
+            costUsd: 0.0,
+            unpricedTokens: 0,
+            cacheHitRate: 0.0
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -497,8 +568,13 @@ struct PeriodStats: Codable, Equatable {
     let wallHours: Double
     let leverage: Double
     let runs: Int
+    let workStatus: WorkDayStatus?
     let tools: [UsageToolStats]
     let topModels: [RankedModelStats]?
+
+    var isWorkUnknown: Bool {
+        workStatus == .unknown
+    }
 
     enum CodingKeys: String, CodingKey {
         case startDate = "start_date"
@@ -519,6 +595,7 @@ struct PeriodStats: Codable, Equatable {
         case wallHours = "wall_hours"
         case leverage
         case runs
+        case workStatus = "work_status"
         case tools
         case topModels = "top_models"
     }
@@ -648,7 +725,13 @@ struct RankedModelStats: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let cacheHitRate: Double
+
+    var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
+    var effectiveHasCostObservation: Bool {
+        totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0
+    }
 
     enum CodingKeys: String, CodingKey {
         case tool
@@ -663,6 +746,7 @@ struct RankedModelStats: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
     }
 }
@@ -689,9 +773,16 @@ struct HeatmapDay: Codable, Equatable, Identifiable {
     let isToday: Bool
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
+    let hasCostObservation: Bool?
     let agentHours: Double
     let sessions: Int
     let tools: [HeatmapDayTool]
+
+    var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
+    var effectiveHasCostObservation: Bool {
+        hasCostObservation ?? (totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0)
+    }
 
     enum CodingKeys: String, CodingKey {
         case date
@@ -700,6 +791,8 @@ struct HeatmapDay: Codable, Equatable, Identifiable {
         case isToday = "is_today"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
+        case hasCostObservation = "has_cost_observation"
         case agentHours = "agent_hours"
         case sessions
         case tools
@@ -713,7 +806,14 @@ struct HeatmapDayTool: Codable, Equatable, Identifiable {
     let color: String
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
+    let hasCostObservation: Bool?
     let agentHours: Double
+
+    var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
+    var effectiveHasCostObservation: Bool {
+        hasCostObservation ?? (totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0)
+    }
 
     enum CodingKeys: String, CodingKey {
         case tool
@@ -721,6 +821,8 @@ struct HeatmapDayTool: Codable, Equatable, Identifiable {
         case color
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
+        case hasCostObservation = "has_cost_observation"
         case agentHours = "agent_hours"
     }
 }
@@ -741,9 +843,12 @@ struct ProjectTrailItem: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let cacheHitRate: Double
     let sessions: Int
     let tools: [ProjectToolBadge]
+
+    var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
 
     enum CodingKeys: String, CodingKey {
         case path, name
@@ -757,6 +862,7 @@ struct ProjectTrailItem: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
         case sessions
         case tools
@@ -781,10 +887,55 @@ struct ProjectPeriodStats: Codable, Equatable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
+    let hasCostObservation: Bool?
     let cacheHitRate: Double
     let sessions: Int
     let tools: [ProjectToolBadge]
     let worktreeSources: [WorktreeSource]
+
+    var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
+    var effectiveHasCostObservation: Bool {
+        hasCostObservation ?? (totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0)
+    }
+
+    init(
+        startDate: String,
+        endDate: String,
+        lastActiveDate: String,
+        agentSeconds: Double?,
+        inputTokens: Int,
+        outputTokens: Int,
+        cacheReadTokens: Int,
+        cacheWriteTokens: Int,
+        reasoningTokens: Int,
+        totalTokens: Int,
+        costUsd: Double,
+        unpricedTokens: Int? = nil,
+        hasCostObservation: Bool? = nil,
+        cacheHitRate: Double,
+        sessions: Int,
+        tools: [ProjectToolBadge],
+        worktreeSources: [WorktreeSource]
+    ) {
+        self.startDate = startDate
+        self.endDate = endDate
+        self.lastActiveDate = lastActiveDate
+        self.agentSeconds = agentSeconds
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.reasoningTokens = reasoningTokens
+        self.totalTokens = totalTokens
+        self.costUsd = costUsd
+        self.unpricedTokens = unpricedTokens
+        self.hasCostObservation = hasCostObservation
+        self.cacheHitRate = cacheHitRate
+        self.sessions = sessions
+        self.tools = tools
+        self.worktreeSources = worktreeSources
+    }
 
     enum CodingKeys: String, CodingKey {
         case startDate = "start_date"
@@ -798,6 +949,8 @@ struct ProjectPeriodStats: Codable, Equatable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
+        case hasCostObservation = "has_cost_observation"
         case cacheHitRate = "cache_hit_rate"
         case sessions
         case tools
@@ -819,6 +972,7 @@ struct ProjectTrail: Codable, Equatable, Identifiable {
     let reasoningTokens: Int
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let cacheHitRate: Double
     let sessions: Int
     let tools: [ProjectToolBadge]
@@ -836,6 +990,7 @@ struct ProjectTrail: Codable, Equatable, Identifiable {
         case reasoningTokens = "reasoning_tokens"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
         case sessions
         case tools
@@ -894,6 +1049,7 @@ struct HistoryDayPoint: Codable, Equatable, Identifiable {
     let isToday: Bool
     let totalTokens: Int
     let costUsd: Double
+    let unpricedTokens: Int?
     let agentHours: Double
 
     enum CodingKeys: String, CodingKey {
@@ -903,6 +1059,7 @@ struct HistoryDayPoint: Codable, Equatable, Identifiable {
         case isToday = "is_today"
         case totalTokens = "total_tokens"
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case agentHours = "agent_hours"
     }
 }

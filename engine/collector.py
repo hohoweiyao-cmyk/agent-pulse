@@ -38,6 +38,7 @@ from health import (  # noqa: E402
     combine_statuses,
     read_jsonl_checked,
     resolve_missing_source_status,
+    seen_source_instances,
 )
 from ledger import LedgerError, build_usage_payload, load_ledger, resolve_data_dir, restore_ledger, valid_day  # noqa: E402
 from pricing import PricingTable  # noqa: E402
@@ -383,42 +384,74 @@ class SegmentCache:
         self.seen.add(key)
         entry = self.files.get(key)
         if not isinstance(entry, dict):
+            self.dirty = True
             return None
-        if entry.get("mtime_ns") != st.st_mtime_ns or entry.get("size") != st.st_size:
+        if (
+            type(entry.get("mtime_ns")) is not int
+            or type(entry.get("size")) is not int
+            or entry["mtime_ns"] != st.st_mtime_ns
+            or entry["size"] != st.st_size
+        ):
             return None
         if require_source_rank:
             sr = entry.get("source_rank")
             if not (
                 isinstance(sr, dict)
-                and isinstance(sr.get("latest_event_ts"), (int, float))
-                and isinstance(sr.get("valid_record_count"), int)
+                and type(sr.get("latest_event_ts")) in (int, float)
+                and math.isfinite(float(sr["latest_event_ts"]))
+                and type(sr.get("valid_record_count")) is int
             ):
+                self.dirty = True
                 return None
 
         raw_segs = entry.get("segs")
         if not isinstance(raw_segs, list):
+            self.dirty = True
             return None
         segs: List[WorkSegment] = []
         for row in raw_segs:
             if not isinstance(row, list) or len(row) != 8:
+                self.dirty = True
+                return None
+            if (
+                not isinstance(row[0], str)
+                or type(row[1]) not in (int, float)
+                or type(row[2]) not in (int, float)
+                or not math.isfinite(float(row[1]))
+                or not math.isfinite(float(row[2]))
+                or row[3] not in (0, 1, True, False)
+                or (row[4] is not None and not isinstance(row[4], str))
+                or (row[5] is not None and not isinstance(row[5], str))
+                or (row[6] is not None and not isinstance(row[6], str))
+                or (row[7] is not None and not isinstance(row[7], str))
+            ):
+                self.dirty = True
                 return None
             segs.append(
                 WorkSegment(
-                    tool=str(row[0]),
+                    tool=row[0],
                     start_ts=float(row[1]),
                     end_ts=float(row[2]),
                     is_active=False,
                     is_turn_head=bool(row[3]),
-                    run_key=str(row[4] or ""),
-                    label=str(row[5] or ""),
-                    workspace_path=row[6] if isinstance(row[6], str) else None,
-                    project_path=row[7] if isinstance(row[7], str) else None,
+                    run_key=row[4] or "",
+                    label=row[5] or "",
+                    workspace_path=row[6],
+                    project_path=row[7],
                     source_id=source_id,
                 )
             )
         completed = entry.get("completed")
-        if completed is not None and not isinstance(completed, list):
-            return None
+        if completed is not None:
+            if not isinstance(completed, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("run_key"), str)
+                or type(item.get("completed_ts")) not in (int, float)
+                or not math.isfinite(float(item["completed_ts"]))
+                for item in completed
+            ):
+                self.dirty = True
+                return None
         return {
             "segs": segs,
             "completed": completed or [],
@@ -750,7 +783,9 @@ def collect_t3_code(
                     ws = parse_ts(r["created_at"])
                     we = parse_ts(r["resolved_at"])
                     st_lower = str(r["status"] or "").strip().lower()
-                    is_pending_legacy = (we is None) and st_lower not in ("resolved", "cancelled", "rejected")
+                    is_pending_legacy = (we is None) and st_lower not in (
+                        "resolved", "cancelled", "canceled", "rejected", "revoked", "expired", "failed", "denied", "aborted"
+                    )
                     if tid and ws is not None:
                         end_w = we if we is not None else now_ts
                         if end_w > ws:
@@ -799,8 +834,9 @@ def collect_t3_code(
                 status_out["work.t3"] = "unavailable"
             return segs
 
-        # Pre-index unfinished runs per thread for strict single-run fallback association
+        # Pre-index unfinished runs per thread and by run_id for strict association + window verification
         unfinished_by_thread: Dict[str, List[Tuple[str, float]]] = {}
+        unfinished_run_meta: Dict[str, Tuple[str, float]] = {}
         parsed_runs: List[Dict[str, Any]] = []
         for r in rows:
             start_ts = parse_ts(r["started_at"]) or parse_ts(r["requested_at"])
@@ -813,6 +849,7 @@ def collect_t3_code(
             is_live_candidate = (end_ts is None) and status in ("running", "starting", "preparing")
             if is_live_candidate:
                 unfinished_by_thread.setdefault(thread_id, []).append((run_id, start_ts))
+                unfinished_run_meta[run_id] = (thread_id, start_ts)
             parsed_runs.append(
                 {
                     "row": r,
@@ -825,12 +862,16 @@ def collect_t3_code(
                 }
             )
 
-        # Map open runtime requests to specific unfinished run_ids
+        # Map open runtime requests to specific unfinished run_ids with strict run, thread, and time-window checks
         run_open_waits: Dict[str, List[Tuple[float, str]]] = {}
         for req in open_runtime_reqs:
             drid = req["direct_run_id"]
             if drid:
-                run_open_waits.setdefault(drid, []).append((req["created_at"], req["wait_kind"]))
+                meta = unfinished_run_meta.get(drid)
+                if meta is not None:
+                    run_tid, run_start = meta
+                    if run_tid == req["thread_id"] and run_start <= req["created_at"] <= now_ts:
+                        run_open_waits.setdefault(drid, []).append((req["created_at"], req["wait_kind"]))
             elif not req["has_direct_ref"]:
                 cands = unfinished_by_thread.get(req["thread_id"], [])
                 if len(cands) == 1:
@@ -897,7 +938,13 @@ def collect_t3_code(
                     we = ica or iua or (now_ts if is_live_candidate else None)
                     if ws is not None and we is not None and we > ws:
                         exclusions.append((max(ws, start_ts), min(we, bound_end)))
-                    if is_live_candidate and ica is None and istatus not in T3_CLOSED_ITEM_STATUSES:
+                    # Strict waiting_human eligibility: explicit open status whitelist + valid time window
+                    if (
+                        is_live_candidate
+                        and ica is None
+                        and istatus in T3_OPEN_WAIT_STATUSES
+                        and (ws is None or start_ts <= ws <= now_ts)
+                    ):
                         has_pending_human_wait = True
                         wait_since = ws if ws is not None else start_ts
                         open_waits_for_run.append((wait_since, T3_WAIT_ITEM_KIND[itype]))
@@ -1055,13 +1102,14 @@ def parse_codex_file_checked(
     turn_starts: Dict[str, float] = {}
     turn_steps: Dict[str, List[float]] = {}
     turn_spans: Dict[str, List[Tuple[float, float]]] = {}
-    turn_cwds: Dict[str, Optional[str]] = {}
+    turn_cwds: Dict[str, str] = {}
     completed_turns: set = set()
     active_turn_id: Optional[str] = None
     last_event_type = ""
     session_cwd: Optional[str] = None
-    current_turn_cwd: Optional[str] = None
+    pending_turn_cwd: Optional[str] = None
     session_label = ""
+    struct_error = False
 
     def emit_turn(key: str, start_ts: float, end_ts: Optional[float], active: bool) -> List[WorkSegment]:
         steps = list(turn_steps.get(key, []))
@@ -1086,15 +1134,17 @@ def parse_codex_file_checked(
 
     for line_no, obj in res.records:
         otype = obj.get("type")
-        payload = obj.get("payload")
-        if not isinstance(payload, dict):
-            payload = {}
+        raw_payload = obj.get("payload")
+        if raw_payload is not None and not isinstance(raw_payload, dict):
+            struct_error = True
+            continue
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
         line_ts = parse_ts(obj.get("timestamp"))
 
         if otype == "session_meta":
             originator = str(payload.get("originator") or "")
             if originator == "T3 Code":
-                return True, [], [], [], res.had_error, res.identity_changed, res.stat_result
+                return True, [], [], [], (res.had_error or struct_error), res.identity_changed, res.stat_result
             cwd = _norm_opt_path(payload.get("cwd"))
             if cwd:
                 session_cwd = cwd
@@ -1103,10 +1153,14 @@ def parse_codex_file_checked(
 
         if otype == "turn_context":
             tc_cwd = _norm_opt_path(payload.get("cwd"))
+            tc_tid = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
             if tc_cwd:
-                current_turn_cwd = tc_cwd
-                if active_turn_id and active_turn_id not in turn_cwds:
+                if tc_tid:
+                    turn_cwds[tc_tid] = tc_cwd
+                elif active_turn_id:
                     turn_cwds[active_turn_id] = tc_cwd
+                else:
+                    pending_turn_cwd = tc_cwd
             continue
 
         if otype == "event_msg":
@@ -1120,8 +1174,9 @@ def parse_codex_file_checked(
                     key = tid or f"{file_path.stem}:L{line_no}"
                     turn_starts[key] = ts
                     turn_steps.setdefault(key, []).append(ts)
-                    if current_turn_cwd or session_cwd:
-                        turn_cwds[key] = current_turn_cwd or session_cwd
+                    if pending_turn_cwd and key not in turn_cwds:
+                        turn_cwds[key] = pending_turn_cwd
+                    pending_turn_cwd = None
                     active_turn_id = key
             elif ptype == "item_completed":
                 key = tid or active_turn_id
@@ -1146,17 +1201,19 @@ def parse_codex_file_checked(
                     except (TypeError, ValueError):
                         pass
                 if start_ts is not None and end_ts is not None and end_ts > start_ts:
-                    if key not in turn_cwds and (current_turn_cwd or session_cwd):
-                        turn_cwds[key] = current_turn_cwd or session_cwd
+                    if key not in turn_cwds and pending_turn_cwd:
+                        turn_cwds[key] = pending_turn_cwd
                     emit_turn(key, start_ts, end_ts, active=False)
                     completed_meta.append({"run_key": f"codex:{key}", "completed_ts": float(end_ts)})
                 active_turn_id = None
+                pending_turn_cwd = None
             elif ptype in ("turn_aborted", "task_aborted"):
                 key = tid or active_turn_id
                 if key and key in turn_starts and key not in completed_turns:
                     completed_turns.add(key)
                     emit_turn(key, turn_starts[key], line_ts, active=False)
                 active_turn_id = None
+                pending_turn_cwd = None
             elif line_ts is not None:
                 key = tid or active_turn_id
                 if key and key in turn_starts:
@@ -1196,7 +1253,7 @@ def parse_codex_file_checked(
         if steps:
             emit_turn(key, start_ts, None, active=False)
 
-    return False, segs, completed_meta, sentinels, res.had_error, res.identity_changed, res.stat_result
+    return False, segs, completed_meta, sentinels, (res.had_error or struct_error), res.identity_changed, res.stat_result
 
 
 def parse_codex_file(file_path: Path, now_ts: float) -> Tuple[bool, List[WorkSegment]]:
@@ -1661,6 +1718,7 @@ def collect_hermes(
     status_out: Optional[Dict[str, str]] = None,
     meta_status_out: Optional[Dict[str, str]] = None,
     prev_sources: Optional[Dict[str, Any]] = None,
+    observed_instances_out: Optional[Dict[str, set]] = None,
 ) -> List[WorkSegment]:
     can_scan, early = check_root_dir(hermes_root, "work.hermes", prev_sources or {})
     if not can_scan:
@@ -1673,9 +1731,11 @@ def collect_hermes(
     db_statuses: List[str] = []
     meta_failed: List[bool] = []
     dir_err = 0
+    discovered_instances: set = set()
 
     main_db = hermes_root / "state.db"
     if main_db.exists():
+        discovered_instances.add("state.db")
         out.extend(
             collect_hermes_db(
                 main_db, cutoff_ts, now_ts, "",
@@ -1690,6 +1750,7 @@ def collect_hermes(
                     continue
                 pdb = pdir / "state.db"
                 if pdb.exists():
+                    discovered_instances.add(f"profiles/{pdir.name}/state.db")
                     out.extend(
                         collect_hermes_db(
                             pdb, cutoff_ts, now_ts, pdir.name,
@@ -1699,7 +1760,13 @@ def collect_hermes(
         except OSError:
             dir_err += 1
 
-    if dir_err > 0:
+    if observed_instances_out is not None:
+        observed_instances_out["work.hermes"] = set(discovered_instances)
+
+    prev_insts = seen_source_instances("work.hermes", prev_sources or {})
+    missing_prev_insts = prev_insts - discovered_instances
+
+    if dir_err > 0 or missing_prev_insts:
         db_statuses.append("unavailable")
     status = "complete" if not db_statuses else combine_statuses(db_statuses)
     if status_out is not None:
@@ -2862,7 +2929,9 @@ def collect_all(
     # Window sizing (Spec 2.4 & 2.6):
     # First complete work / project-work backfill scans up to 182 days;
     # subsequent runs scan max(days, days_elapsed_in_current_month).
-    need_work_backfill = (not ledger.get("work_history_from")) or (not ledger.get("project_work_history_from"))
+    need_work_history = not ledger.get("work_history_from")
+    need_project_work_history = not ledger.get("project_work_history_from")
+    need_work_backfill = need_work_history or need_project_work_history
     work_days = max(days, 182) if need_work_backfill else max(days, now_dt.day)
 
     today = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2878,6 +2947,7 @@ def collect_all(
 
     source_statuses: Dict[str, str] = {}
     meta_statuses: Dict[str, str] = {}
+    observed_instances: Dict[str, set] = {}
     sentinel_candidates: List[SentinelCandidate] = []
     all_segments: List[WorkSegment] = []
 
@@ -2918,6 +2988,7 @@ def collect_all(
             home_dir / ".hermes", cutoff_ts, now,
             sentinels_out=sentinel_candidates, status_out=source_statuses,
             meta_status_out=meta_statuses, prev_sources=prev_sources,
+            observed_instances_out=observed_instances,
         )
     )
     all_segments.extend(
@@ -2974,6 +3045,7 @@ def collect_all(
         billing_out=live_billing,
         billing_cutoff_day=month_start_str,
         prev_sources=prev_sources,
+        observed_instances_out=observed_instances,
     )
 
     wt_resolver = WorktreeResolver()
@@ -2990,25 +3062,27 @@ def collect_all(
         pricing=pricing_tbl,
         live_projects=live_projects,
         home=home_dir,
-        work_history_from=history_from_day,
+        work_history_from=history_from_day if need_work_history else None,
         source_statuses=source_statuses,
         project_work_meta_statuses=meta_statuses,
         observed_project_work=observed_project_work,
-        project_work_history_from=history_from_day,
+        project_work_history_from=history_from_day if need_project_work_history else None,
         live_billing=live_billing,
         billing_cutoff_day=month_start_str,
         commit_ts=scan_commit_ts,
         worktree_resolver=wt_resolver,
         out_state=ledger_state,
+        observed_instances=observed_instances,
     )
 
     collection_payload = ledger_state.get("collection")
     work_complete = bool(ledger_state.get("work_complete", True))
     rejected_stale = bool(ledger_state.get("rejected_stale_commit", False))
     retained_work_days = ledger_state.get("ledger_work_days") or {}
+    effective_statuses = ledger_state.get("source_statuses") or source_statuses
 
     healthy_work_sources = {
-        sid for sid in WORK_SOURCE_IDS if source_statuses.get(sid) == "complete"
+        sid for sid in WORK_SOURCE_IDS if effective_statuses.get(sid) == "complete"
     }
     if rejected_stale:
         sentinel_tasks, active_agents = [], []
@@ -3125,12 +3199,29 @@ def render_markdown_report(
         e_date = p_stats.get("end_date", "")
         range_str = s_date if s_date == e_date else f"{s_date} ~ {e_date}"
 
-        lines = [
-            f"## AI 工时与用量战报 · {title_cn}（{range_str}）",
-            "",
-            f"- **AI 累计工时**：**{p_stats['agent_hours']:.2f} h**（折合 **{p_stats['workdays']:.2f} 个 AI 工作日**，按 8h/日）",
-            f"- **并行杠杆率**：**{p_stats['leverage']:.2f}×**（去重墙钟 {p_stats['wall_hours']:.2f} h · 共 {p_stats['runs']} 轮执行 · 活跃 {p_stats['active_days']} 天）",
-        ]
+        p_work_status = p_stats.get("work_status")
+        if p_work_status is None:
+            col_work_st = ((payload.get("collection") or {}).get("work") or {}).get("status")
+            if float(p_stats.get("agent_seconds", 0.0) or 0.0) == 0.0 and col_work_st in ("partial", "unavailable"):
+                p_work_status = "unknown"
+            else:
+                p_work_status = "observed"
+        p_work_unknown = (p_work_status == "unknown")
+
+        if p_work_unknown:
+            lines = [
+                f"## AI 工时与用量战报 · {title_cn}（{range_str}）",
+                "",
+                "- **AI 累计工时**：**—**（无可信工时观测）",
+                "- **并行杠杆率**：**—**（当前快照工时源不可用）",
+            ]
+        else:
+            lines = [
+                f"## AI 工时与用量战报 · {title_cn}（{range_str}）",
+                "",
+                f"- **AI 累计工时**：**{p_stats['agent_hours']:.2f} h**（折合 **{p_stats['workdays']:.2f} 个 AI 工作日**，按 8h/日）",
+                f"- **并行杠杆率**：**{p_stats['leverage']:.2f}×**（去重墙钟 {p_stats['wall_hours']:.2f} h · 共 {p_stats['runs']} 轮执行 · 活跃 {p_stats['active_days']} 天）",
+            ]
         p_tok = int(p_stats.get("total_tokens", 0) or 0)
         p_cost = float(p_stats.get("cost_usd", 0.0) or 0.0)
         p_unpriced = int(p_stats.get("unpriced_tokens", 0) or 0)
@@ -3167,7 +3258,7 @@ def render_markdown_report(
                 )
         elif p_stats.get("agent_seconds", 0) == 0 and not has_obs:
             lines.append("")
-            lines.append("该周期暂无工时与用量记录。")
+            lines.append("该周期暂无可信工时与用量观测。" if p_work_unknown else "该周期暂无工时与用量记录。")
 
         lines.append("")
         lines.append(
@@ -3192,12 +3283,21 @@ def render_markdown_report(
             raise ValueError(f"日期不在可查询窗口内：{target_date}")
         target_idx = matched_idx
 
-    lines = [
-        f"## AI 工时与用量日报 · {day['date']} ({day['weekday']})",
-        "",
-        f"- **AI 累计工时**：**{day['agent_hours']:.2f} h**（折合 **{day['workdays']:.2f} 个 AI 工作日**，按 8h/日）",
-        f"- **并行杠杆率**：**{day['leverage']:.2f}×**（去重墙钟 {day['wall_hours']:.2f} h · 共 {day['runs']} 轮执行）",
-    ]
+    day_work_unknown = (day.get("work_status") == "unknown")
+    if day_work_unknown:
+        lines = [
+            f"## AI 工时与用量日报 · {day['date']} ({day['weekday']})",
+            "",
+            "- **AI 累计工时**：**—**（无可信工时观测）",
+            "- **并行杠杆率**：**—**（当前快照工时源不可用）",
+        ]
+    else:
+        lines = [
+            f"## AI 工时与用量日报 · {day['date']} ({day['weekday']})",
+            "",
+            f"- **AI 累计工时**：**{day['agent_hours']:.2f} h**（折合 **{day['workdays']:.2f} 个 AI 工作日**，按 8h/日）",
+            f"- **并行杠杆率**：**{day['leverage']:.2f}×**（去重墙钟 {day['wall_hours']:.2f} h · 共 {day['runs']} 轮执行）",
+        ]
     day_tok = int(day.get("tokens", 0) or 0)
     day_cost = float(day.get("cost_usd", 0.0) or 0.0)
     day_unp = int(day.get("unpriced_tokens", 0) or 0)
@@ -3233,14 +3333,23 @@ def render_markdown_report(
         win_start = max(0, target_idx - 6)
         window_days = days_list[win_start : target_idx + 1]
         cov_count = len(window_days)
-        cov_sec = sum(float(d.get("agent_seconds", 0.0) or 0.0) for d in window_days)
-        cov_hrs = cov_sec / 3600.0
-        cov_avg = cov_hrs / max(1, cov_count)
-        cov_active = sum(1 for d in window_days if float(d.get("agent_seconds", 0.0) or 0.0) >= 60.0)
-        lines.extend([
-            "",
-            f"> 截至 {day['date']} 近 {cov_count} 天累计 **{cov_hrs:.2f} h**（日均 {cov_avg:.2f} h，活跃 {cov_active}/{cov_count} 天）。口径：步间心跳 {hb}m（纯 AI 执行，剔除等人等待），自有增量 Token 引擎，T3↔Codex 双向去重。",
-        ])
+        known_days = [d for d in window_days if d.get("work_status") != "unknown"]
+        unknown_count = cov_count - len(known_days)
+        if not known_days:
+            lines.extend([
+                "",
+                f"> 截至 {day['date']} 近 {cov_count} 天尚无可信工时观测。口径：步间心跳 {hb}m（纯 AI 执行，剔除等人等待），自有增量 Token 引擎，T3↔Codex 双向去重。",
+            ])
+        else:
+            cov_sec = sum(float(d.get("agent_seconds", 0.0) or 0.0) for d in known_days)
+            cov_hrs = cov_sec / 3600.0
+            cov_avg = cov_hrs / max(1, len(known_days))
+            cov_active = sum(1 for d in known_days if float(d.get("agent_seconds", 0.0) or 0.0) >= 60.0)
+            unk_suffix = f"；另有 {unknown_count} 天工时未知" if unknown_count > 0 else ""
+            lines.extend([
+                "",
+                f"> 截至 {day['date']} 近 {cov_count} 天累计 **{cov_hrs:.2f} h**（日均 {cov_avg:.2f} h，活跃 {cov_active}/{len(known_days)} 天{unk_suffix}）。口径：步间心跳 {hb}m（纯 AI 执行，剔除等人等待），自有增量 Token 引擎，T3↔Codex 双向去重。",
+            ])
     if notice:
         lines.append(notice)
     return "\n".join(lines)

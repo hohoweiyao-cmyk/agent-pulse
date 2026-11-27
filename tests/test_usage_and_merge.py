@@ -68,7 +68,13 @@ class TestAgentPulseEngine(unittest.TestCase):
             self.assertEqual(set(json.loads(path.read_text())), {"q5", "q5_reset", "updated", "source"})
             result = qc.probe_claude_quota(home, {}, 1010)
             self.assertEqual(result["windows"][0]["used_percent"], 23.5)
-            self.assertFalse(qc.probe_claude_quota(home, {}, 2000)["windows"])
+            # v0.7 (#9): after reset, live freshness is revoked (status=stale, fresh_until=None)
+            # while detail view retains the last reading and original fetched_at timestamp.
+            reset_res = qc.probe_claude_quota(home, {}, 2000)
+            self.assertEqual(reset_res["status"], "stale")
+            self.assertEqual(reset_res["fetched_at"], 1000)
+            self.assertEqual(reset_res["windows"][0]["used_percent"], 23.5)
+            self.assertIsNone(qc._window_fresh_until(reset_res, reset_res["windows"][0], 2000))
 
     def test_pricing_resolution_and_cost(self):
         tbl = pr.PricingTable(

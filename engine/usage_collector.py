@@ -36,6 +36,7 @@ from health import (
     combine_statuses,
     read_jsonl_checked,
     resolve_missing_source_status,
+    seen_source_instances,
 )
 from pricing import PricingTable
 from storage import sqlite_snapshot_with_status, write_json
@@ -45,6 +46,17 @@ USAGE_CACHE_VERSION = 5
 
 _HERMES_ACTUAL_COST_SOURCES = frozenset({"provider_cost_api", "provider_generation_api"})
 _HERMES_INCLUDED_MODES = frozenset({"subscription_included", "included"})
+_HERMES_API_BILLING_MODES = frozenset({
+    "api",
+    "api_key",
+    "payg",
+    "pay_as_you_go",
+    "byok",
+    "direct_api",
+    "metered",
+    "credits",
+    "openrouter",
+})
 
 
 def _normalize_project_path(raw: Any) -> str:
@@ -141,6 +153,49 @@ def _add_billing_decimal(
     d_map[field] = d_map.get(field, Decimal("0")) + amount
 
 
+def _is_valid_day_str(val: Any) -> bool:
+    if not isinstance(val, str) or len(val) != 10:
+        return False
+    try:
+        return datetime.strptime(val, "%Y-%m-%d").strftime("%Y-%m-%d") == val
+    except ValueError:
+        return False
+
+
+def _is_nonneg_int(val: Any) -> bool:
+    return type(val) is int and val >= 0
+
+
+def _is_nonneg_finite_num(val: Any) -> bool:
+    return type(val) in (int, float) and math.isfinite(float(val)) and float(val) >= 0.0
+
+
+def _is_valid_usage_cache_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    tool = row.get("tool")
+    day = row.get("day")
+    model = row.get("model")
+    if not (isinstance(tool, str) and tool and _is_valid_day_str(day) and isinstance(model, str) and model):
+        return False
+    for int_key in ("in", "out", "cr", "cw", "thoughts", "requests", "sessions"):
+        if int_key not in row or not _is_nonneg_int(row[int_key]):
+            return False
+    if "cost_usd" not in row or not _is_nonneg_finite_num(row["cost_usd"]):
+        return False
+    if "sub_cand" in row and not _is_nonneg_finite_num(row["sub_cand"]):
+        return False
+    if "project" in row and not isinstance(row["project"], str):
+        return False
+    if "unpriced_tokens" in row and not _is_nonneg_int(row["unpriced_tokens"]):
+        return False
+    if "dedup_id" in row and not (isinstance(row["dedup_id"], str) and row["dedup_id"]):
+        return False
+    if "session_id" in row and not (isinstance(row["session_id"], str) and row["session_id"]):
+        return False
+    return True
+
+
 class UsageCache:
     """Caches parsed daily token deltas per source file using mtime_ns + size (v5)."""
 
@@ -166,7 +221,7 @@ class UsageCache:
                 self.files = {}
                 self.dirty = True
 
-    def get(self, file_path: Path) -> Optional[List[Dict[str, Any]]]:
+    def get(self, file_path: Path, *, require_codex_dedup: bool = False) -> Optional[List[Dict[str, Any]]]:
         try:
             st = file_path.stat()
         except OSError:
@@ -176,11 +231,19 @@ class UsageCache:
         entry = self.files.get(key)
         if (
             isinstance(entry, dict)
-            and entry.get("mtime_ns") == st.st_mtime_ns
-            and entry.get("size") == st.st_size
+            and type(entry.get("mtime_ns")) is int
+            and type(entry.get("size")) is int
+            and entry["mtime_ns"] == st.st_mtime_ns
+            and entry["size"] == st.st_size
             and isinstance(entry.get("rows"), list)
         ):
-            return entry["rows"]
+            if require_codex_dedup and entry.get("codex_dedup") is not True:
+                self.dirty = True
+                return None
+            rows = entry["rows"]
+            if all(_is_valid_usage_cache_row(r) for r in rows):
+                return rows
+            self.dirty = True
         return None
 
     def put(
@@ -189,6 +252,7 @@ class UsageCache:
         rows: List[Dict[str, Any]],
         *,
         stat_result: Optional[os.stat_result] = None,
+        codex_dedup: bool = False,
     ) -> None:
         try:
             st = stat_result if stat_result is not None else file_path.stat()
@@ -196,11 +260,14 @@ class UsageCache:
             return
         key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
         self.seen.add(key)
-        self.files[key] = {
+        entry: Dict[str, Any] = {
             "mtime_ns": st.st_mtime_ns,
             "size": st.st_size,
             "rows": rows,
         }
+        if codex_dedup:
+            entry["codex_dedup"] = True
+        self.files[key] = entry
         self.dirty = True
 
     def save(self) -> None:
@@ -275,13 +342,16 @@ def _merge_rows_into_result(
     projects_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = None,
     billing_cutoff_day: Optional[str] = None,
+    pricing: Optional[PricingTable] = None,
 ) -> None:
     b_floor = billing_cutoff_day or cutoff_day
     for r in rows:
-        day = r.get("day")
-        if not day:
+        if not isinstance(r, dict):
             continue
-        tool = r["tool"]
+        day = r.get("day")
+        tool = r.get("tool")
+        if not isinstance(day, str) or not day or not isinstance(tool, str) or not tool:
+            continue
 
         # Billing candidate accumulation can span from month start without altering legacy cutoff_day
         if billing_acc is not None and day >= b_floor:
@@ -302,12 +372,13 @@ def _merge_rows_into_result(
         cost_usd = _safe_float(r.get("cost_usd"))
         reqs = _safe_int(r.get("requests") or 1)
         sess = _safe_int(r.get("sessions"))
+        model = str(r.get("model") or "unknown")
 
         day_map = result.setdefault(tool, {})
         bucket = day_map.setdefault(day, _empty_bucket())
         _add_to_bucket(
             bucket,
-            model=r.get("model", "unknown"),
+            model=model,
             inp=inp,
             out=out,
             cr=cr,
@@ -330,6 +401,7 @@ def _merge_rows_into_result(
                     "cw": 0,
                     "thoughts": 0,
                     "cost_usd": 0.0,
+                    "unpriced_tokens": 0,
                     "sessions": 0,
                     "tools": [],
                 },
@@ -340,6 +412,14 @@ def _merge_rows_into_result(
             pb["cw"] += cw
             pb["thoughts"] += thoughts
             pb["cost_usd"] = round(pb["cost_usd"] + cost_usd, 6)
+            row_tok = inp + out + cr + cw + thoughts
+            if "unpriced_tokens" in r:
+                row_unp = min(row_tok, _safe_int(r.get("unpriced_tokens")))
+            elif pricing is not None:
+                row_unp = row_tok if (cost_usd == 0.0 and row_tok > 0 and pricing.resolve(model) is None) else 0
+            else:
+                row_unp = row_tok if (cost_usd == 0.0 and row_tok > 0) else 0
+            pb["unpriced_tokens"] = pb.get("unpriced_tokens", 0) + row_unp
             pb["sessions"] += sess
             if tool not in pb["tools"]:
                 pb["tools"].append(tool)
@@ -465,6 +545,9 @@ class CodexUsageEvent:
     tokens: CodexTokens
     total: Optional[CodexTokens]
     response: bool
+    turn_id: str = ""
+    response_id: str = ""
+    project_cwd: str = ""
 
 
 def _codex_mirrored_events(events: List[CodexUsageEvent], response_totals: set) -> set:
@@ -494,34 +577,55 @@ def _parse_codex_file_checked(
 ) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
     res = read_jsonl_checked(
         path,
-        keyword_filter=('"token_count"', '"token_usage_record"', '"session_meta"', '"turn_context"'),
+        keyword_filter=(
+            '"token_count"',
+            '"token_usage_record"',
+            '"session_meta"',
+            '"turn_context"',
+            '"task_started"',
+            '"task_complete"',
+            '"turn_aborted"',
+            '"task_aborted"',
+            '"turn_id"',
+            '"payload"',
+        ),
     )
     if res.permission_error or res.missing:
         return [], True, res.identity_changed, None
 
     originator = ""
-    project_cwd = ""
-    session_id = None
+    session_cwd = ""
+    pending_turn_cwd = ""
+    active_turn_id = ""
+    current_turn_id = ""
+    turn_cwds: Dict[str, str] = {}
+    session_id: Optional[str] = None
     response_ids = set()
     current_model = "unknown"
     prev_total: Optional[CodexTokens] = None
     turn = 0
     events: List[CodexUsageEvent] = []
     response_totals: set = set()
+    struct_error = False
 
     for _, obj in res.records:
         typ = obj.get("type")
-        payload = obj.get("payload")
-        if not isinstance(payload, dict):
+        raw_payload = obj.get("payload")
+        if raw_payload is not None and not isinstance(raw_payload, dict):
+            struct_error = True
             continue
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
 
         if typ == "session_meta":
-            session_id = payload.get("id")
+            sid = payload.get("id")
+            if isinstance(sid, str) and sid.strip():
+                session_id = sid.strip()
             orig = payload.get("originator")
             if isinstance(orig, str):
                 originator = orig
-            if not project_cwd:
-                project_cwd = _normalize_project_path(payload.get("cwd"))
+            cwd = _normalize_project_path(payload.get("cwd"))
+            if cwd:
+                session_cwd = cwd
             continue
 
         if typ == "turn_context":
@@ -529,15 +633,46 @@ def _parse_codex_file_checked(
             m = payload.get("model")
             if isinstance(m, str) and m.strip():
                 current_model = m.strip()
-            if not project_cwd:
-                project_cwd = _normalize_project_path(payload.get("cwd"))
+            tc_tid = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
+            if tc_tid:
+                current_turn_id = tc_tid
+            tc_cwd = _normalize_project_path(payload.get("cwd"))
+            if tc_cwd:
+                if tc_tid:
+                    turn_cwds[tc_tid] = tc_cwd
+                elif active_turn_id:
+                    turn_cwds[active_turn_id] = tc_cwd
+                else:
+                    pending_turn_cwd = tc_cwd
+            continue
+
+        if typ == "event_msg" and payload.get("type") in ("task_started", "task_complete", "turn_aborted", "task_aborted"):
+            ptype = str(payload.get("type") or "")
+            tid = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
+            if ptype == "task_started":
+                active_turn_id = tid or f"turn-{turn + 1}"
+                current_turn_id = tid or active_turn_id
+                if pending_turn_cwd and active_turn_id not in turn_cwds:
+                    turn_cwds[active_turn_id] = pending_turn_cwd
+                pending_turn_cwd = ""
+            else:
+                if tid:
+                    current_turn_id = tid
+                active_turn_id = ""
+                pending_turn_cwd = ""
             continue
 
         is_response = typ == "token_usage_record"
+        response_id_str = ""
         if is_response:
             last = payload.get("usage")
             total = payload.get("thread_token_usage")
+            if (last is not None and not isinstance(last, dict)) or (total is not None and not isinstance(total, dict)):
+                struct_error = True
+                continue
             owner = payload.get("thread_id")
+            if isinstance(owner, str) and owner.strip() and not session_id:
+                session_id = owner.strip()
             response_id = payload.get("response_id")
             if not isinstance(last, dict) or (owner and session_id and owner != session_id):
                 continue
@@ -545,17 +680,25 @@ def _parse_codex_file_checked(
                 if response_id in response_ids:
                     continue
                 response_ids.add(response_id)
+                response_id_str = response_id
         elif typ == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
+            if info is None:
+                continue
             if not isinstance(info, dict):
+                struct_error = True
                 continue
             total = info.get("total_token_usage")
             last = info.get("last_token_usage")
+            if (total is not None and not isinstance(total, dict)) or (last is not None and not isinstance(last, dict)):
+                struct_error = True
+                continue
         else:
             continue
 
         ts = _parse_ts(obj.get("timestamp"))
         if ts is None:
+            struct_error = True
             continue
 
         d_in = d_cr = d_cw = d_out = d_reason = 0
@@ -613,36 +756,106 @@ def _parse_codex_file_checked(
 
         if d_in + d_out + d_cr + d_cw + d_reason <= 0:
             continue
+        ev_turn_id = str(payload.get("turn_id") or payload.get("root_turn_id") or current_turn_id or "")
+        ev_cwd = (
+            (turn_cwds.get(ev_turn_id) if ev_turn_id else None)
+            or (turn_cwds.get(active_turn_id) if active_turn_id else None)
+            or pending_turn_cwd
+            or session_cwd
+        )
         events.append(
-            CodexUsageEvent(ts, current_model, turn, (d_in, d_cr, d_cw, d_out, d_reason), cur_tuple, is_response)
+            CodexUsageEvent(
+                ts,
+                current_model,
+                turn,
+                (d_in, d_cr, d_cw, d_out, d_reason),
+                cur_tuple,
+                is_response,
+                turn_id=ev_turn_id,
+                response_id=response_id_str,
+                project_cwd=ev_cwd,
+            )
         )
 
-    acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     duplicates = _codex_mirrored_events(events, response_totals)
     tool_key = "t3_codex" if originator == "T3 Code" else "codex"
+    rows: List[Dict[str, Any]] = []
+    seen_session_days: set = set()
+    occ_counts: Dict[Tuple[Any, ...], int] = {}
+
     for index, event in enumerate(events):
         if index in duplicates:
             continue
         inp, cr, cw, out, reasoning = event.tokens
         non_cached_in = max(0, inp - cr - cw)
         non_reason_out = max(0, out - reasoning)
+        tot_tok = non_cached_in + non_reason_out + cr + cw + reasoning
         rates = pricing.resolve(event.model)
         cost = pricing.estimate_cost(event.model, non_cached_in, non_reason_out, cr, cw, reasoning)
         sub_cand = cost if rates is not None else None
-        _acc_add(
-            acc,
-            tool_key,
-            _ts_to_day(event.timestamp),
-            event.model,
-            non_cached_in,
-            non_reason_out,
-            cr,
-            cw,
-            reasoning,
-            cost,
-            sub_cand_usd=sub_cand,
-        )
-    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+        unpriced = tot_tok if (cost == 0.0 and rates is None) else 0
+        day = _ts_to_day(event.timestamp)
+
+        s_key = (tool_key, day)
+        sess_inc = 0
+        if s_key not in seen_session_days:
+            seen_session_days.add(s_key)
+            sess_inc = 1
+
+        row: Dict[str, Any] = {
+            "tool": tool_key,
+            "day": day,
+            "model": event.model or "unknown",
+            "in": non_cached_in,
+            "out": non_reason_out,
+            "cr": cr,
+            "cw": cw,
+            "thoughts": reasoning,
+            "cost_usd": round(cost, 6),
+            "unpriced_tokens": unpriced,
+            "requests": 1,
+            "sessions": sess_inc,
+        }
+        if sub_cand is not None:
+            row["sub_cand"] = round(float(sub_cand), 6)
+        if event.project_cwd:
+            row["project"] = event.project_cwd
+
+        if session_id:
+            row["session_id"] = session_id
+            if event.response_id:
+                dedup_raw = f"resp|{tool_key}|{session_id}|{event.response_id}"
+            elif event.total is not None:
+                base_sig = (
+                    "tot",
+                    tool_key,
+                    session_id,
+                    event.turn_id,
+                    round(event.timestamp, 3),
+                    event.model,
+                    event.total,
+                )
+                occ = occ_counts.get(base_sig, 0)
+                occ_counts[base_sig] = occ + 1
+                dedup_raw = f"tot|{tool_key}|{session_id}|{event.turn_id}|{round(event.timestamp, 3)}|{event.model}|{event.total}|{occ}"
+            else:
+                base_sig = (
+                    "ev",
+                    tool_key,
+                    session_id,
+                    event.turn_id,
+                    round(event.timestamp, 3),
+                    event.model,
+                    event.tokens,
+                )
+                occ = occ_counts.get(base_sig, 0)
+                occ_counts[base_sig] = occ + 1
+                dedup_raw = f"ev|{tool_key}|{session_id}|{event.turn_id}|{round(event.timestamp, 3)}|{event.model}|{event.tokens}|{occ}"
+            row["dedup_id"] = hashlib.sha256(dedup_raw.encode("utf-8")).hexdigest()[:32]
+        rows.append(row)
+
+    had_err = res.had_error or struct_error
+    return rows, had_err, res.identity_changed, res.stat_result
 
 
 def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
@@ -667,8 +880,12 @@ def collect_codex_usage(
         return early or "not_configured"
 
     files, dir_err = _walk_matching_files(sessions_root, ".jsonl")
+    files.sort(key=lambda p: str(p))
     files_ok = 0
     files_err = 0
+    seen_event_ids: set = set()
+    seen_session_days: set = set()
+
     for path in files:
         try:
             if path.stat().st_mtime < cutoff_ts - 86400:
@@ -677,22 +894,42 @@ def collect_codex_usage(
         except OSError:
             files_err += 1
             continue
-        rows = cache.get(path)
+        rows = cache.get(path, require_codex_dedup=True)
         if rows is None:
             rows, had_err, changed, st_res = _parse_codex_file_checked(path, pricing)
             if had_err or changed:
                 files_err += 1
                 continue
-            cache.put(path, rows, stat_result=st_res)
+            cache.put(path, rows, stat_result=st_res, codex_dedup=True)
         files_ok += 1
-        _merge_rows_into_result(
-            result,
-            rows,
-            cutoff_day,
-            projects_out=projects_out,
-            billing_acc=billing_acc,
-            billing_cutoff_day=billing_cutoff_day,
-        )
+
+        deduped_rows: List[Dict[str, Any]] = []
+        for r in rows:
+            did = r.get("dedup_id")
+            if did:
+                if did in seen_event_ids:
+                    continue
+                seen_event_ids.add(did)
+            sid = r.get("session_id")
+            sess_key = (r["tool"], r["day"], f"sid:{sid}" if sid else f"file:{path}")
+            row_copy = dict(r)
+            if sess_key in seen_session_days:
+                row_copy["sessions"] = 0
+            else:
+                seen_session_days.add(sess_key)
+                row_copy["sessions"] = 1
+            deduped_rows.append(row_copy)
+
+        if deduped_rows:
+            _merge_rows_into_result(
+                result,
+                deduped_rows,
+                cutoff_day,
+                projects_out=projects_out,
+                billing_acc=billing_acc,
+                billing_cutoff_day=billing_cutoff_day,
+                pricing=pricing,
+            )
     return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
@@ -899,7 +1136,7 @@ def collect_workbuddy_usage(
                 continue
             cache.put(path, rows, stat_result=st_res)
         files_ok += 1
-        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
+        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out, pricing=pricing)
     return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
@@ -1027,6 +1264,7 @@ def collect_claude_usage(
             projects_out=projects_out,
             billing_acc=billing_acc,
             billing_cutoff_day=billing_cutoff_day,
+            pricing=pricing,
         )
     return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
@@ -1135,7 +1373,7 @@ def collect_pi_usage(
                 continue
             cache.put(path, rows, stat_result=st_res)
         files_ok += 1
-        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
+        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out, pricing=pricing)
     return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
@@ -1153,14 +1391,17 @@ def collect_hermes_usage(
     billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = None,
     billing_cutoff_day: Optional[str] = None,
     prev_sources: Optional[Dict[str, Any]] = None,
+    observed_instances_out: Optional[Dict[str, set]] = None,
 ) -> str:
     can_scan, early = check_root_dir(hermes_root, "usage.hermes", prev_sources or {})
     if not can_scan:
         return early or "not_configured"
 
     db_entries: List[Tuple[str, Path]] = []
+    discovered_instances: set = set()
     if (hermes_root / "state.db").exists():
         db_entries.append(("", hermes_root / "state.db"))
+        discovered_instances.add("state.db")
     profiles_dir = hermes_root / "profiles"
     dir_err = 0
     if profiles_dir.exists():
@@ -1171,10 +1412,17 @@ def collect_hermes_usage(
                 cand = prof / "state.db"
                 if cand.exists():
                     db_entries.append((prof.name, cand))
+                    discovered_instances.add(f"profiles/{prof.name}/state.db")
         except OSError:
             dir_err += 1
 
-    if not db_entries and dir_err == 0:
+    if observed_instances_out is not None:
+        observed_instances_out["usage.hermes"] = set(discovered_instances)
+
+    prev_insts = seen_source_instances("usage.hermes", prev_sources or {})
+    missing_prev_insts = prev_insts - discovered_instances
+
+    if not db_entries and dir_err == 0 and not missing_prev_insts:
         return "complete"
 
     b_floor = billing_cutoff_day or cutoff_day
@@ -1261,7 +1509,7 @@ def collect_hermes_usage(
                                         if (
                                             cstatus == "actual"
                                             and csource in _HERMES_ACTUAL_COST_SOURCES
-                                            and bmode not in _HERMES_INCLUDED_MODES
+                                            and bmode in _HERMES_API_BILLING_MODES
                                         ):
                                             actual_dec = _safe_nonneg_decimal(row["actual_cost_usd"])
                                             if actual_dec is not None:
@@ -1391,7 +1639,7 @@ def collect_hermes_usage(
                 db_statuses.append("complete")
                 _merge_rows_into_result(result, _compact_rows(acc), cutoff_day)
 
-    if dir_err > 0:
+    if dir_err > 0 or missing_prev_insts:
         db_statuses.append("unavailable")
     return combine_statuses(db_statuses)
 
@@ -1630,6 +1878,7 @@ def collect_live_usage(
     billing_out: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
     billing_cutoff_day: Optional[str] = None,
     prev_sources: Optional[Dict[str, Any]] = None,
+    observed_instances_out: Optional[Dict[str, set]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Scan local AI logs for the last `days` days and return {tool: {YYYY-MM-DD: bucket}}."""
     home_dir = home or Path.home()
@@ -1725,6 +1974,7 @@ def collect_live_usage(
         billing_acc=billing_acc,
         billing_cutoff_day=billing_cutoff_day,
         prev_sources=prev_sources,
+        observed_instances_out=observed_instances_out,
     )
     statuses["usage.opencode"] = collect_opencode_usage(
         home_dir / ".local" / "share" / "opencode" / "opencode.db",

@@ -78,9 +78,9 @@ def read_jsonl_checked(
 ) -> JsonlReadResult:
     """Read a JSONL file with pre/post identity check and one retry for incomplete tail lines.
 
-    When `keyword_filter` is given, only lines containing any keyword or the final non-empty
-    line (or lines that fail a basic `{...}` framing check) are fully JSON-decoded, keeping
-    cold scans fast while still catching truncated tails and corrupt lines.
+    Every non-empty line is strictly JSON-decoded and verified to be a JSON object so corrupt
+    middle lines (even with balanced `{...}` braces and missing filter keywords) are always
+    detected. When `keyword_filter` is given, only matching objects are retained in `records`.
     """
     for attempt in range(2):
         try:
@@ -96,8 +96,6 @@ def read_jsonl_checked(
         records: List[Tuple[int, Dict[str, Any]]] = []
         bad_indices: List[int] = []
         last_non_empty_idx = -1
-        last_non_empty_line = ""
-        last_non_empty_parsed = False
 
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -106,45 +104,25 @@ def read_jsonl_checked(
                     if not s:
                         continue
                     last_non_empty_idx = idx
-                    last_non_empty_line = s
-                    last_non_empty_parsed = False
-
-                    should_parse = True
-                    if keyword_filter is not None:
-                        if not (s.startswith("{") and s.endswith("}")):
-                            should_parse = True
-                        elif not any(kw in s for kw in keyword_filter):
-                            should_parse = False
-
-                    if not should_parse:
-                        continue
 
                     try:
                         obj = json.loads(s)
                     except json.JSONDecodeError:
                         bad_indices.append(idx)
-                        last_non_empty_parsed = True
                         continue
-                    last_non_empty_parsed = True
-                    if isinstance(obj, dict):
-                        records.append((idx, obj))
-                    else:
+
+                    if not isinstance(obj, dict):
                         bad_indices.append(idx)
+                        continue
+
+                    if keyword_filter is None or any(kw in s for kw in keyword_filter):
+                        records.append((idx, obj))
         except PermissionError:
             return JsonlReadResult(records=[], had_error=True, permission_error=True, error_kind="permission_error")
         except FileNotFoundError:
             return JsonlReadResult(records=[], had_error=True, missing=True, error_kind="missing")
         except OSError:
             return JsonlReadResult(records=[], had_error=True, error_kind="io_error")
-
-        # Always verify the final non-empty line to catch in-progress truncated writes.
-        if last_non_empty_idx >= 0 and not last_non_empty_parsed:
-            try:
-                tail_obj = json.loads(last_non_empty_line)
-                if not isinstance(tail_obj, dict):
-                    bad_indices.append(last_non_empty_idx)
-            except json.JSONDecodeError:
-                bad_indices.append(last_non_empty_idx)
 
         try:
             st_after = path.stat()
@@ -230,20 +208,127 @@ def make_health_entry(status: str, last_success_ts: Optional[float] = None) -> D
     return out
 
 
+def seen_source_instances(source_id: str, prev_sources: Dict[str, Any]) -> set:
+    """Return previously seen instance keys (e.g., Hermes main/profile state.db paths) for `source_id`."""
+    prev = prev_sources.get(source_id)
+    if not isinstance(prev, dict):
+        return set()
+    raw = prev.get("seen_instances")
+    if not isinstance(raw, list):
+        return set()
+    return {str(x) for x in raw if isinstance(x, str) and x}
+
+
+def normalize_source_statuses(
+    raw_source_statuses: Dict[str, str],
+    prev_collection: Optional[Dict[str, Any]],
+    *,
+    observed_instances: Optional[Dict[str, Iterable[str]]] = None,
+) -> Dict[str, str]:
+    """Normalize raw scan statuses against the latest on-disk `seen_configured` and `seen_instances`."""
+    prev = prev_collection if isinstance(prev_collection, dict) else {}
+    prev_sources = prev.get("sources") if isinstance(prev.get("sources"), dict) else {}
+    obs_map = observed_instances or {}
+
+    all_source_ids = WORK_SOURCE_IDS + USAGE_SOURCE_IDS
+    normalized: Dict[str, str] = {}
+    for sid in all_source_ids:
+        prev_entry = prev_sources.get(sid) if isinstance(prev_sources.get(sid), dict) else {}
+        prev_seen = bool(prev_entry.get("seen_configured"))
+        prev_insts = seen_source_instances(sid, prev_sources)
+
+        status = raw_source_statuses.get(sid)
+        if status is None or status not in VALID_HEALTH_STATUSES:
+            status = resolve_missing_source_status(sid, prev_sources)
+        elif status == "not_configured" and prev_seen:
+            status = "unavailable"
+
+        if prev_insts and sid in obs_map:
+            cur_insts = {str(x) for x in obs_map[sid] if isinstance(x, str) and x}
+            if prev_insts - cur_insts:
+                if status == "complete":
+                    status = "partial" if cur_insts else "unavailable"
+                elif status == "not_configured":
+                    status = "unavailable"
+
+        normalized[sid] = status
+    return normalized
+
+
+def collection_payload_from_ledger(prev_collection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a read-only `collection` payload strictly from the accepted on-disk ledger state.
+
+    Used when a concurrent older `commit_ts` scan is rejected so rejected scan statuses and
+    the accepted scan's `commit_ts` are never forged as `last_success_ts`.
+    """
+    prev = prev_collection if isinstance(prev_collection, dict) else {}
+    prev_sources = prev.get("sources") if isinstance(prev.get("sources"), dict) else {}
+    prev_domains = prev.get("domain_last_success_ts") if isinstance(prev.get("domain_last_success_ts"), dict) else {}
+    prev_domain_statuses = prev.get("domain_statuses") if isinstance(prev.get("domain_statuses"), dict) else {}
+
+    all_source_ids = WORK_SOURCE_IDS + USAGE_SOURCE_IDS
+    sources_payload: Dict[str, Dict[str, Any]] = {}
+    for sid in all_source_ids:
+        prev_entry = prev_sources.get(sid) if isinstance(prev_sources.get(sid), dict) else {}
+        prev_seen = bool(prev_entry.get("seen_configured"))
+        prev_ts = prev_entry.get("last_success_ts")
+        if not isinstance(prev_ts, (int, float)):
+            prev_ts = None
+        saved_status = prev_entry.get("status")
+        if isinstance(saved_status, str) and saved_status in VALID_HEALTH_STATUSES:
+            status = saved_status
+        else:
+            status = "unavailable" if prev_seen else "not_configured"
+        sources_payload[sid] = make_health_entry(status, prev_ts)
+
+    def _domain_status(key: str, fallback: str) -> str:
+        s = prev_domain_statuses.get(key)
+        return s if isinstance(s, str) and s in VALID_HEALTH_STATUSES else fallback
+
+    work_status = _domain_status("work", combine_statuses([sources_payload[s]["status"] for s in WORK_SOURCE_IDS]))
+    usage_status = _domain_status("usage", combine_statuses([sources_payload[s]["status"] for s in USAGE_SOURCE_IDS]))
+    proj_fallback = combine_statuses(
+        [sources_payload[s]["status"] for s in WORK_SOURCE_IDS]
+        + [sources_payload[s]["status"] for s in PROJECT_USAGE_SOURCE_IDS]
+    )
+    projects_status = _domain_status("projects", proj_fallback)
+
+    def _domain_ts(key: str) -> Optional[float]:
+        v = prev_domains.get(key)
+        return round(float(v), 3) if isinstance(v, (int, float)) else None
+
+    return {
+        "work": make_health_entry(work_status, _domain_ts("work")),
+        "usage": make_health_entry(usage_status, _domain_ts("usage")),
+        "projects": make_health_entry(projects_status, _domain_ts("projects")),
+        "sources": sources_payload,
+    }
+
+
 def build_collection_payload(
     raw_source_statuses: Dict[str, str],
     project_work_meta_statuses: Dict[str, str],
     prev_collection: Optional[Dict[str, Any]],
     now_ts: float,
+    *,
+    observed_instances: Optional[Dict[str, Iterable[str]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Build (collection_payload, next_ledger_collection_meta).
 
-    - Each source records `seen_configured` and `last_success_ts` (only on `complete`).
+    - Each source records `seen_configured`, `status`, `last_success_ts` (only on `complete`),
+      and optional `seen_instances` (union of all ever-seen DB instances).
     - Domain `work`, `usage`, `projects` combine their constituent sources.
     """
     prev = prev_collection if isinstance(prev_collection, dict) else {}
     prev_sources = prev.get("sources") if isinstance(prev.get("sources"), dict) else {}
     prev_domains = prev.get("domain_last_success_ts") if isinstance(prev.get("domain_last_success_ts"), dict) else {}
+    obs_map = observed_instances or {}
+
+    normalized = normalize_source_statuses(
+        raw_source_statuses,
+        prev_collection,
+        observed_instances=observed_instances,
+    )
 
     all_source_ids = WORK_SOURCE_IDS + USAGE_SOURCE_IDS
     sources_payload: Dict[str, Dict[str, Any]] = {}
@@ -260,20 +345,23 @@ def build_collection_payload(
         prev_ts = prev_entry.get("last_success_ts")
         if not isinstance(prev_ts, (int, float)):
             prev_ts = None
+        prev_insts = seen_source_instances(sid, prev_sources)
+        cur_insts = {str(x) for x in obs_map.get(sid, ()) if isinstance(x, str) and x}
+        merged_insts = sorted(prev_insts | cur_insts)
 
-        status = raw_source_statuses.get(sid)
-        if status is None:
-            status = resolve_missing_source_status(sid, prev_sources)
-        elif status == "not_configured" and prev_seen:
-            status = "unavailable"
-
-        seen = prev_seen or (status != "not_configured")
+        status = normalized[sid]
+        seen = prev_seen or (status != "not_configured") or bool(merged_insts)
         last_ts = round(float(now_ts), 3) if status == "complete" else prev_ts
 
         sources_payload[sid] = make_health_entry(status, last_ts)
-        entry: Dict[str, Any] = {"seen_configured": seen}
+        entry: Dict[str, Any] = {
+            "seen_configured": seen,
+            "status": status,
+        }
         if last_ts is not None:
             entry["last_success_ts"] = last_ts
+        if merged_insts:
+            entry["seen_instances"] = merged_insts
         ledger_sources[sid] = entry
 
     work_status = combine_statuses([sources_payload[s]["status"] for s in WORK_SOURCE_IDS])
@@ -308,6 +396,11 @@ def build_collection_payload(
     ledger_collection = {
         "commit_ts": round(float(now_ts), 6),
         "sources": ledger_sources,
+        "domain_statuses": {
+            "work": work_status,
+            "usage": usage_status,
+            "projects": projects_status,
+        },
         "domain_last_success_ts": domain_ts,
     }
     return collection_payload, ledger_collection
