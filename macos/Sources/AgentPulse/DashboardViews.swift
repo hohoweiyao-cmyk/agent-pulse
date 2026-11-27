@@ -83,11 +83,12 @@ struct DashboardViews: View {
                 }
 
                 if let repErr = store.reportError {
+                    let bannerMessage = repErr.contains("剪贴板") ? repErr : "复制失败（剪贴板未改动）：\(repErr)"
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 10))
                             .foregroundStyle(amberAccent)
-                        Text(repErr)
+                        Text(bannerMessage)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.primary)
                             .lineLimit(2)
@@ -113,7 +114,7 @@ struct DashboardViews: View {
                     Button {
                         store.openDataDirectory()
                     } label: {
-                        Text("打开 ~/.agent-pulse")
+                        Text("打开数据目录")
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(.primary)
                             .padding(.horizontal, 9)
@@ -123,9 +124,10 @@ struct DashboardViews: View {
                     }
                     .buttonStyle(.plain)
                     .pointingHandCursor()
+                    .help("在访达中打开 ~/.agent-pulse")
 
                     if let start = store.snapshot?.usage?.ledgerMeta.workHistoryFrom {
-                        Text("工时回溯始于 \(start)")
+                        Text("工时记录自 \(start) 起")
                             .font(.system(size: 9.5))
                             .foregroundStyle(.tertiary)
                     }
@@ -168,7 +170,7 @@ struct DashboardViews: View {
 
         return HStack(spacing: 8) {
             kpiBox(title: "AI 有效工时", value: String(format: "%.2fh", hrs), sub: String(format: "%.2f 员工日", hrs / 8.0), tint: liveEmerald)
-            kpiBox(title: "总 Token", value: Formatters.compactTokens(tok), sub: "Cache Hit \(hitPct)%", tint: Color(hex: "#38BDF8"))
+            kpiBox(title: "总 Token", value: Formatters.compactTokens(tok), sub: "缓存命中 \(hitPct)%", tint: Color(hex: "#38BDF8"))
             kpiBox(
                 title: "估算 API 成本",
                 value: Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs),
@@ -220,7 +222,7 @@ struct DashboardViews: View {
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("近 26 周活跃热力图（点击格子查看当日账单）")
+                Text("近 26 周活跃热力图")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()
@@ -269,6 +271,7 @@ struct DashboardViews: View {
                                         )
                                 }
                                 .buttonStyle(.plain)
+                                .pointingHandCursor()
                                 .help("\(d.date) (\(d.weekday)) · \(dayCostText) · \(Formatters.compactTokens(d.totalTokens)) tok · \(String(format: "%.2fh", d.agentHours))")
                             } else {
                                 Color.clear.frame(height: 14)
@@ -374,7 +377,7 @@ struct DashboardViews: View {
 
         return VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("跨工具模型消耗排行（\(store.selectedPeriod.title)）")
+                Text("模型消耗排行 · \(store.selectedPeriod.title)")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()

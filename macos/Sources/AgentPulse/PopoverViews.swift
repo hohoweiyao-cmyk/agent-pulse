@@ -47,7 +47,7 @@ struct PopoverRootView: View {
 
             if let skipped = store.snapshot?.usage?.ledgerMeta.skippedInvalidDays, skipped > 0,
                store.selectedPopoverTab == .overview || store.selectedPopoverTab == .dashboard {
-                Label("已保留 \(skipped) 条日期无效的历史记录，未纳入统计。", systemImage: "exclamationmark.circle")
+                Label("已跳过 \(skipped) 条日期异常的历史记录（原文件已保留）", systemImage: "exclamationmark.circle")
                     .font(.system(size: 10.5))
                     .foregroundStyle(amberAccent)
             }
@@ -138,7 +138,7 @@ struct PopoverRootView: View {
             }
             .buttonStyle(.plain)
             .pointingHandCursor()
-            .help(sitReminder.isDue ? "点击确认已起身并重置久坐计时" : "久坐提醒倒计时（点击前往设置）")
+            .help(sitReminder.isDue ? "已到久坐提醒时间，点击重置计时" : "久坐提醒倒计时，点击前往设置")
 
             Button {
                 store.refreshAll(forceQuotas: store.selectedPopoverTab == .quotas)

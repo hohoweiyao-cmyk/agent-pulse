@@ -57,13 +57,14 @@ struct QuotaViews: View {
 
         VStack(alignment: .leading, spacing: 9) {
             if let error = store.quotaError {
+                let cleanErr = error.hasSuffix("。") ? String(error.dropLast()) : error
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(amberAccent)
-                    Text(providers.isEmpty ? error : "\(error) 当前仅展示上次读数详情。")
+                    Text(providers.isEmpty ? error : "\(cleanErr)，下方仅展示上次记录。")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(colorScheme == .dark ? amberAccent : amberAccent)
+                        .foregroundStyle(amberAccent)
                         .lineLimit(2)
                     Spacer(minLength: 2)
                 }
@@ -92,7 +93,7 @@ struct QuotaViews: View {
                                     Circle()
                                         .fill(liveEmerald)
                                         .frame(width: 5.5, height: 5.5)
-                                    Text("当前有效读数")
+                                    Text("实时额度")
                                         .font(.system(size: 10, weight: .bold))
                                         .foregroundStyle(.secondary)
                                 }
@@ -115,7 +116,7 @@ struct QuotaViews: View {
                                     Image(systemName: "clock.arrow.circlepath")
                                         .font(.system(size: 9.5, weight: .semibold))
                                         .foregroundStyle(amberAccent)
-                                    Text("上次读数与状态详情")
+                                    Text("上次记录与未就绪项")
                                         .font(.system(size: 10, weight: .bold))
                                         .foregroundStyle(.secondary)
                                 }
@@ -182,7 +183,7 @@ struct QuotaViews: View {
                     .foregroundStyle(isStaleSection ? .secondary : .primary)
 
                 if isStaleSection && !windows.isEmpty {
-                    Text("上次读数")
+                    Text("上次记录")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(amberAccent)
                         .padding(.horizontal, 5.5)
@@ -296,11 +297,11 @@ struct QuotaViews: View {
                     Image(systemName: "hourglass.bottomhalf.filled")
                         .font(.system(size: 8.5))
                         .foregroundStyle(style.tint)
-                    Text("预计耗尽：\(ViewTimeFormatters.monthDayHHmm(exhaustTs, now: store.nowEpoch))")
+                    Text("预计用尽：\(ViewTimeFormatters.monthDayHHmm(exhaustTs, now: store.nowEpoch))")
                         .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                         .foregroundStyle(style.tint)
                     if let projected = pace.projectedUsedPercent, projected.isFinite {
-                        Text(String(format: "· 重置前预计 %.0f%%", projected))
+                        Text(String(format: "· 重置前约 %.0f%%", projected))
                             .font(.system(size: 9.5, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
@@ -337,7 +338,7 @@ struct QuotaViews: View {
         let hhmm = ViewTimeFormatters.hhmm(Double(p.fetchedAt))
         let rel = Formatters.relativeUpdated(p.fetchedAt, now: store.nowEpoch)
         if p.status == "unavailable" {
-            return "\(p.plan) · 观察于 \(hhmm)"
+            return "\(p.plan) · 记录于 \(hhmm)"
         }
         return "\(p.plan) · \(hhmm) (\(rel))"
     }

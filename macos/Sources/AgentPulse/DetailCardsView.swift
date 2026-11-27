@@ -9,7 +9,7 @@ extension UsagePeriodKey {
         case .week: return "复制本周战报"
         case .lastWeek: return "复制上周战报"
         case .month: return "复制本月战报"
-        case .year: return "复制全年战报"
+        case .year: return "复制今年战报"
         case .all: return "复制全部战报"
         }
     }
@@ -21,7 +21,7 @@ extension UsagePeriodKey {
         case .week: return "已复制本周战报"
         case .lastWeek: return "已复制上周战报"
         case .month: return "已复制本月战报"
-        case .year: return "已复制全年战报"
+        case .year: return "已复制今年战报"
         case .all: return "已复制全部战报"
         }
     }
@@ -89,7 +89,7 @@ struct DetailCardsView: View {
             }
 
             if let count = periodStats?.unpricedTokens, count > 0 {
-                Text("\(Formatters.compactTokens(count)) Token 未计入费用。")
+                Text("含 \(Formatters.compactTokens(count)) 未匹配单价的 Token，未计入估算费用")
                     .font(.system(size: 10))
                     .foregroundStyle(amberAccent)
             }
@@ -107,7 +107,7 @@ struct DetailCardsView: View {
                     Text("「\(store.selectedPeriod.title)」暂无 AI 工具记录")
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text("可切换「本周」「本月」或「全部」查看历史明细")
+                    Text(store.selectedPeriod == .all ? "使用 AI 工具产生对话或用量后会自动归集到这里" : "可切换到更长周期或「全部」查看历史明细")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                 }
@@ -234,7 +234,7 @@ struct DetailCardsView: View {
                         Text(String(format: "%.2fh", hrs))
                             .font(.system(size: 17, weight: .bold, design: .rounded))
                             .monospacedDigit()
-                        Text(String(format: "%.2f日 · %.2f×", wd, lev))
+                        Text(String(format: "%.2f 员工日 · %.2f×", wd, lev))
                             .font(.system(size: 10, weight: .semibold))
                             .monospacedDigit()
                             .foregroundStyle(liveEmerald)
@@ -340,7 +340,7 @@ struct DetailCardsView: View {
                         .font(.system(size: 23, weight: .bold, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(tint)
-                    Text(tool.totalTokens > 0 ? "\(store.selectedPeriod.title) 总 Token" : "\(store.selectedPeriod.title) 订阅工时")
+                    Text(tool.totalTokens > 0 ? "\(store.selectedPeriod.title)总 Token" : "\(store.selectedPeriod.title) AI 工时")
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
@@ -352,7 +352,7 @@ struct DetailCardsView: View {
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(hasCostObs ? Color.primary : Color.secondary.opacity(0.6))
-                    Text(hasCostObs ? "≈ API 成本" : "无用量记录")
+                    Text(hasCostObs ? "按 API 价估算" : (tool.agentSeconds > 0 ? "仅统计工时" : "暂无记录"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.tertiary)
                 }
@@ -430,7 +430,7 @@ struct DetailCardsView: View {
             spacing: 6
         ) {
             HStack(spacing: 5) {
-                Text("Cache Hit")
+                Text("缓存命中")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 2)
@@ -662,11 +662,12 @@ struct DetailCardsView: View {
     }
 
     private func reportErrorBanner(_ message: String) -> some View {
-        HStack(spacing: 6) {
+        let bannerMessage = message.contains("剪贴板") ? message : "复制失败（剪贴板未改动）：\(message)"
+        return HStack(spacing: 6) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 10))
                 .foregroundStyle(amberAccent)
-            Text(message)
+            Text(bannerMessage)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.primary)
                 .lineLimit(2)
@@ -723,7 +724,7 @@ struct DetailCardsView: View {
             Button {
                 store.isCardVisible.toggle()
             } label: {
-                Text(store.isCardVisible ? "隐藏卡片" : "显示卡片")
+                Text(store.isCardVisible ? "隐藏挂件" : "显示挂件")
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 9)
@@ -733,6 +734,7 @@ struct DetailCardsView: View {
             }
             .buttonStyle(.plain)
             .pointingHandCursor()
+            .help("显示或隐藏桌面悬浮挂件")
 
             Button {
                 store.windowLayer = store.windowLayer.toggledPrimary()

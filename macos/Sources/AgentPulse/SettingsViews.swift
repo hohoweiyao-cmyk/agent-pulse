@@ -57,6 +57,8 @@ struct SettingsViews: View {
         let subRows = rows.filter { $0.subscriptionValueUsd != nil || $0.monthlyFeeCents != nil }
         let apiRows = rows.filter { $0.apiActualUsd != nil }
         let totalApiActual = apiRows.reduce(Decimal(0)) { $0 + ($1.apiActualUsd ?? Decimal(0)) }
+        let hasCodexRow = subRows.contains { $0.tool == "codex" }
+        let hasClaudeRow = subRows.contains { $0.tool == "claude_code" }
 
         return VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
@@ -67,7 +69,7 @@ struct SettingsViews: View {
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(.primary)
                 Spacer()
-                Text("上海自然月汇总")
+                Text("自然月累计")
                     .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(.tertiary)
             }
@@ -78,7 +80,7 @@ struct SettingsViews: View {
             HStack(alignment: .top, spacing: 8) {
                 // Column 1: Subscription Value & Payback
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("订阅折算价值 & 回本倍率")
+                    Text("订阅折算与回本")
                         .font(.system(size: 9.5, weight: .bold))
                         .foregroundStyle(.secondary)
 
@@ -87,13 +89,13 @@ struct SettingsViews: View {
                             Text("本月暂无订阅折算记录")
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundStyle(.secondary)
-                            Text("可先预设常用订阅月费，产生用量后自动计算回本倍率")
+                            Text("可先设置常用订阅月费，产生用量后自动计算回本倍率")
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
                             HStack(spacing: 5) {
-                                presetToolSetupButton(tool: "codex", title: "设 Codex")
-                                presetToolSetupButton(tool: "claude_code", title: "设 Claude")
+                                presetToolSetupButton(tool: "codex", title: "+ 设 Codex")
+                                presetToolSetupButton(tool: "claude_code", title: "+ 设 Claude")
                             }
                             .padding(.top, 2)
                         }
@@ -102,6 +104,17 @@ struct SettingsViews: View {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(subRows) { row in
                                 subscriptionColumnRow(row)
+                            }
+                            if !hasCodexRow || !hasClaudeRow {
+                                HStack(spacing: 5) {
+                                    if !hasCodexRow {
+                                        presetToolSetupButton(tool: "codex", title: "+ 设 Codex")
+                                    }
+                                    if !hasClaudeRow {
+                                        presetToolSetupButton(tool: "claude_code", title: "+ 设 Claude")
+                                    }
+                                }
+                                .padding(.top, 1)
                             }
                         }
                     }
@@ -122,7 +135,7 @@ struct SettingsViews: View {
                             Text("暂无可核实的 API 实付")
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundStyle(.secondary)
-                            Text("仅展示来自账单实付口径的按量费用，不与估算价混算")
+                            Text("仅统计接口返回的真实扣费，不含按价表估算的费用")
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -173,7 +186,7 @@ struct SettingsViews: View {
             }
 
             // Mandatory Disclosure Note
-            Text("仅当该工具本月全部走同一订阅渠道时启用折算；混用订阅与按量 API 请留空，已核实 API 实付仍会独立展示。")
+            Text("适合包月订阅工具估算回本进度；若同一工具混用订阅与按量 API，建议清空月费以免高估，右侧 API 实付仍会单独统计。")
                 .font(.system(size: 9.5))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -336,16 +349,17 @@ struct SettingsViews: View {
             }
 
             // Custom USD 2-decimal Input + Save
+            let isBlankToClear = row.monthlyFeeCents != nil && feeInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             HStack(spacing: 6) {
                 HStack(spacing: 4) {
                     Text("$")
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    TextField("例如 20.00", text: $feeInputText)
+                    TextField(row.monthlyFeeCents != nil ? "如 20.00（留空可清空）" : "例如 20.00", text: $feeInputText)
                         .textFieldStyle(.plain)
                         .font(.system(size: 11, design: .monospaced))
                         .onSubmit {
-                            saveCustomFee(for: row.tool)
+                            saveCustomFee(for: row)
                         }
                 }
                 .padding(.horizontal, 8)
@@ -357,14 +371,14 @@ struct SettingsViews: View {
                 )
 
                 Button {
-                    saveCustomFee(for: row.tool)
+                    saveCustomFee(for: row)
                 } label: {
-                    Text("保存")
+                    Text(isBlankToClear ? "清空" : "保存")
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 11)
                         .padding(.vertical, 5)
-                        .background(accentPurple, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .background(isBlankToClear ? errorCoral : accentPurple, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .pointingHandCursor()
@@ -400,6 +414,7 @@ struct SettingsViews: View {
         if store.setSubscriptionFee(cents: cents, for: tool) {
             feeInputText = String(format: "%.2f", Double(cents) / 100.0)
             feeInputError = nil
+            editingToolId = nil
         } else {
             feeInputError = "月费保存失败，请检查输入范围。"
         }
@@ -415,19 +430,24 @@ struct SettingsViews: View {
         }
     }
 
-    private func saveCustomFee(for tool: String) {
+    private func saveCustomFee(for row: SubscriptionRow) {
         let trimmed = feeInputText.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            clearFee(for: tool)
+            if row.monthlyFeeCents != nil {
+                clearFee(for: row.tool)
+            } else {
+                feeInputError = "请选择上方常用档位，或输入月费金额"
+            }
             return
         }
         guard let cents = Self.parseUSDToCents(trimmed) else {
             feeInputError = "请输入 $0.01 ~ $10,000.00 的有效金额（最多两位小数）"
             return
         }
-        if store.setSubscriptionFee(cents: cents, for: tool) {
+        if store.setSubscriptionFee(cents: cents, for: row.tool) {
             feeInputText = String(format: "%.2f", Double(cents) / 100.0)
             feeInputError = nil
+            editingToolId = nil
         } else {
             feeInputError = "月费超出允许范围（$0.01 ~ $10,000.00）"
         }
@@ -483,7 +503,7 @@ struct SettingsViews: View {
                 .foregroundStyle(.secondary)
 
             Toggle(isOn: $sitReminder.isEnabled) {
-                Text("启用久坐原生通知提醒")
+                Text("开启久坐提醒通知")
                     .font(.system(size: 11.5))
             }
             .toggleStyle(.switch)
@@ -518,7 +538,7 @@ struct SettingsViews: View {
                 }
 
                 Toggle(isOn: $sitReminder.resetOnSleep) {
-                    Text("锁屏/休眠超 5 分钟自动重置计时")
+                    Text("锁屏或休眠超 5 分钟自动重置")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -595,7 +615,7 @@ struct SettingsViews: View {
                 .foregroundStyle(.secondary)
 
             Toggle(isOn: $store.cardShowQuotaAlert) {
-                Text("卡片底部高额度预警条（≥70% 时显示）")
+                Text("挂件底部显示高额度预警（≥70% 时出现）")
                     .font(.system(size: 11.5))
             }
             .toggleStyle(.switch)
@@ -620,7 +640,7 @@ struct SettingsViews: View {
 
     private var dataAndMigrationCard: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("账本数据与 Tokei 迁移")
+            Text("本地数据与历史导入")
                 .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(.secondary)
 

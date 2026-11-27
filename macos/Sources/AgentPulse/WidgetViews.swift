@@ -161,17 +161,17 @@ struct FreshnessBannerView: View {
         let tsText = ViewTimeFormatters.hhmm(store.lastTrustedSuccessTimestamp)
         switch freshness {
         case .degraded:
-            return "部分数据源降级 · 末次成功 \(tsText)"
+            return "部分数据暂未读全 · 上次更新 \(tsText)"
         case .stale:
             if store.isCrossedMidnightFromSnapshot {
-                return "已跨日待同步 · 末次成功 \(tsText)"
+                return "已跨日待刷新 · 上次更新 \(tsText)"
             }
             if store.lastError != nil {
-                return "数据暂未更新 · 末次成功 \(tsText)"
+                return "刷新暂未成功 · 上次更新 \(tsText)"
             }
-            return "非实时快照 · 末次成功 \(tsText)"
+            return "数据待刷新 · 上次更新 \(tsText)"
         case .unavailable:
-            return "暂未连接本机实时快照"
+            return "暂未读到本机工时数据"
         case .fresh:
             return ""
         }
@@ -261,12 +261,12 @@ struct HourlyPulseChartView: View {
                 .monospacedDigit()
                 .foregroundStyle(.tertiary)
         } else if let peak = peakHour {
-            Text(String(format: "峰值 %02d时 · %@", peak.hour, Formatters.shortDuration(peak.seconds)))
+            Text(String(format: "峰值 %02d点 · %@", peak.hour, Formatters.shortDuration(peak.seconds)))
                 .font(.system(size: 10, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
         } else {
-            Text("00–23 时基线")
+            Text("暂无活跃时段")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.tertiary)
         }
@@ -462,7 +462,8 @@ struct WidgetRootView: View {
                             quotaAlertStrip(window: hw)
                         }
                         if let repErr = store.reportError {
-                            inlineNoticeBanner(message: repErr) {
+                            let bannerMsg = repErr.contains("剪贴板") ? repErr : "复制失败（剪贴板未改动）：\(repErr)"
+                            inlineNoticeBanner(message: bannerMsg) {
                                 store.reportError = nil
                             }
                         }
@@ -615,13 +616,18 @@ struct WidgetRootView: View {
                         .padding(.vertical, 2)
                         .background(amberAccent.opacity(0.14), in: Capsule())
                 } else if waitingCount > 0 {
+                    let waitBadgeText = (!store.isCompact && runningCount > 0)
+                        ? "\(waitingCount) 待拍板 · \(runningCount) 运行中"
+                        : "\(waitingCount) 待拍板"
                     HStack(spacing: 3) {
                         Image(systemName: "hand.raised.fill")
                             .font(.system(size: 8.5, weight: .bold))
-                        Text(runningCount > 0 ? "\(waitingCount) 待拍板 · \(runningCount)" : "\(waitingCount) 待拍板")
+                        Text(waitBadgeText)
                             .font(.system(size: 10, weight: .semibold))
                             .monospacedDigit()
+                            .lineLimit(1)
                     }
+                    .fixedSize()
                     .foregroundStyle(amberAccent)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -773,10 +779,10 @@ struct WidgetRootView: View {
                     Circle()
                         .fill(liveEmerald)
                         .frame(width: 5, height: 5)
-                    Text("当前任务")
+                    Text("此刻实时")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)
-                    Text("实时")
+                    Text("非所选日")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(liveEmerald)
                         .padding(.horizontal, 5)
@@ -788,6 +794,7 @@ struct WidgetRootView: View {
                     }
                 }
                 .padding(.top, 1)
+                .help("始终展示此刻正在运行或待处理的任务，不随上方历史日期切换")
             }
 
             if needsScroll {
@@ -825,7 +832,7 @@ struct WidgetRootView: View {
             notifyPanelLayoutChanged()
         } label: {
             HStack(spacing: 3.5) {
-                Text(isSentinelExpanded ? "收起任务" : "+\(hiddenCount) 展开全部 (\(totalCount))")
+                Text(isSentinelExpanded ? "收起" : "+\(hiddenCount) 展开")
                     .font(.system(size: 10, weight: .semibold))
                     .monospacedDigit()
                 Image(systemName: isSentinelExpanded ? "chevron.up" : "chevron.down")
@@ -838,7 +845,7 @@ struct WidgetRootView: View {
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
-        .help(isSentinelExpanded ? "收起哨兵任务列表" : "展开查看全部 \(totalCount) 个任务")
+        .help(isSentinelExpanded ? "收起多余任务" : "展开查看全部 \(totalCount) 个任务")
         .accessibilityLabel(isSentinelExpanded ? "收起任务列表" : "展开其余 \(hiddenCount) 个任务")
     }
 
@@ -1370,10 +1377,15 @@ struct WidgetRootView: View {
             Spacer(minLength: 4)
 
             if store.copiedToast && store.reportError == nil {
+                let copiedLabel: String = {
+                    if store.isViewingToday { return "已复制今日日报" }
+                    if let shortDate = store.displayedDay?.shortDate { return "已复制 \(shortDate) 日报" }
+                    return "已复制日报"
+                }()
                 HStack(spacing: 3) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 9.5, weight: .bold))
-                    Text("已复制日报")
+                    Text(copiedLabel)
                         .font(.system(size: 10, weight: .semibold))
                 }
                 .foregroundStyle(liveEmerald)

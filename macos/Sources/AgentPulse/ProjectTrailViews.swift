@@ -51,7 +51,7 @@ struct ProjectTrailViews: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                TextField("按项目名、路径或分支搜索…", text: $query)
+                TextField("搜索项目名、路径或分支…", text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11.5))
                 if !query.isEmpty {
@@ -101,14 +101,23 @@ struct ProjectTrailViews: View {
             }
 
             if rows.isEmpty {
+                let emptyHint: String = {
+                    if !query.isEmpty {
+                        return "试试项目名、目录路径或分支名"
+                    }
+                    if store.selectedProjectPeriod == .all {
+                        return "使用 AI 编程工具产生记录后会自动归集到这里"
+                    }
+                    return "可切换到更长周期或「全部」查看历史项目"
+                }()
                 VStack(spacing: 6) {
                     Image(systemName: "folder")
                         .font(.system(size: 18))
                         .foregroundStyle(.tertiary)
-                    Text(query.isEmpty ? "「\(store.selectedProjectPeriod.title)」暂无活跃项目记录" : "未找到匹配「\(query)」的项目")
+                    Text(query.isEmpty ? "「\(store.selectedProjectPeriod.title)」暂无项目记录" : "未找到匹配「\(query)」的项目")
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text(query.isEmpty ? "可切换「本周」「本月」或「全部」查看历史项目" : "试试项目目录名、路径或 worktree 分支名")
+                    Text(emptyHint)
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                 }
@@ -278,12 +287,12 @@ struct ProjectTrailViews: View {
                             }
                             Spacer(minLength: 4)
                             if stats.totalTokens > 0 {
-                                Text("\(Formatters.compactTokens(stats.totalTokens)) · \(hitPct)% · \(stats.sessions)会话")
+                                Text("\(Formatters.compactTokens(stats.totalTokens)) · 缓存 \(hitPct)% · \(stats.sessions) 会话")
                                     .font(.system(size: 9.5, design: .monospaced))
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             } else {
-                                Text(stats.sessions > 0 ? "\(stats.sessions) 会话 · 仅工时" : "仅工时归集")
+                                Text(stats.sessions > 0 ? "\(stats.sessions) 会话 · 仅记录工时" : "仅记录工时")
                                     .font(.system(size: 9.5))
                                     .foregroundStyle(.tertiary)
                                     .lineLimit(1)
@@ -385,7 +394,7 @@ struct ProjectTrailViews: View {
                         Button {
                             store.openProjectInTerminal(row.path)
                         } label: {
-                            Label("终端打开", systemImage: "terminal")
+                            Label("在终端中打开", systemImage: "terminal")
                                 .font(.system(size: 9.5, weight: .semibold))
                                 .foregroundStyle(.primary)
                                 .padding(.horizontal, 8)
