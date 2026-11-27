@@ -85,6 +85,7 @@ struct DetailCardsView: View {
                     .padding(.vertical, 28)
             } else if tools.isEmpty {
                 let isUnobservedPeriod = periodStats == nil
+                let unavailableHint = store.periodUnavailableHint(for: store.selectedPeriod)
                 VStack(spacing: 6) {
                     Image(systemName: isUnobservedPeriod ? "clock.badge.exclamationmark" : "tray")
                         .font(.system(size: 18))
@@ -94,11 +95,13 @@ struct DetailCardsView: View {
                         .foregroundStyle(.secondary)
                     Text(
                         isUnobservedPeriod
-                            ? "等待刷新获取最新记录，或切换到其他周期查看历史明细"
+                            ? (unavailableHint ?? "等待刷新获取最新记录，或切换到其他周期查看历史明细")
                             : (store.selectedPeriod == .all ? "使用 AI 工具产生对话或用量后会自动归集到这里" : "可切换到更长周期或「全部」查看历史明细")
                     )
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 30)
@@ -216,6 +219,7 @@ struct DetailCardsView: View {
         let cost = periodStats?.costUsd ?? 0.0
         let unpriced = periodStats?.unpricedTokens ?? 0
         let hasCostObs = hasPeriod && (tok > 0 || cost > 0 || unpriced > 0)
+        let costText = periodStats?.formattedEstimatedCost ?? "—"
         let hitPct = Int(round((periodStats?.cacheHitRate ?? 0.0) * 100))
 
         return HStack(spacing: 8) {
@@ -253,7 +257,7 @@ struct DetailCardsView: View {
                             .font(.system(size: 17, weight: .bold, design: .rounded))
                             .monospacedDigit()
                             .foregroundStyle(hasPeriod ? .primary : .secondary)
-                        Text(Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs))
+                        Text(costText)
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundStyle(hasCostObs ? accentPurple : Color.secondary.opacity(0.6))
                         if hasPeriod && hitPct > 0 {
@@ -344,7 +348,7 @@ struct DetailCardsView: View {
                 Spacer(minLength: 4)
 
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text(Formatters.estimatedUSD(tool.costUsd, unpricedTokens: tool.unpricedTokens ?? 0, hasObservation: hasCostObs))
+                    Text(tool.formattedEstimatedCost)
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(hasCostObs ? Color.primary : Color.secondary.opacity(0.6))
@@ -513,7 +517,7 @@ struct DetailCardsView: View {
         } label: {
             VStack(alignment: .leading, spacing: 5) {
                 ForEach(windows.prefix(2)) { w in
-                    let barColor = Formatters.quotaColor(for: w.usedPercent, defaultColor: Color(hex: provider.color))
+                    let barColor = Formatters.quotaColor(for: w.effectiveThresholdPercent, defaultColor: Color(hex: provider.color))
                     let resetStr = Formatters.relativeReset(w.resetsAt, now: store.nowEpoch)
                     VStack(alignment: .leading, spacing: 2.5) {
                         HStack {
@@ -548,7 +552,6 @@ struct DetailCardsView: View {
         let key = "\(toolId)::\(model.id)"
         let isExpanded = expandedModels.contains(key)
         let hitPct = Int(round(model.effectiveCacheHitRate * 100))
-        let hasObs = model.totalTokens > 0 || model.costUsd > 0 || (model.unpricedTokens ?? 0) > 0
 
         return VStack(alignment: .leading, spacing: 4) {
             Button {
@@ -585,7 +588,7 @@ struct DetailCardsView: View {
                             .padding(.vertical, 1)
                             .background(Color.primary.opacity(0.07), in: Capsule())
                     }
-                    Text(Formatters.estimatedUSD(model.costUsd, unpricedTokens: model.unpricedTokens ?? 0, hasObservation: hasObs))
+                    Text(model.formattedEstimatedCost)
                         .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(.primary)
                         .frame(minWidth: 38, alignment: .trailing)

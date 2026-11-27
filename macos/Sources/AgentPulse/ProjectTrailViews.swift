@@ -225,11 +225,7 @@ struct ProjectTrailViews: View {
         let stats = row.stats
         let isExpanded = expandedProjectId == row.id
         let hasCostObs = stats.effectiveHasCostObservation
-        let costText = Formatters.estimatedUSD(
-            stats.costUsd,
-            unpricedTokens: stats.effectiveUnpricedTokens,
-            hasObservation: hasCostObs
-        )
+        let costText = stats.formattedEstimatedCost
         let hitPct = Int(round(stats.cacheHitRate * 100))
         let hasWorktreeMerge = stats.worktreeSources.count > 1
 

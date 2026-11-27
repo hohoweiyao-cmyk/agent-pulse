@@ -471,8 +471,7 @@ struct WidgetRootView: View {
                         hairlineDivider
                         sevenDayChart
                         if store.cardShowQuotaAlert,
-                           let hw = store.highestFreshQuotaWindow,
-                           hw.usedPercent >= 70.0 {
+                           let hw = store.activeAlertQuotaWindow {
                             quotaAlertStrip(window: hw)
                         }
                         if let repErr = store.reportError {
@@ -1317,7 +1316,7 @@ struct WidgetRootView: View {
     // MARK: - Optional Fresh Quota Alert Strip (>= 70%)
 
     private func quotaAlertStrip(window: HighestQuotaWindow) -> some View {
-        let tint = Formatters.quotaColor(for: window.usedPercent, defaultColor: amberAccent)
+        let tint = Formatters.quotaColor(for: window.effectiveThresholdPercent, defaultColor: amberAccent)
         let resetStr = Formatters.relativeReset(window.resetsAt, now: store.nowEpoch)
 
         return Button {
@@ -1363,10 +1362,8 @@ struct WidgetRootView: View {
 
     private var footerRow: some View {
         let dayTok = store.displayedDayTokens
-        let dayCost = store.displayedDayCostUsd
-        let dayUnpriced = store.displayedDayUnpricedTokens
         let hasObs = store.displayedDayHasCostObservation
-        let costLabel = Formatters.estimatedUSD(dayCost, unpricedTokens: dayUnpriced, hasObservation: hasObs)
+        let costLabel = store.isViewingToday ? store.todayEstimatedCostText : store.displayedDayEstimatedCostText
 
         return HStack(spacing: 8) {
             Button {

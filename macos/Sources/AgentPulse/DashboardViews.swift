@@ -72,6 +72,24 @@ struct DashboardViews: View {
                 // 4 KPI Cards
                 kpiRow(periodStats: periodStats, heatmap: heatmap)
 
+                if periodStats == nil,
+                   let unavailableHint = store.periodUnavailableHint(for: store.selectedPeriod) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock.badge.exclamationmark")
+                            .font(.system(size: 10))
+                            .foregroundStyle(amberAccent)
+                        Text(unavailableHint)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(amberAccent.opacity(colorScheme == .dark ? 0.12 : 0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(amberAccent.opacity(0.25), lineWidth: 0.6))
+                }
+
                 // 26-Week Interactive Heatmap + Selected Day Detail
                 if let hm = heatmap {
                     heatmapCard(hm)
@@ -190,7 +208,7 @@ struct DashboardViews: View {
             )
             kpiBox(
                 title: "估算 API 成本",
-                value: Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs),
+                value: periodStats?.formattedEstimatedCost ?? "—",
                 sub: hasPeriod
                     ? (unpriced > 0 ? "\(Formatters.compactTokens(unpriced)) Token 未计价" : "\(periodStats?.tools.count ?? 0) 个工具")
                     : "暂未获取当期数据",
@@ -281,11 +299,8 @@ struct DashboardViews: View {
                                 let d = days[idx]
                                 let val = values[idx]
                                 let isSel = selectedDay?.date == d.date
-                                let dayCostText = Formatters.estimatedUSD(
-                                    d.costUsd,
-                                    unpricedTokens: d.effectiveUnpricedTokens,
-                                    hasObservation: d.effectiveHasCostObservation
-                                )
+                                let dayCostText = d.formattedEstimatedCost
+                                let dayHoursText = d.isWorkUnknown ? "—" : String(format: "%.2fh", d.agentHours)
                                 Button {
                                     selectedHeatmapDate = d.date
                                 } label: {
@@ -299,7 +314,7 @@ struct DashboardViews: View {
                                 }
                                 .buttonStyle(.plain)
                                 .pointingHandCursor()
-                                .help("\(d.date) (\(d.weekday)) · \(dayCostText) · \(Formatters.compactTokens(d.totalTokens)) tok · \(String(format: "%.2fh", d.agentHours))")
+                                .help("\(d.date) (\(d.weekday)) · \(dayCostText) · \(Formatters.compactTokens(d.totalTokens)) tok · \(dayHoursText)")
                             } else {
                                 Color.clear.frame(height: 14)
                             }
@@ -312,11 +327,7 @@ struct DashboardViews: View {
             // Selected Day Detail Card
             if let d = selectedDay {
                 let hasDayObs = d.effectiveHasCostObservation
-                let dayCostText = Formatters.estimatedUSD(
-                    d.costUsd,
-                    unpricedTokens: d.effectiveUnpricedTokens,
-                    hasObservation: hasDayObs
-                )
+                let dayCostText = d.formattedEstimatedCost
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
@@ -324,9 +335,9 @@ struct DashboardViews: View {
                             .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(.primary)
                         Spacer()
-                        Text(String(format: "工时 %.2fh", d.agentHours))
+                        Text(d.isWorkUnknown ? "工时 —" : String(format: "工时 %.2fh", d.agentHours))
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(liveEmerald)
+                            .foregroundStyle(d.isWorkUnknown ? .secondary : liveEmerald)
                         Text("·")
                             .foregroundStyle(.tertiary)
                         Text("\(Formatters.compactTokens(d.totalTokens)) tok")
@@ -347,11 +358,7 @@ struct DashboardViews: View {
                         ) {
                             ForEach(d.tools) { dt in
                                 let dtHasObs = dt.effectiveHasCostObservation
-                                let dtCost = Formatters.estimatedUSD(
-                                    dt.costUsd,
-                                    unpricedTokens: dt.effectiveUnpricedTokens,
-                                    hasObservation: dtHasObs
-                                )
+                                let dtCost = dt.formattedEstimatedCost
                                 let dtMetricText: String = {
                                     if dt.totalTokens > 0 {
                                         return "\(Formatters.compactTokens(dt.totalTokens)) · \(dtCost)"
@@ -359,7 +366,7 @@ struct DashboardViews: View {
                                     if dtHasObs {
                                         return dtCost
                                     }
-                                    return String(format: "%.2fh", dt.agentHours)
+                                    return d.isWorkUnknown ? "—" : String(format: "%.2fh", dt.agentHours)
                                 }()
                                 HStack(spacing: 5) {
                                     Circle()
@@ -376,7 +383,7 @@ struct DashboardViews: View {
                             }
                         }
                     } else {
-                        Text("当天无活跃记录")
+                        Text(d.isWorkUnknown ? "暂未获取到该日工时观测" : "当天无活跃记录")
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }
@@ -392,7 +399,7 @@ struct DashboardViews: View {
 
     private func metricValue(_ d: HeatmapDay, metric: HistoryMetric) -> Double {
         switch metric {
-        case .hours: return d.agentHours
+        case .hours: return d.isWorkUnknown ? 0.0 : d.agentHours
         case .tokens: return Double(d.totalTokens)
         case .cost: return d.costUsd
         }
@@ -437,7 +444,6 @@ struct DashboardViews: View {
                         : min(1.0, max(0.05, Double(m.totalTokens) / Double(maxTok)))
                     let tint = Color(hex: m.color)
                     let hitPct = Int(round(m.cacheHitRate * 100))
-                    let hasObs = m.effectiveHasCostObservation
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
@@ -464,13 +470,7 @@ struct DashboardViews: View {
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundStyle(.tertiary)
                             }
-                            Text(
-                                Formatters.estimatedUSD(
-                                    m.costUsd,
-                                    unpricedTokens: m.effectiveUnpricedTokens,
-                                    hasObservation: hasObs
-                                )
-                            )
+                            Text(m.formattedEstimatedCost)
                                 .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                                 .foregroundStyle(.primary)
                                 .frame(minWidth: 44, alignment: .trailing)

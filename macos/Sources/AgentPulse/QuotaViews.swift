@@ -227,7 +227,7 @@ struct QuotaViews: View {
     }
 
     private func quotaWindowRow(provider p: QuotaProvider, window w: QuotaWindow, isStale: Bool) -> some View {
-        let rawBarColor = Formatters.quotaColor(for: w.usedPercent, defaultColor: Color(hex: p.color))
+        let rawBarColor = Formatters.quotaColor(for: w.effectiveThresholdPercent, defaultColor: Color(hex: p.color))
         let barColor = isStale ? mutedSlate : rawBarColor
         let resetStr = Formatters.relativeReset(w.resetsAt, now: store.nowEpoch)
 
