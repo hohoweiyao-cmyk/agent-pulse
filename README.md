@@ -6,6 +6,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+**Latest version [v0.7.0](CHANGELOG.md#070---2026-11-28)**
+
 [![macOS 13+](https://img.shields.io/badge/macOS-13.0%2B-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white)](https://swift.org/)
 [![Python 3.9+ stdlib](https://img.shields.io/badge/Python-3.9%2B%20stdlib%20only-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -35,20 +37,22 @@ When you work with multiple AI coding agents in parallel — **T3 Code**, **Code
   - Continuous long autonomous runs (45 min, 2 hours, etc.) are counted in full — no arbitrary 30-minute turn cap.
   - Silent intra-turn pauses > 5 minutes are dropped (`0s`), and explicit human waits in T3 Code (`approval_request`, `user_input_request`, `secret_request`) are subtracted even when shorter than 5 minutes.
 - **Unified Token, Cost, Project Trail & Multi-Period Ledger**:
-  - Zero-dependency Python 3.9+ incremental parser with file `mtime_ns + size` caching (`< 200ms` per scan).
+  - Zero-dependency Python 3.9+ incremental parser with v5 caches for work hours and usage. Source health and refresh safeguards preserve confirmed history when collection is incomplete.
   - Bundled pricing baseline (`engine/pricing.json`, 600+ models) plus custom user overrides at `~/.agent-pulse/pricing_overrides.json`.
-  - Persistent local ledger at `~/.agent-pulse/ledger.json` supporting **7 time periods** (`Today / Yesterday / Week / Last Week / Month / Year / All`), a **26-week activity heatmap** with streak tracking, cross-tool model leaderboards, and **Project Trail** (`cwd`-based project cost & token tracking).
+  - Persistent local ledger at `~/.agent-pulse/ledger.json` supporting **7 time periods** (`Today / Yesterday / Week / Last Week / Month / Year / All`), a **26-week activity heatmap** with streak tracking, cross-tool model leaderboards, and project-level work hours, tokens, and estimated costs.
 - **T3 Code ↔ Codex Bidirectional Deduplication**:
   - Sessions launched inside T3 Code (`originator == "T3 Code"`) are attributed to `T3 · Codex` and excluded from standalone `Codex` for **both** work hours and token/cost accounting — zero double counting.
 - **Fast / Slow Dual-Track Architecture**:
   - **Fast track (every 15s, 100% local)**: Work hours, live running agents, incremental tokens, cost & project trail.
   - **Slow track (every 5 min, non-blocking)**: Codex quota uses local logs by default. You can enable live Codex quota in the Quotas tab. Claude uses its CLI statusline or desktop cache, and Antigravity, Kimi and Grok use local snapshots.
 - **Native macOS Aesthetic (SwiftUI + AppKit)**:
-  - **Desktop Widget Card**: Frosted HUD glass (`340pt` full / `276pt` compact), 3 window layers (*Desktop* / *Floating* / *Normal*), draggable top header with position memory, live agent timer, interactive 7-day bar chart, optional high-quota alert bar (≥ 70%), and one-click Markdown daily report copy.
+  - **Desktop Widget Card**: Full and compact layouts, three window layers, a draggable header with position memory, an interactive seven-day chart, and daily Markdown report copying. The **24-hour pulse chart** shows when agents worked. The **desktop task sentinel** shows running tasks, tasks waiting for input, and recently finished tasks, with Finder shortcuts for validated directories.
   - **Single Menu Bar Icon & Adaptive 5-Tab Popover**: Live hours, active agent count, daily cost, and quota badges. Left-click opens a dynamic-width 5-tab native `NSPopover` (**Detail Cards / Dashboard & Heatmap / Projects / Quotas / Settings**):
-    - **Detail Cards**: 2-column per-tool cards showing AI work hours, sessions, Cache Hit ring, full 5-part token grid (`Input / Output / Cache Read / Cache Write / Reasoning`), inline 5h/7d quota bars, and **2-level expandable model breakdowns** with per-1M-token pricing references.
+    - **Detail Cards**: Per-tool work hours, sessions, cache hit rate, five-part token breakdown, inline 5h/7d quota bars, and expandable model details. Copy a Markdown report for the selected period.
     - **Dashboard**: 26-week interactive GitHub-style heatmap (click any day for its full tool bill), active streaks, and cross-tool model cost rankings.
-    - **Projects**: Searchable, pinnable project usage tracker grouped by activity recency with Finder & Terminal quick-open actions.
+    - **Projects**: Group Git and Orca worktrees under their parent project and view AI work hours and usage for **Today / This Week / This Month / All Time**. Projects support search, pinning, and Finder and Terminal shortcuts.
+    - **Quotas**: Estimate when a supported quota window will run out. The optional desktop quota alert uses the unrounded percentage to check the 70% threshold.
+    - **Settings**: The **monthly subscription payback meter** compares eligible API-equivalent usage value with the configured monthly fee. It shows verified API charges separately when available.
   - **Built-in Sit Reminder**: 30 / 45 / 60 / 90 min intervals, automatic reset after > 5 min lock/sleep, and native macOS notifications with *Reset* and *Snooze 10m* actions.
 - **Strictly Read-Only & Privacy-First**:
   - Reads AI client SQLite databases through private temporary snapshots, without opening the live database through SQLite.
@@ -65,7 +69,7 @@ When you work with multiple AI coding agents in parallel — **T3 Code**, **Code
 | **Claude Code** | ✅ | ✅ | ✅ | ✅ Statusline / Cache | `~/.claude/projects/**/*.jsonl` |
 | **WorkBuddy** | ✅ | ✅ | ✅ | — | `~/.workbuddy/projects/**/*.jsonl` |
 | **Hermes** (Main + Profiles) | ✅ | ✅ | ✅ | — | `~/.hermes/state.db` & `profiles/*/state.db` |
-| **Antigravity** (Standalone) | ✅ | ✅ | — | 🟡 Cached snapshot | `~/.gemini/antigravity/brain/*/.../transcript.jsonl` |
+| **Antigravity** (Desktop / CLI) | ✅ | ✅ | — | 🟡 Cached snapshot | `~/.gemini/antigravity/brain/` and `~/.gemini/antigravity-cli/brain/` |
 | **Pi Agent** | ✅ | — | ✅ | — | `~/.pi/agent/sessions/**/*.jsonl` |
 | **OpenCode** | ✅ | — | ✅ | — | `~/.local/share/opencode/opencode.db` |
 | **Gemini CLI** | — | — | ✅ | — | `~/.gemini/tmp/**/session-*.json` |
@@ -115,6 +119,9 @@ python3 engine/collector.py --markdown
 
 # Report for a specific date
 python3 engine/collector.py --markdown --date 2026-11-25
+
+# Report for the current week
+python3 engine/collector.py --markdown --period week
 
 # Pretty-printed JSON snapshot (Schema v3)
 python3 engine/collector.py --days 14 --pretty

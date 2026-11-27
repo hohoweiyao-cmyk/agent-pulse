@@ -1,16 +1,32 @@
 # Changelog
 
-## [0.6.0] Unreleased
+All notable changes to **AgentPulse** (formerly *AgentClock*) are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.7.0] - 2026-11-28
+
+### Added
+
+- Backfill Antigravity CLI work hours and deduplicate shared desktop and CLI transcripts by full conversation ID.
+- Group Git and Orca worktrees under their parent project. Show per-project AI work hours for Today, This Week, This Month, and All Time.
+- Show hourly activity in a 24-hour pulse chart. The desktop task sentinel tracks running, waiting-for-input, and recently finished tasks and opens validated directories in Finder.
+- Estimate quota burn rate and time to exhaustion for supported quota windows.
+- Compare this month's eligible API-equivalent usage value with configured subscription fees and display verified API charges separately.
+- Copy Markdown reports for the selected reporting period in the app or generate them with `--markdown --period` in the CLI.
+
+### Changed
+
+- Upgrade work-hours and usage caches to v5. Gate history updates on source health and validate concurrent refreshes before accepting snapshots, preserving confirmed records when sources are incomplete.
+- Evaluate high-quota alerts against unrounded usage percentages to prevent premature warnings.
+
+### Reliability changes carried forward from the unreleased v0.6.0 work
 
 - Keep existing local data private, preserve unreadable ledgers, serialize concurrent writes and validate Tokei imports before committing them. The CLI can restore a validated backup and retain the replaced file.
 - Start Codex quota in local mode. Live checks require opt-in, scope cached results to the account, and honor network failure backoff.
 - Keep daily work history, account for additional Codex log mirrors and avoid replacing larger Tokei days with partial native data. Recompute recent estimates after a price change and show unpriced usage.
 - Bound collector runtime, show refresh failures, and validate directory actions in Project Trail.
 - Run engine, native and build checks in the Verify workflow for macOS on Apple Silicon and Intel.
-
-All notable changes to **AgentPulse** (formerly *AgentClock*) are documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.5.0] - 2026-11-26
 

@@ -6,6 +6,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+**最新版本 [v0.7.0](CHANGELOG.md#070---2026-11-28)**
+
 [![macOS 13+](https://img.shields.io/badge/macOS-13.0%2B-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white)](https://swift.org/)
 [![Python 3.9+ 零外部依赖](https://img.shields.io/badge/Python-3.9%2B%20%E9%9B%B6%E4%BE%9D%E8%B5%96-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -34,20 +36,22 @@
   - 以 **5 分钟步间心跳窗口**识别真实执行段：连续自主运行 45 分钟或 2 小时的长任务全额计入，不设人为 30 分钟上限。
   - 轮内超过 5 分钟的静默断档直接剔除（计 0 秒）；T3 Code 进一步显式扣除 `approval_request` / `user_input_request` / `secret_request` 等人工等待区间，即使短于 5 分钟也会扣减，待审批时不会误报“在岗”。
 - **自有增量 Token、费用与项目追踪账本**：
-  - Python 3.9+ 标准库零外部依赖，基于文件 `mtime_ns + size` 增量缓存，单次扫描耗时 `< 200ms`。
+  - 仅使用 Python 3.9+ 标准库，工时和用量均采用 v5 增量缓存。来源健康检查和刷新保护会在采集不完整时保留已确认的历史记录。
   - 内置 `engine/pricing.json`（600+ 模型费率基线），并支持在 `~/.agent-pulse/pricing_overrides.json` 自定义模型价格与别名。
-  - 自有持久化账本存于 `~/.agent-pulse/ledger.json`，支持 **7 档时间切页**（`今天 / 昨天 / 本周 / 上周 / 本月 / 今年 / 全部`）、**近 26 周活跃热力图与连续活跃天数**、跨工具模型消耗排行，以及按工作目录 `cwd` 自动归集的 **项目追踪**。
+  - 自有持久化账本存于 `~/.agent-pulse/ledger.json`，支持 **7 档时间切页**（`今天 / 昨天 / 本周 / 上周 / 本月 / 今年 / 全部`）、**近 26 周活跃热力图与连续活跃天数**、跨工具模型消耗排行，以及按项目查看 AI 工时、Token 和估算费用。
 - **T3 Code ↔ Codex 双向精准去重**：
   - 无论工时还是 Token/费用，Codex 日志中 `originator == "T3 Code"` 的会话均精准归属 `T3 · Codex`，与独立 `Codex` 零重复计数。
 - **快慢双轨刷新架构**：
   - **快轨（15 秒，纯本地）**：AI 工时、实时在岗检测、增量 Token / 费用与项目账本更新。
   - **慢轨（5 分钟，异步非阻塞）**：Codex 默认读取本地日志，可在「额度」页启用联网查询。Claude 读取 CLI 状态栏或桌面端缓存，其他供应商展示本地额度快照。
 - **macOS 原生视觉与双层交互**：
-  - **桌面挂件卡片**：HUD 毛玻璃材质（完整 `340pt` / 紧凑 `276pt` 双视图）、三档窗口层级（贴附桌面层 / 悬浮置顶 / 正常窗口）、按住顶部标题区自由拖动并记忆位置、实时在岗计时、可点击近 7 天柱状图（联动展示该日工时与 Token/费用）、可选高额度预警条（≥ 70% 浮现）、一键复制一体化 Markdown 日报。
+  - **桌面挂件卡片**提供完整和紧凑两种布局、三档窗口层级、可拖动并记忆位置的标题栏、可点击的近 7 天柱状图，以及 Markdown 日报复制。**24 小时昼夜脉搏图**显示智能体何时在工作。**桌面指挥哨兵**展示「运行中」「待拍板」「刚收工」三种任务状态，可在访达中直达通过校验的目录。
   - **菜单栏单图标 + 宽幅 5 页签原生 Popover**：实时展示工时·在岗数、今日估算费用与常用额度徽章；**左键**打开动态宽幅 5 页签面板（**明细 / 大屏 / 项目 / 额度 / 设置**），**右键**呼出快捷菜单：
-    - **明细页**：单/双列独立工具卡片，展示有效工时、会话数、`Cache Hit` 环形指标、5 项 Token 细分网格（输入/输出/缓存读/缓存写/推理）、同框 5h/7d 额度条，以及**两级可展开模型明细**（含单模型 5 项 Token 与 `$/1M` 参考单价）。
+    - **明细页**展示分工具的有效工时、会话数、缓存命中率、五项 Token 明细、5 小时和 7 天额度条，以及可展开的模型明细。可一键复制所选周期的 Markdown 战报。
     - **大屏页**：近 26 周 GitHub 风格交互热力图（点击任意日期查看当日分工具账单）、连续活跃天数（Streak）与跨工具模型消耗排行。
-    - **项目页**：按 `cwd` 自动归集各项目消耗，支持搜索、置顶、分组及一键在访达/终端打开。
+    - **项目页**将 Git 和 Orca worktree 归到母项目，可查看**今日 / 本周 / 本月 / 全部**的 AI 工时与用量，支持搜索、置顶及一键在访达或终端打开。
+    - **额度页**展示支持的额度窗口的燃尽配速，估算额度何时用完。桌面挂件的可选额度预警用未舍入的百分比判断是否达到 70%。
+    - **设置页**的**本月订阅回本仪**把符合条件的用量按 API 费率折算，与配置的订阅月费对比。有可核实的 API 实付时会单独展示。
   - **内置久坐提醒**：支持 30 / 45 / 60 / 90 分钟间隔、锁屏/休眠超 5 分钟自动重置计时、macOS 原生通知（支持「已起身重置 / 推迟 10 分钟」）。
 - **严格只读与隐私安全**：
   - 绝不改写或锁住任何 AI 客户端数据库（SQLite 一律采用 WAL 安全的临时快照只读读取）。
@@ -64,7 +68,7 @@
 | **Claude Code** | ✅ | ✅ | ✅ | ✅ 状态栏 / 缓存 | `~/.claude/projects/**/*.jsonl` |
 | **WorkBuddy** | ✅ | ✅ | ✅ | — | `~/.workbuddy/projects/**/*.jsonl` |
 | **Hermes**（主库 + 多 Profiles） | ✅ | ✅ | ✅ | — | `~/.hermes/state.db` 及 `profiles/*/state.db` |
-| **Antigravity**（独立版） | ✅ | ✅ | — | 🟡 缓存快照 | `~/.gemini/antigravity/brain/*/.../transcript.jsonl` |
+| **Antigravity**（桌面端 / CLI） | ✅ | ✅ | — | 🟡 缓存快照 | `~/.gemini/antigravity/brain/` 和 `~/.gemini/antigravity-cli/brain/` |
 | **Pi Agent** | ✅ | — | ✅ | — | `~/.pi/agent/sessions/**/*.jsonl` |
 | **OpenCode** | ✅ | — | ✅ | — | `~/.local/share/opencode/opencode.db` |
 | **Gemini CLI** | — | — | ✅ | — | `~/.gemini/tmp/**/session-*.json` |
@@ -102,7 +106,7 @@ cp -R dist/AgentPulse.app /Applications/AgentPulse.app
 open /Applications/AgentPulse.app
 ```
 
-> **使用提示**：`build_app.sh` 默认使用 `dev.agentpulse.app`（可通过环境变量 `AGENTPULSE_BUNDLE_ID` 自定义）并对本地产物执行 ad-hoc 签名。启动后，按住卡片左上角「AgentPulse」标题或顶部空白区即可自由拖动；左键点击菜单栏图标打开 4-Tab 详单，右键打开快捷菜单。
+> **使用提示**：`build_app.sh` 默认使用 `dev.agentpulse.app`（可通过环境变量 `AGENTPULSE_BUNDLE_ID` 自定义）并对本地产物执行 ad-hoc 签名。启动后，按住卡片左上角「AgentPulse」标题或顶部空白区即可拖动。左键点击菜单栏图标打开五页签面板，右键打开快捷菜单。
 
 ### 命令行使用（纯终端 / 脚本集成）
 
@@ -114,6 +118,9 @@ python3 engine/collector.py --markdown
 
 # 输出指定日期的日报
 python3 engine/collector.py --markdown --date 2026-11-25
+
+# 输出本周战报
+python3 engine/collector.py --markdown --period week
 
 # 输出格式化 JSON 快照（Schema v3）
 python3 engine/collector.py --days 14 --pretty
@@ -195,7 +202,7 @@ agent-pulse/
 │   └── quota_collector.py    # 独立慢轨订阅额度探测器
 ├── macos/
 │   ├── Package.swift         # SwiftPM 清单（macOS 13+，零外部依赖）
-│   └── Sources/AgentPulse/   # 原生 SwiftUI + AppKit 挂件、4-Tab Popover 与久坐提醒
+│   └── Sources/AgentPulse/   # 原生 SwiftUI + AppKit 挂件、五页签面板与久坐提醒
 ├── scripts/
 │   ├── build_app.sh          # Release 编译 + 矢量图标生成 + .app 组装 + ad-hoc 签名
 │   ├── generate_icon.swift   # CoreGraphics 矢量 macOS 图标生成脚本

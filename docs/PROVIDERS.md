@@ -11,17 +11,19 @@ All paths below are accessed **strictly read-only**. If a client is not installe
 | Client | Tool Key(s) | Local Path | Work Hours | Tokens & Cost | Quota |
 |---|---|---|:---:|:---:|:---:|
 | **T3 Code** | `t3_antigravity`, `t3_codex`, `t3_claude`, `t3_other` | `~/.t3/userdata/statev2.sqlite` | ✅ (`turn_items` + `runtime_requests` exclusions) | ✅ (`t3_codex` via Codex JSONL dedup) | — |
-| **Codex** | `codex` | `~/.codex/sessions/**/*.jsonl` | ✅ (skips `originator == "T3 Code"`) | ✅ (`token_count` & `token_usage_record`) | ✅ Live API (`~/.codex/auth.json`) + JSONL fallback |
+| **Codex** | `codex` | `~/.codex/sessions/**/*.jsonl` | ✅ (skips `originator == "T3 Code"`) | ✅ (`token_count` & `token_usage_record`) | ✅ Local logs by default, opt-in live API |
 | **Claude Code** | `claude_code` | `~/.claude/projects/**/*.jsonl` | ✅ (skips `t3code-claude-title-*`) | ✅ (dedups streaming chunks by `message.id`) | ✅ CLI statusline hook + Desktop zstd cache |
 | **WorkBuddy** | `workbuddy` | `~/.workbuddy/projects/**/*.jsonl` | ✅ | ✅ | — |
 | **CodeBuddy** | `codebuddy` | `~/.codebuddy/projects/**/*.jsonl` | — | ✅ | — |
 | **Hermes** | `hermes` | `~/.hermes/state.db`, `~/.hermes/profiles/*/state.db` | ✅ (incl. `session_turn_leases`) | ✅ (`model_usage` / `sessions`) | — |
-| **Antigravity** | `antigravity` | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript*.jsonl` | ✅ | — | 🟡 Cached snapshot only |
+| **Antigravity** (Desktop / CLI) | `antigravity` | `~/.gemini/antigravity/brain/`, `~/.gemini/antigravity-cli/brain/` | ✅ | — | 🟡 Cached snapshot only |
 | **Pi Agent** | `pi` | `~/.pi/agent/sessions/**/*.jsonl` | ✅ | ✅ | — |
 | **OpenCode** | `opencode` | `~/.local/share/opencode/opencode.db` | ✅ | ✅ | — |
 | **Gemini CLI** | `gemini` | `~/.gemini/tmp/**/session-*.json` | — | ✅ | — |
 | **ZCode** | `zcode` | `~/.zcode/cli/db/db.sqlite` | — | ✅ (`model_usage`) | — |
 | **Kimi / Grok** | `kimi`, `grok` | `~/.agent-pulse/quota_cache.json` | — | — | 🟡 Cached snapshot only |
+
+Under each Antigravity source, AgentPulse reads `*/.system_generated/logs/transcript.jsonl` with `transcript_full.jsonl` as a fallback. Desktop and CLI transcripts with the same full conversation ID count once.
 
 ---
 
