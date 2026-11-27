@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 
 
 def private_directory(path):
@@ -68,7 +69,8 @@ def copy_private(source, target):
         shutil.copyfileobj(original, copy)
 
 
-def _file_identity(path):
+def file_identity(path):
+    """Return a tuple identifying a regular file's version, or None if missing."""
     try:
         info = path.stat()
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
@@ -76,33 +78,88 @@ def _file_identity(path):
         return None
 
 
+_file_identity = file_identity
+
+
 @contextmanager
-def sqlite_snapshot(source):
-    """Copy a stable DB and WAL without opening or locking the live database."""
-    if not source.is_file():
-        yield None
+def sqlite_snapshot_with_status(source):
+    """Copy a stable DB and WAL without opening or locking the live database.
+
+    Yields (connection_or_none, status) where status is one of:
+    'ok', 'missing', 'permission_error', 'unstable', 'corrupt', 'unavailable'.
+    """
+    try:
+        st = source.stat()
+    except FileNotFoundError:
+        yield None, "missing"
         return
+    except PermissionError:
+        yield None, "permission_error"
+        return
+    except OSError:
+        yield None, "unavailable"
+        return
+
+    if not stat.S_ISREG(st.st_mode):
+        yield None, "unavailable"
+        return
+
     wal = source.with_name(source.name + "-wal")
     with tempfile.TemporaryDirectory(prefix="agentpulse-sqlite-") as directory:
         connection = None
+        status = "unavailable"
         for attempt in range(2):
             snapshot = Path(directory) / f"{attempt}.sqlite"
             try:
                 before = (_file_identity(source), _file_identity(wal))
                 if before[0] is None:
+                    status = "missing"
                     break
                 shutil.copyfile(source, snapshot)
                 if before[1] is not None:
                     shutil.copyfile(wal, snapshot.with_name(snapshot.name + "-wal"))
-                if before != (_file_identity(source), _file_identity(wal)):
+                after = (_file_identity(source), _file_identity(wal))
+                if before != after:
+                    status = "unstable"
+                    if attempt == 0:
+                        time.sleep(0.02)
                     continue
-                connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=2.0)
-                connection.row_factory = sqlite3.Row
+                # Open the isolated temporary copy so SQLite can replay WAL frames
+                # or open checkpointed WAL-header DBs cleanly without touching source.
+                conn = sqlite3.connect(str(snapshot), timeout=2.0)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only = ON")
+                conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+                connection = conn
+                status = "ok"
                 break
-            except (OSError, sqlite3.Error):
+            except PermissionError:
+                status = "permission_error"
+                break
+            except sqlite3.Error:
+                status = "corrupt"
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                    connection = None
+                continue
+            except OSError:
+                status = "unavailable"
                 continue
         try:
-            yield connection
+            yield connection, status
         finally:
             if connection is not None:
-                connection.close()
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
+@contextmanager
+def sqlite_snapshot(source):
+    """Copy a stable DB and WAL without opening or locking the live database."""
+    with sqlite_snapshot_with_status(source) as (connection, _):
+        yield connection

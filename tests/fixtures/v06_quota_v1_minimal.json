@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-27T15:00:00+08:00",
+  "generated_ts": 1795762800.0,
+  "providers": [
+    {
+      "id": "codex",
+      "name": "Codex",
+      "color": "#10B981",
+      "plan": "Pro",
+      "status": "ok",
+      "status_text": "已实时同步",
+      "fetched_at": 1795762780,
+      "windows": [
+        {
+          "id": "codex_5h",
+          "label": "5 小时窗口",
+          "short_label": "C5",
+          "used_percent": 70.0,
+          "remaining_percent": 30.0,
+          "resets_at": 1795766400,
+          "window_minutes": 300
+        }
+      ]
+    }
+  ],
+  "highest_window": {
+    "provider_id": "codex",
+    "provider_name": "Codex",
+    "label": "5 小时窗口",
+    "short_label": "C5",
+    "used_percent": 70.0,
+    "resets_at": 1795766400
+  }
+}

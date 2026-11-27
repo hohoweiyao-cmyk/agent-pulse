@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AgentPulse — Local read-only Token & Cost incremental collector.
+"""AgentPulse — Local read-only Token, Cost & Billing incremental collector (v0.7).
 
 Strictly read-only on all AI client logs and SQLite databases (WAL-safe temp copies).
 Zero external dependencies (Python 3.9+ stdlib only).
@@ -9,8 +9,11 @@ Key guarantees:
 - T3 Code <-> Codex bidirectional deduplication:
   Codex sessions with originator == "T3 Code" are attributed to `t3_codex`,
   standalone Codex sessions to `codex`, matching work-hours attribution 1:1.
-- Incremental file-level cache (mtime_ns + size) at ~/.agent-pulse/usage_cache.json
-  so 15s polling completes in < 200ms.
+- Per-source health tracking (`complete | partial | unavailable | not_configured`)
+  with checked JSONL reading (pre/post file identity + 1 retry on truncated tail).
+- Incremental file-level cache (v5, mtime_ns + size) at ~/.agent-pulse/usage_cache.json.
+- Independent billing attribution (`subscription_candidate_usd` and Hermes verified
+  `api_actual_usd` using Decimal arithmetic) without altering legacy `cost_usd`.
 """
 
 from __future__ import annotations
@@ -24,14 +27,24 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from health import (
+    check_root_dir,
+    combine_statuses,
+    read_jsonl_checked,
+    resolve_missing_source_status,
+)
 from pricing import PricingTable
-from storage import sqlite_snapshot, write_json
+from storage import sqlite_snapshot_with_status, write_json
 
 BIZ_TZ = timezone(timedelta(hours=8))
-USAGE_CACHE_VERSION = 4
+USAGE_CACHE_VERSION = 5
+
+_HERMES_ACTUAL_COST_SOURCES = frozenset({"provider_cost_api", "provider_generation_api"})
+_HERMES_INCLUDED_MODES = frozenset({"subscription_included", "included"})
 
 
 def _normalize_project_path(raw: Any) -> str:
@@ -48,7 +61,7 @@ def _parse_ts(value: Any) -> Optional[float]:
         return None
     if isinstance(value, (int, float)):
         v = float(value)
-        if v <= 0:
+        if v <= 0 or not math.isfinite(v):
             return None
         if v > 1e14:
             return v / 1e6
@@ -99,13 +112,37 @@ def _safe_int(val: Any) -> int:
 def _safe_float(val: Any) -> float:
     try:
         v = float(val)
-        return v if v > 0 else 0.0
+        return v if v > 0 and math.isfinite(v) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
 
+def _safe_nonneg_decimal(val: Any) -> Optional[Decimal]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+        if not math.isfinite(f) or f < 0:
+            return None
+        return Decimal(str(val)) if isinstance(val, (int, str)) else Decimal(str(f))
+    except Exception:
+        return None
+
+
+def _add_billing_decimal(
+    billing_acc: Dict[str, Dict[str, Dict[str, Decimal]]],
+    tool: str,
+    day: str,
+    field: str,
+    amount: Decimal,
+) -> None:
+    t_map = billing_acc.setdefault(tool, {})
+    d_map = t_map.setdefault(day, {})
+    d_map[field] = d_map.get(field, Decimal("0")) + amount
+
+
 class UsageCache:
-    """Caches parsed daily token deltas per source file using mtime_ns + size."""
+    """Caches parsed daily token deltas per source file using mtime_ns + size (v5)."""
 
     def __init__(self, path: Optional[Path], pricing_signature: str = ""):
         self.path = path
@@ -116,14 +153,18 @@ class UsageCache:
         if path and path.is_file():
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-                if (raw.get("version") == USAGE_CACHE_VERSION
+                if (
+                    isinstance(raw, dict)
+                    and raw.get("version") == USAGE_CACHE_VERSION
                     and raw.get("pricing_signature") == self.pricing_signature
-                    and isinstance(raw.get("files"), dict)):
+                    and isinstance(raw.get("files"), dict)
+                ):
                     self.files = raw["files"]
                 else:
                     self.dirty = True
             except Exception:
                 self.files = {}
+                self.dirty = True
 
     def get(self, file_path: Path) -> Optional[List[Dict[str, Any]]]:
         try:
@@ -133,13 +174,24 @@ class UsageCache:
         key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
         self.seen.add(key)
         entry = self.files.get(key)
-        if entry and entry.get("mtime_ns") == st.st_mtime_ns and entry.get("size") == st.st_size:
-            return entry.get("rows")
+        if (
+            isinstance(entry, dict)
+            and entry.get("mtime_ns") == st.st_mtime_ns
+            and entry.get("size") == st.st_size
+            and isinstance(entry.get("rows"), list)
+        ):
+            return entry["rows"]
         return None
 
-    def put(self, file_path: Path, rows: List[Dict[str, Any]]) -> None:
+    def put(
+        self,
+        file_path: Path,
+        rows: List[Dict[str, Any]],
+        *,
+        stat_result: Optional[os.stat_result] = None,
+    ) -> None:
         try:
-            st = file_path.stat()
+            st = stat_result if stat_result is not None else file_path.stat()
         except OSError:
             return
         key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
@@ -155,11 +207,14 @@ class UsageCache:
         if not self.path or (not self.dirty and self.files.keys() <= self.seen):
             return
         try:
-            write_json(self.path, {
-                "version": USAGE_CACHE_VERSION,
-                "pricing_signature": self.pricing_signature,
-                "files": {key: value for key, value in self.files.items() if key in self.seen},
-            })
+            write_json(
+                self.path,
+                {
+                    "version": USAGE_CACHE_VERSION,
+                    "pricing_signature": self.pricing_signature,
+                    "files": {key: value for key, value in self.files.items() if key in self.seen},
+                },
+            )
         except (OSError, ValueError):
             pass
 
@@ -218,12 +273,27 @@ def _merge_rows_into_result(
     rows: List[Dict[str, Any]],
     cutoff_day: str,
     projects_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = None,
+    billing_cutoff_day: Optional[str] = None,
 ) -> None:
+    b_floor = billing_cutoff_day or cutoff_day
     for r in rows:
         day = r.get("day")
-        if not day or day < cutoff_day:
+        if not day:
             continue
         tool = r["tool"]
+
+        # Billing candidate accumulation can span from month start without altering legacy cutoff_day
+        if billing_acc is not None and day >= b_floor:
+            sub_cand = r.get("sub_cand")
+            if sub_cand is not None:
+                dec = _safe_nonneg_decimal(sub_cand)
+                if dec is not None:
+                    _add_billing_decimal(billing_acc, tool, day, "subscription_candidate_usd", dec)
+
+        if day < cutoff_day:
+            continue
+
         inp = _safe_int(r.get("in"))
         out = _safe_int(r.get("out"))
         cr = _safe_int(r.get("cr"))
@@ -302,6 +372,8 @@ def _compact_rows(
             "requests": v["requests"],
             "sessions": sess_inc,
         }
+        if v.get("has_sub_cand"):
+            row["sub_cand"] = round(float(v["sub_cand"]), 6)
         if project:
             row["project"] = project
         rows.append(row)
@@ -320,11 +392,22 @@ def _acc_add(
     thoughts: int,
     cost_usd: float,
     requests: int = 1,
+    sub_cand_usd: Optional[float] = None,
 ) -> None:
     key = (tool, day, model or "unknown")
     entry = acc.setdefault(
         key,
-        {"in": 0, "out": 0, "cr": 0, "cw": 0, "thoughts": 0, "cost_usd": 0.0, "requests": 0},
+        {
+            "in": 0,
+            "out": 0,
+            "cr": 0,
+            "cw": 0,
+            "thoughts": 0,
+            "cost_usd": 0.0,
+            "requests": 0,
+            "sub_cand": Decimal("0"),
+            "has_sub_cand": False,
+        },
     )
     entry["in"] += inp
     entry["out"] += out
@@ -333,6 +416,38 @@ def _acc_add(
     entry["thoughts"] += thoughts
     entry["cost_usd"] += cost_usd
     entry["requests"] += requests
+    if sub_cand_usd is not None:
+        dec = _safe_nonneg_decimal(sub_cand_usd)
+        if dec is not None:
+            entry["sub_cand"] += dec
+            entry["has_sub_cand"] = True
+
+
+def _walk_matching_files(root: Path, suffix: str, prefix: str = "") -> Tuple[List[Path], int]:
+    """Walk `root` collecting files matching suffix/prefix; counts directory permission/OS errors."""
+    paths: List[Path] = []
+    dir_errors = 0
+
+    def on_error(_exc: OSError) -> None:
+        nonlocal dir_errors
+        dir_errors += 1
+
+    for cur_root, _, files in os.walk(root, onerror=on_error):
+        for fname in files:
+            if suffix and not fname.endswith(suffix):
+                continue
+            if prefix and not fname.startswith(prefix):
+                continue
+            paths.append(Path(cur_root) / fname)
+    return paths, dir_errors
+
+
+def _summarize_file_scan_health(files_ok: int, files_err: int, dir_err: int) -> str:
+    if files_err == 0 and dir_err == 0:
+        return "complete"
+    if files_ok == 0:
+        return "unavailable"
+    return "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +489,16 @@ def _codex_mirrored_events(events: List[CodexUsageEvent], response_totals: set) 
     return duplicates
 
 
-def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
+def _parse_codex_file_checked(
+    path: Path, pricing: PricingTable
+) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+    res = read_jsonl_checked(
+        path,
+        keyword_filter=('"token_count"', '"token_usage_record"', '"session_meta"', '"turn_context"'),
+    )
+    if res.permission_error or res.missing:
+        return [], True, res.identity_changed, None
+
     originator = ""
     project_cwd = ""
     session_id = None
@@ -385,122 +509,113 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
     events: List[CodexUsageEvent] = []
     response_totals: set = set()
 
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
+    for _, obj in res.records:
+        typ = obj.get("type")
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if typ == "session_meta":
+            session_id = payload.get("id")
+            orig = payload.get("originator")
+            if isinstance(orig, str):
+                originator = orig
+            if not project_cwd:
+                project_cwd = _normalize_project_path(payload.get("cwd"))
+            continue
+
+        if typ == "turn_context":
+            turn += 1
+            m = payload.get("model")
+            if isinstance(m, str) and m.strip():
+                current_model = m.strip()
+            if not project_cwd:
+                project_cwd = _normalize_project_path(payload.get("cwd"))
+            continue
+
+        is_response = typ == "token_usage_record"
+        if is_response:
+            last = payload.get("usage")
+            total = payload.get("thread_token_usage")
+            owner = payload.get("thread_id")
+            response_id = payload.get("response_id")
+            if not isinstance(last, dict) or (owner and session_id and owner != session_id):
+                continue
+            if isinstance(response_id, str) and response_id:
+                if response_id in response_ids:
+                    continue
+                response_ids.add(response_id)
+        elif typ == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            total = info.get("total_token_usage")
+            last = info.get("last_token_usage")
+        else:
+            continue
+
+        ts = _parse_ts(obj.get("timestamp"))
+        if ts is None:
+            continue
+
+        d_in = d_cr = d_cw = d_out = d_reason = 0
+        cur_tuple = None
+        if isinstance(total, dict):
+            cur_in = _safe_int(total.get("input_tokens"))
+            cur_cr = _safe_int(total.get("cached_input_tokens"))
+            cur_cw = _safe_int(total.get("cache_write_input_tokens"))
+            cur_out = _safe_int(total.get("output_tokens"))
+            cur_r = _safe_int(total.get("reasoning_output_tokens"))
+            cur_tuple = (cur_in, cur_cr, cur_cw, cur_out, cur_r)
+            if is_response:
+                response_totals.add((turn, cur_tuple))
+            if prev_total is not None:
+                if cur_tuple == prev_total:
+                    continue
                 if (
-                    '"token_count"' not in line
-                    and '"token_usage_record"' not in line
-                    and '"session_meta"' not in line
-                    and '"turn_context"' not in line
+                    cur_in >= prev_total[0]
+                    and cur_cr >= prev_total[1]
+                    and cur_cw >= prev_total[2]
+                    and cur_out >= prev_total[3]
+                    and cur_r >= prev_total[4]
                 ):
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                typ = obj.get("type")
-                payload = obj.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-
-                if typ == "session_meta":
-                    session_id = payload.get("id")
-                    orig = payload.get("originator")
-                    if isinstance(orig, str):
-                        originator = orig
-                    if not project_cwd:
-                        project_cwd = _normalize_project_path(payload.get("cwd"))
-                    continue
-
-                if typ == "turn_context":
-                    turn += 1
-                    m = payload.get("model")
-                    if isinstance(m, str) and m.strip():
-                        current_model = m.strip()
-                    continue
-
-                is_response = typ == "token_usage_record"
-                if is_response:
-                    last = payload.get("usage")
-                    total = payload.get("thread_token_usage")
-                    owner = payload.get("thread_id")
-                    response_id = payload.get("response_id")
-                    if not isinstance(last, dict) or (owner and session_id and owner != session_id):
-                        continue
-                    if isinstance(response_id, str) and response_id:
-                        if response_id in response_ids:
-                            continue
-                        response_ids.add(response_id)
-                elif typ == "event_msg" and payload.get("type") == "token_count":
-                    info = payload.get("info")
-                    if not isinstance(info, dict):
-                        continue
-                    total = info.get("total_token_usage")
-                    last = info.get("last_token_usage")
-                else:
-                    continue
-
-                ts = _parse_ts(obj.get("timestamp"))
-                if ts is None:
-                    continue
-
-                d_in = d_cr = d_cw = d_out = d_reason = 0
-                cur_tuple = None
-                if isinstance(total, dict):
-                    cur_in = _safe_int(total.get("input_tokens"))
-                    cur_cr = _safe_int(total.get("cached_input_tokens"))
-                    cur_cw = _safe_int(total.get("cache_write_input_tokens"))
-                    cur_out = _safe_int(total.get("output_tokens"))
-                    cur_r = _safe_int(total.get("reasoning_output_tokens"))
-                    cur_tuple = (cur_in, cur_cr, cur_cw, cur_out, cur_r)
-                    if is_response:
-                        response_totals.add((turn, cur_tuple))
-                    if prev_total is not None:
-                        if cur_tuple == prev_total:
-                            continue  # Duplicate snapshot echo
-                        if (
-                            cur_in >= prev_total[0]
-                            and cur_cr >= prev_total[1]
-                            and cur_cw >= prev_total[2]
-                            and cur_out >= prev_total[3]
-                            and cur_r >= prev_total[4]
-                        ):
-                            d_in = cur_in - prev_total[0]
-                            d_cr = cur_cr - prev_total[1]
-                            d_cw = cur_cw - prev_total[2]
-                            d_out = cur_out - prev_total[3]
-                            d_reason = cur_r - prev_total[4]
-                        elif isinstance(last, dict):
-                            d_in = _safe_int(last.get("input_tokens"))
-                            d_cr = _safe_int(last.get("cached_input_tokens"))
-                            d_cw = _safe_int(last.get("cache_write_input_tokens"))
-                            d_out = _safe_int(last.get("output_tokens"))
-                            d_reason = _safe_int(last.get("reasoning_output_tokens"))
-                    else:
-                        d_in, d_cr, d_cw, d_out, d_reason = cur_tuple
-                    if is_response:
-                        d_in, d_cr, d_cw, d_out, d_reason = (_safe_int(last.get(key)) for key in (
-                            "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
-                            "output_tokens", "reasoning_output_tokens",
-                        ))
-                    prev_total = cur_tuple
+                    d_in = cur_in - prev_total[0]
+                    d_cr = cur_cr - prev_total[1]
+                    d_cw = cur_cw - prev_total[2]
+                    d_out = cur_out - prev_total[3]
+                    d_reason = cur_r - prev_total[4]
                 elif isinstance(last, dict):
                     d_in = _safe_int(last.get("input_tokens"))
                     d_cr = _safe_int(last.get("cached_input_tokens"))
                     d_cw = _safe_int(last.get("cache_write_input_tokens"))
                     d_out = _safe_int(last.get("output_tokens"))
                     d_reason = _safe_int(last.get("reasoning_output_tokens"))
-
-                if d_in + d_out + d_cr + d_cw + d_reason <= 0:
-                    continue
-                events.append(
-                    CodexUsageEvent(ts, current_model, turn, (d_in, d_cr, d_cw, d_out, d_reason), cur_tuple, is_response)
+            else:
+                d_in, d_cr, d_cw, d_out, d_reason = cur_tuple
+            if is_response:
+                d_in, d_cr, d_cw, d_out, d_reason = (
+                    _safe_int(last.get(key))
+                    for key in (
+                        "input_tokens",
+                        "cached_input_tokens",
+                        "cache_write_input_tokens",
+                        "output_tokens",
+                        "reasoning_output_tokens",
+                    )
                 )
-    except OSError:
-        return []
+            prev_total = cur_tuple
+        elif isinstance(last, dict):
+            d_in = _safe_int(last.get("input_tokens"))
+            d_cr = _safe_int(last.get("cached_input_tokens"))
+            d_cw = _safe_int(last.get("cache_write_input_tokens"))
+            d_out = _safe_int(last.get("output_tokens"))
+            d_reason = _safe_int(last.get("reasoning_output_tokens"))
+
+        if d_in + d_out + d_cr + d_cw + d_reason <= 0:
+            continue
+        events.append(
+            CodexUsageEvent(ts, current_model, turn, (d_in, d_cr, d_cw, d_out, d_reason), cur_tuple, is_response)
+        )
 
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     duplicates = _codex_mirrored_events(events, response_totals)
@@ -511,10 +626,28 @@ def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]
         inp, cr, cw, out, reasoning = event.tokens
         non_cached_in = max(0, inp - cr - cw)
         non_reason_out = max(0, out - reasoning)
+        rates = pricing.resolve(event.model)
         cost = pricing.estimate_cost(event.model, non_cached_in, non_reason_out, cr, cw, reasoning)
-        _acc_add(acc, tool_key, _ts_to_day(event.timestamp), event.model,
-                 non_cached_in, non_reason_out, cr, cw, reasoning, cost)
-    return _compact_rows(acc, project=project_cwd)
+        sub_cand = cost if rates is not None else None
+        _acc_add(
+            acc,
+            tool_key,
+            _ts_to_day(event.timestamp),
+            event.model,
+            non_cached_in,
+            non_reason_out,
+            cr,
+            cw,
+            reasoning,
+            cost,
+            sub_cand_usd=sub_cand,
+        )
+    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+
+
+def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
+    rows, _, _, _ = _parse_codex_file_checked(path, pricing)
+    return rows
 
 
 def collect_codex_usage(
@@ -525,20 +658,42 @@ def collect_codex_usage(
     pricing: PricingTable,
     result: Dict[str, Any],
     projects_out: Optional[Dict[str, Any]] = None,
-) -> None:
-    if not sessions_root.is_dir():
-        return
-    for path in sessions_root.rglob("*.jsonl"):
+    billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = None,
+    billing_cutoff_day: Optional[str] = None,
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
+    can_scan, early = check_root_dir(sessions_root, "usage.codex", prev_sources or {})
+    if not can_scan:
+        return early or "not_configured"
+
+    files, dir_err = _walk_matching_files(sessions_root, ".jsonl")
+    files_ok = 0
+    files_err = 0
+    for path in files:
         try:
             if path.stat().st_mtime < cutoff_ts - 86400:
+                files_ok += 1
                 continue
         except OSError:
+            files_err += 1
             continue
         rows = cache.get(path)
         if rows is None:
-            rows = _parse_codex_file(path, pricing)
-            cache.put(path, rows)
-        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
+            rows, had_err, changed, st_res = _parse_codex_file_checked(path, pricing)
+            if had_err or changed:
+                files_err += 1
+                continue
+            cache.put(path, rows, stat_result=st_res)
+        files_ok += 1
+        _merge_rows_into_result(
+            result,
+            rows,
+            cutoff_day,
+            projects_out=projects_out,
+            billing_acc=billing_acc,
+            billing_cutoff_day=billing_cutoff_day,
+        )
+    return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
 # ---------------------------------------------------------------------------
@@ -561,152 +716,152 @@ def _detail_int(d: Any, *keys: str) -> int:
     return _pick_int(d, *keys)
 
 
-def _parse_workbuddy_file(path: Path, tool_key: str, pricing: PricingTable) -> List[Dict[str, Any]]:
+def _parse_workbuddy_file_checked(
+    path: Path, tool_key: str, pricing: PricingTable
+) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+    res = read_jsonl_checked(
+        path,
+        keyword_filter=('"usage"', '"rawUsage"', '"cwd"'),
+    )
+    if res.permission_error or res.missing:
+        return [], True, res.identity_changed, None
+
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     seen_dedup: set = set()
     project_cwd = ""
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line_no, line in enumerate(fh, 1):
-                if '"usage"' not in line and '"rawUsage"' not in line and (project_cwd or '"cwd"' not in line):
-                    continue
-                try:
-                    item = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(item, dict):
-                    continue
-                if not project_cwd:
-                    project_cwd = _normalize_project_path(item.get("cwd"))
-                if '"usage"' not in line and '"rawUsage"' not in line:
-                    continue
-                ts = _parse_ts(item.get("timestamp") or item.get("createdAt") or item.get("ts"))
-                if ts is None:
-                    continue
 
-                message = item.get("message") if isinstance(item.get("message"), dict) else {}
-                provider = item.get("providerData") or message.get("providerData") or {}
-                if not isinstance(provider, dict):
-                    provider = {}
+    for line_no, item in res.records:
+        if not project_cwd:
+            project_cwd = _normalize_project_path(item.get("cwd"))
+        message = item.get("message") if isinstance(item.get("message"), dict) else {}
+        provider = item.get("providerData") or message.get("providerData") or {}
+        if not isinstance(provider, dict):
+            provider = {}
 
-                sources = [
-                    x
-                    for x in (message.get("usage"), provider.get("usage"), provider.get("rawUsage"), item.get("usage"))
-                    if isinstance(x, dict) and x
-                ]
-                if not sources:
-                    continue
+        sources = [
+            x
+            for x in (message.get("usage"), provider.get("usage"), provider.get("rawUsage"), item.get("usage"))
+            if isinstance(x, dict) and x
+        ]
+        if not sources:
+            continue
 
-                selected = None
-                inp_total = out_total = 0
-                for src in sources:
-                    i_v = _pick_int(src, "input_tokens", "inputTokens", "input", "prompt_tokens")
-                    o_v = _pick_int(src, "output_tokens", "outputTokens", "output", "completion_tokens")
-                    if i_v + o_v > 0:
-                        selected = src
-                        inp_total = i_v
-                        out_total = o_v
-                        break
-                if selected is None:
-                    continue
+        ts = _parse_ts(item.get("timestamp") or item.get("createdAt") or item.get("ts"))
+        if ts is None:
+            continue
 
-                cr = 0
-                cw = 0
-                thoughts = 0
-                total_candidates: List[int] = []
-                for src in sources:
-                    cr = max(
-                        cr,
-                        _pick_int(
-                            src,
-                            "cache_read_input_tokens",
-                            "cacheReadInputTokens",
-                            "cache_read",
-                            "cacheRead",
-                            "cached_tokens",
-                            "cachedTokens",
-                            "prompt_cache_hit_tokens",
-                        ),
-                        _detail_int(src.get("inputTokensDetails"), "cached_tokens", "cachedTokens"),
-                        _detail_int(src.get("input_tokens_details"), "cached_tokens", "cachedTokens"),
-                        _detail_int(src.get("prompt_tokens_details"), "cached_tokens", "cachedTokens"),
-                    )
-                    cw = max(
-                        cw,
-                        _pick_int(
-                            src,
-                            "cache_creation_input_tokens",
-                            "cacheCreationInputTokens",
-                            "cache_write_input_tokens",
-                            "cacheWriteInputTokens",
-                            "prompt_cache_write_tokens",
-                            "cache_write",
-                            "cacheWrite",
-                        ),
-                    )
-                    thoughts = max(
-                        thoughts,
-                        _pick_int(src, "reasoning_tokens", "reasoningTokens", "thinking_tokens"),
-                        _detail_int(src.get("output_tokens_details"), "reasoning_tokens", "thinking_tokens"),
-                        _detail_int(src.get("outputTokensDetails"), "reasoningTokens", "thinkingTokens"),
-                    )
-                    tot = _pick_int(src, "total_tokens", "totalTokens", "total")
-                    if tot > 0:
-                        total_candidates.append(tot)
+        selected = None
+        inp_total = out_total = 0
+        for src in sources:
+            i_v = _pick_int(src, "input_tokens", "inputTokens", "input", "prompt_tokens")
+            o_v = _pick_int(src, "output_tokens", "outputTokens", "output", "completion_tokens")
+            if i_v + o_v > 0:
+                selected = src
+                inp_total = i_v
+                out_total = o_v
+                break
+        if selected is None:
+            continue
 
-                # Deduplicate repeated frames in same file
-                dedup_id = message.get("id") or item.get("id") or f"{line_no}"
-                dedup_key = (str(dedup_id), int(ts))
-                if dedup_key in seen_dedup:
-                    continue
-                seen_dedup.add(dedup_key)
+        cr = 0
+        cw = 0
+        thoughts = 0
+        total_candidates: List[int] = []
+        for src in sources:
+            cr = max(
+                cr,
+                _pick_int(
+                    src,
+                    "cache_read_input_tokens",
+                    "cacheReadInputTokens",
+                    "cache_read",
+                    "cacheRead",
+                    "cached_tokens",
+                    "cachedTokens",
+                    "prompt_cache_hit_tokens",
+                ),
+                _detail_int(src.get("inputTokensDetails"), "cached_tokens", "cachedTokens"),
+                _detail_int(src.get("input_tokens_details"), "cached_tokens", "cachedTokens"),
+                _detail_int(src.get("prompt_tokens_details"), "cached_tokens", "cachedTokens"),
+            )
+            cw = max(
+                cw,
+                _pick_int(
+                    src,
+                    "cache_creation_input_tokens",
+                    "cacheCreationInputTokens",
+                    "cache_write_input_tokens",
+                    "cacheWriteInputTokens",
+                    "prompt_cache_write_tokens",
+                    "cache_write",
+                    "cacheWrite",
+                ),
+            )
+            thoughts = max(
+                thoughts,
+                _pick_int(src, "reasoning_tokens", "reasoningTokens", "thinking_tokens"),
+                _detail_int(src.get("output_tokens_details"), "reasoning_tokens", "thinking_tokens"),
+                _detail_int(src.get("outputTokensDetails"), "reasoningTokens", "thinkingTokens"),
+            )
+            tot = _pick_int(src, "total_tokens", "totalTokens", "total")
+            if tot > 0:
+                total_candidates.append(tot)
 
-                inclusive_input = any(tot == inp_total + out_total for tot in total_candidates)
-                if inclusive_input or cr + cw <= inp_total:
-                    non_cached_in = max(0, inp_total - cr - cw)
-                else:
-                    non_cached_in = inp_total
+        dedup_id = message.get("id") or item.get("id") or f"{line_no + 1}"
+        dedup_key = (str(dedup_id), int(ts))
+        if dedup_key in seen_dedup:
+            continue
+        seen_dedup.add(dedup_key)
 
-                non_reason_out = max(0, out_total - thoughts) if thoughts <= out_total else out_total
+        inclusive_input = any(tot == inp_total + out_total for tot in total_candidates)
+        if inclusive_input or cr + cw <= inp_total:
+            non_cached_in = max(0, inp_total - cr - cw)
+        else:
+            non_cached_in = inp_total
 
-                model = (
-                    provider.get("modelName")
-                    or provider.get("model")
-                    or provider.get("modelId")
-                    or message.get("model")
-                    or item.get("model")
-                    or "unknown"
-                )
-                if not isinstance(model, str):
-                    model = "unknown"
+        non_reason_out = max(0, out_total - thoughts) if thoughts <= out_total else out_total
 
-                cost = _safe_float(selected.get("cost")) or _safe_float(provider.get("cost"))
-                if cost <= 0:
-                    cost = pricing.estimate_cost(
-                        model,
-                        input_tokens=non_cached_in,
-                        output_tokens=non_reason_out,
-                        cache_read_tokens=cr,
-                        cache_write_tokens=cw,
-                        reasoning_tokens=thoughts,
-                    )
+        model = (
+            provider.get("modelName")
+            or provider.get("model")
+            or provider.get("modelId")
+            or message.get("model")
+            or item.get("model")
+            or "unknown"
+        )
+        if not isinstance(model, str):
+            model = "unknown"
 
-                _acc_add(
-                    acc,
-                    tool=tool_key,
-                    day=_ts_to_day(ts),
-                    model=model,
-                    inp=non_cached_in,
-                    out=non_reason_out,
-                    cr=cr,
-                    cw=cw,
-                    thoughts=thoughts,
-                    cost_usd=cost,
-                    requests=1,
-                )
-    except OSError:
-        return []
-    return _compact_rows(acc, project=project_cwd)
+        cost = _safe_float(selected.get("cost")) or _safe_float(provider.get("cost"))
+        if cost <= 0:
+            cost = pricing.estimate_cost(
+                model,
+                input_tokens=non_cached_in,
+                output_tokens=non_reason_out,
+                cache_read_tokens=cr,
+                cache_write_tokens=cw,
+                reasoning_tokens=thoughts,
+            )
+
+        _acc_add(
+            acc,
+            tool=tool_key,
+            day=_ts_to_day(ts),
+            model=model,
+            inp=non_cached_in,
+            out=non_reason_out,
+            cr=cr,
+            cw=cw,
+            thoughts=thoughts,
+            cost_usd=cost,
+            requests=1,
+        )
+    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+
+
+def _parse_workbuddy_file(path: Path, tool_key: str, pricing: PricingTable) -> List[Dict[str, Any]]:
+    rows, _, _, _ = _parse_workbuddy_file_checked(path, tool_key, pricing)
+    return rows
 
 
 def collect_workbuddy_usage(
@@ -718,20 +873,34 @@ def collect_workbuddy_usage(
     pricing: PricingTable,
     result: Dict[str, Any],
     projects_out: Optional[Dict[str, Any]] = None,
-) -> None:
-    if not root.is_dir():
-        return
-    for path in root.rglob("*.jsonl"):
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
+    source_id = f"usage.{tool_key}"
+    can_scan, early = check_root_dir(root, source_id, prev_sources or {})
+    if not can_scan:
+        return early or "not_configured"
+
+    files, dir_err = _walk_matching_files(root, ".jsonl")
+    files_ok = 0
+    files_err = 0
+    for path in files:
         try:
             if path.stat().st_mtime < cutoff_ts - 86400:
+                files_ok += 1
                 continue
         except OSError:
+            files_err += 1
             continue
         rows = cache.get(path)
         if rows is None:
-            rows = _parse_workbuddy_file(path, tool_key, pricing)
-            cache.put(path, rows)
+            rows, had_err, changed, st_res = _parse_workbuddy_file_checked(path, tool_key, pricing)
+            if had_err or changed:
+                files_err += 1
+                continue
+            cache.put(path, rows, stat_result=st_res)
+        files_ok += 1
         _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
+    return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
 # ---------------------------------------------------------------------------
@@ -739,59 +908,52 @@ def collect_workbuddy_usage(
 # ---------------------------------------------------------------------------
 
 
-def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
-    # Deduplicate streaming chunks by message.id, retaining the final (max output) snapshot
+def _parse_claude_file_checked(
+    path: Path, pricing: PricingTable
+) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+    res = read_jsonl_checked(path, keyword_filter=('"usage"', '"cwd"'))
+    if res.permission_error or res.missing:
+        return [], True, res.identity_changed, None
+
     by_msg: Dict[str, Tuple[float, str, int, int, int, int, int]] = {}
     fallback_seq = 0
     project_cwd = ""
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                if '"usage"' not in line and (project_cwd or '"cwd"' not in line):
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if not project_cwd:
-                    project_cwd = _normalize_project_path(obj.get("cwd"))
-                if '"usage"' not in line:
-                    continue
-                msg = obj.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                usage = msg.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                ts = _parse_ts(obj.get("timestamp"))
-                if ts is None:
-                    continue
 
-                inp = _safe_int(usage.get("input_tokens"))
-                out = _safe_int(usage.get("output_tokens"))
-                cr = _safe_int(usage.get("cache_read_input_tokens"))
-                cw = _safe_int(usage.get("cache_creation_input_tokens"))
-                thoughts = _detail_int(usage.get("output_tokens_details"), "thinking_tokens", "reasoning_tokens")
-                if inp + out + cr + cw + thoughts <= 0:
-                    continue
+    for _, obj in res.records:
+        if not project_cwd:
+            project_cwd = _normalize_project_path(obj.get("cwd"))
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        ts = _parse_ts(obj.get("timestamp"))
+        if ts is None:
+            continue
 
-                model = str(msg.get("model") or "claude")
-                msg_id = msg.get("id") or obj.get("requestId")
-                if not msg_id:
-                    fallback_seq += 1
-                    msg_id = f"seq-{fallback_seq}"
-                msg_id = str(msg_id)
-                prev = by_msg.get(msg_id)
-                if prev is None or out >= prev[3]:
-                    by_msg[msg_id] = (ts, model, inp, out, cr, cw, thoughts)
-    except OSError:
-        return []
+        inp = _safe_int(usage.get("input_tokens"))
+        out = _safe_int(usage.get("output_tokens"))
+        cr = _safe_int(usage.get("cache_read_input_tokens"))
+        cw = _safe_int(usage.get("cache_creation_input_tokens"))
+        thoughts = _detail_int(usage.get("output_tokens_details"), "thinking_tokens", "reasoning_tokens")
+        if inp + out + cr + cw + thoughts <= 0:
+            continue
+
+        model = str(msg.get("model") or "claude")
+        msg_id = msg.get("id") or obj.get("requestId")
+        if not msg_id:
+            fallback_seq += 1
+            msg_id = f"seq-{fallback_seq}"
+        msg_id = str(msg_id)
+        prev = by_msg.get(msg_id)
+        if prev is None or out >= prev[3]:
+            by_msg[msg_id] = (ts, model, inp, out, cr, cw, thoughts)
 
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for ts, model, inp, out, cr, cw, thoughts in by_msg.values():
         non_reason_out = max(0, out - thoughts) if thoughts <= out else out
+        rates = pricing.resolve(model)
         cost = pricing.estimate_cost(
             model,
             input_tokens=inp,
@@ -800,6 +962,7 @@ def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]
             cache_write_tokens=cw,
             reasoning_tokens=thoughts,
         )
+        sub_cand = cost if rates is not None else None
         _acc_add(
             acc,
             tool="claude_code",
@@ -812,8 +975,14 @@ def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]
             thoughts=thoughts,
             cost_usd=cost,
             requests=1,
+            sub_cand_usd=sub_cand,
         )
-    return _compact_rows(acc, project=project_cwd)
+    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+
+
+def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
+    rows, _, _, _ = _parse_claude_file_checked(path, pricing)
+    return rows
 
 
 def collect_claude_usage(
@@ -824,20 +993,42 @@ def collect_claude_usage(
     pricing: PricingTable,
     result: Dict[str, Any],
     projects_out: Optional[Dict[str, Any]] = None,
-) -> None:
-    if not projects_root.is_dir():
-        return
-    for path in projects_root.rglob("*.jsonl"):
+    billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = None,
+    billing_cutoff_day: Optional[str] = None,
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
+    can_scan, early = check_root_dir(projects_root, "usage.claude_code", prev_sources or {})
+    if not can_scan:
+        return early or "not_configured"
+
+    files, dir_err = _walk_matching_files(projects_root, ".jsonl")
+    files_ok = 0
+    files_err = 0
+    for path in files:
         try:
             if path.stat().st_mtime < cutoff_ts - 86400:
+                files_ok += 1
                 continue
         except OSError:
+            files_err += 1
             continue
         rows = cache.get(path)
         if rows is None:
-            rows = _parse_claude_file(path, pricing)
-            cache.put(path, rows)
-        _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
+            rows, had_err, changed, st_res = _parse_claude_file_checked(path, pricing)
+            if had_err or changed:
+                files_err += 1
+                continue
+            cache.put(path, rows, stat_result=st_res)
+        files_ok += 1
+        _merge_rows_into_result(
+            result,
+            rows,
+            cutoff_day,
+            projects_out=projects_out,
+            billing_acc=billing_acc,
+            billing_cutoff_day=billing_cutoff_day,
+        )
+    return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
 # ---------------------------------------------------------------------------
@@ -845,72 +1036,70 @@ def collect_claude_usage(
 # ---------------------------------------------------------------------------
 
 
-def _parse_pi_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
+def _parse_pi_file_checked(
+    path: Path, pricing: PricingTable
+) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+    res = read_jsonl_checked(path, keyword_filter=('"usage"', '"session"'))
+    if res.permission_error or res.missing:
+        return [], True, res.identity_changed, None
+
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     project_cwd = ""
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                if '"usage"' not in line and (project_cwd or '"session"' not in line):
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if not project_cwd and obj.get("type") == "session":
-                    project_cwd = _normalize_project_path(obj.get("cwd"))
-                if '"usage"' not in line:
-                    continue
-                msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-                usage = msg.get("usage") or obj.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                ts = _parse_ts(obj.get("timestamp") or msg.get("timestamp"))
-                if ts is None:
-                    continue
 
-                inp = _pick_int(usage, "input", "input_tokens", "inputTokens")
-                out = _pick_int(usage, "output", "output_tokens", "outputTokens")
-                cr = _pick_int(usage, "cacheRead", "cache_read", "cache_read_input_tokens")
-                cw = _pick_int(usage, "cacheWrite", "cache_write", "cache_creation_input_tokens")
-                thoughts = _pick_int(usage, "reasoning", "thoughts", "thinking_tokens")
-                if inp + out + cr + cw + thoughts <= 0:
-                    continue
+    for _, obj in res.records:
+        if not project_cwd and obj.get("type") == "session":
+            project_cwd = _normalize_project_path(obj.get("cwd"))
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        usage = msg.get("usage") or obj.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        ts = _parse_ts(obj.get("timestamp") or msg.get("timestamp"))
+        if ts is None:
+            continue
 
-                model = str(msg.get("model") or obj.get("model") or "unknown")
-                cost_obj = usage.get("cost")
-                cost = 0.0
-                if isinstance(cost_obj, dict):
-                    cost = _safe_float(cost_obj.get("total"))
-                elif isinstance(cost_obj, (int, float)):
-                    cost = _safe_float(cost_obj)
-                if cost <= 0:
-                    cost = pricing.estimate_cost(
-                        model,
-                        input_tokens=inp,
-                        output_tokens=out,
-                        cache_read_tokens=cr,
-                        cache_write_tokens=cw,
-                        reasoning_tokens=thoughts,
-                    )
-                _acc_add(
-                    acc,
-                    tool="pi",
-                    day=_ts_to_day(ts),
-                    model=model,
-                    inp=inp,
-                    out=out,
-                    cr=cr,
-                    cw=cw,
-                    thoughts=thoughts,
-                    cost_usd=cost,
-                    requests=1,
-                )
-    except OSError:
-        return []
-    return _compact_rows(acc, project=project_cwd)
+        inp = _pick_int(usage, "input", "input_tokens", "inputTokens")
+        out = _pick_int(usage, "output", "output_tokens", "outputTokens")
+        cr = _pick_int(usage, "cacheRead", "cache_read", "cache_read_input_tokens")
+        cw = _pick_int(usage, "cacheWrite", "cache_write", "cache_creation_input_tokens")
+        thoughts = _pick_int(usage, "reasoning", "thoughts", "thinking_tokens")
+        if inp + out + cr + cw + thoughts <= 0:
+            continue
+
+        model = str(msg.get("model") or obj.get("model") or "unknown")
+        cost_obj = usage.get("cost")
+        cost = 0.0
+        if isinstance(cost_obj, dict):
+            cost = _safe_float(cost_obj.get("total"))
+        elif isinstance(cost_obj, (int, float)):
+            cost = _safe_float(cost_obj)
+        if cost <= 0:
+            cost = pricing.estimate_cost(
+                model,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_read_tokens=cr,
+                cache_write_tokens=cw,
+                reasoning_tokens=thoughts,
+            )
+        _acc_add(
+            acc,
+            tool="pi",
+            day=_ts_to_day(ts),
+            model=model,
+            inp=inp,
+            out=out,
+            cr=cr,
+            cw=cw,
+            thoughts=thoughts,
+            cost_usd=cost,
+            requests=1,
+        )
+    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+
+
+def _parse_pi_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
+    rows, _, _, _ = _parse_pi_file_checked(path, pricing)
+    return rows
 
 
 def collect_pi_usage(
@@ -921,20 +1110,33 @@ def collect_pi_usage(
     pricing: PricingTable,
     result: Dict[str, Any],
     projects_out: Optional[Dict[str, Any]] = None,
-) -> None:
-    if not sessions_root.is_dir():
-        return
-    for path in sessions_root.rglob("*.jsonl"):
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
+    can_scan, early = check_root_dir(sessions_root, "usage.pi", prev_sources or {})
+    if not can_scan:
+        return early or "not_configured"
+
+    files, dir_err = _walk_matching_files(sessions_root, ".jsonl")
+    files_ok = 0
+    files_err = 0
+    for path in files:
         try:
             if path.stat().st_mtime < cutoff_ts - 86400:
+                files_ok += 1
                 continue
         except OSError:
+            files_err += 1
             continue
         rows = cache.get(path)
         if rows is None:
-            rows = _parse_pi_file(path, pricing)
-            cache.put(path, rows)
+            rows, had_err, changed, st_res = _parse_pi_file_checked(path, pricing)
+            if had_err or changed:
+                files_err += 1
+                continue
+            cache.put(path, rows, stat_result=st_res)
+        files_ok += 1
         _merge_rows_into_result(result, rows, cutoff_day, projects_out=projects_out)
+    return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
 # ---------------------------------------------------------------------------
@@ -943,75 +1145,209 @@ def collect_pi_usage(
 
 
 def collect_hermes_usage(
-    hermes_root: Path, cutoff_ts: float, cutoff_day: str, pricing: PricingTable, result: Dict[str, Any]
-) -> None:
-    if not hermes_root.is_dir():
-        return
-    db_paths: List[Path] = []
-    if (hermes_root / "state.db").is_file():
-        db_paths.append(hermes_root / "state.db")
-    profiles_dir = hermes_root / "profiles"
-    if profiles_dir.is_dir():
-        for prof in sorted(profiles_dir.iterdir()):
-            cand = prof / "state.db"
-            if cand.is_file():
-                db_paths.append(cand)
+    hermes_root: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = None,
+    billing_cutoff_day: Optional[str] = None,
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
+    can_scan, early = check_root_dir(hermes_root, "usage.hermes", prev_sources or {})
+    if not can_scan:
+        return early or "not_configured"
 
-    for db_path in db_paths:
+    db_entries: List[Tuple[str, Path]] = []
+    if (hermes_root / "state.db").exists():
+        db_entries.append(("", hermes_root / "state.db"))
+    profiles_dir = hermes_root / "profiles"
+    dir_err = 0
+    if profiles_dir.exists():
         try:
-            if db_path.stat().st_mtime < cutoff_ts - 86400:
-                continue
+            for prof in sorted(profiles_dir.iterdir()):
+                if not prof.is_dir():
+                    continue
+                cand = prof / "state.db"
+                if cand.exists():
+                    db_entries.append((prof.name, cand))
         except OSError:
-            continue
-        with sqlite_snapshot(db_path) as conn:
-            if conn is None:
+            dir_err += 1
+
+    if not db_entries and dir_err == 0:
+        return "complete"
+
+    b_floor = billing_cutoff_day or cutoff_day
+    db_statuses: List[str] = []
+    seen_actual_keys: set = set()
+
+    for profile_tag, db_path in db_entries:
+        with sqlite_snapshot_with_status(db_path) as (conn, snap_status):
+            if snap_status != "ok" or conn is None:
+                db_statuses.append("unavailable")
                 continue
             try:
                 tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             except sqlite3.Error:
+                db_statuses.append("unavailable")
                 continue
 
             acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
             used_detail_table = False
+            db_failed = False
 
-            # Prefer fine-grained usage table if present
-            for tbl in ("model_usage", "token_usage", "session_usage", "usage"):
-                if tbl not in tables:
-                    continue
+            # First check Hermes v2 `session_model_usage` (supports billing_mode & verified API actual cost)
+            if "session_model_usage" in tables:
                 try:
-                    cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()}
-                    if "input_tokens" not in cols and "output_tokens" not in cols:
-                        continue
-                    ts_col = "last_seen" if "last_seen" in cols else ("first_seen" if "first_seen" in cols else ("created_at" if "created_at" in cols else None))
-                    model_col = "model" if "model" in cols else "''"
-                    cr_col = "cache_read_tokens" if "cache_read_tokens" in cols else "0"
-                    cw_col = "cache_write_tokens" if "cache_write_tokens" in cols else "0"
-                    r_col = "reasoning_tokens" if "reasoning_tokens" in cols else "0"
-                    cost_col = "actual_cost_usd" if "actual_cost_usd" in cols else ("estimated_cost_usd" if "estimated_cost_usd" in cols else "0")
-                    q = f'SELECT {model_col} AS model, input_tokens, output_tokens, {cr_col} AS cr, {cw_col} AS cw, {r_col} AS r, {cost_col} AS cost_usd, {ts_col if ts_col else "NULL"} AS ts FROM "{tbl}"'
-                    rows = conn.execute(q).fetchall()
-                    for row in rows:
-                        ts = _parse_ts(row["ts"])
-                        if ts is None or ts < cutoff_ts:
-                            continue
-                        inp = _safe_int(row["input_tokens"])
-                        out = _safe_int(row["output_tokens"])
-                        cr = _safe_int(row["cr"])
-                        cw = _safe_int(row["cw"])
-                        reason = _safe_int(row["r"])
-                        if inp + out + cr + cw + reason <= 0:
-                            continue
-                        model = str(row["model"] or "hermes")
-                        cost = _safe_float(row["cost_usd"])
-                        if cost <= 0:
-                            cost = pricing.estimate_cost(model, inp, out, cr, cw, reason)
-                        _acc_add(acc, "hermes", _ts_to_day(ts), model, inp, out, cr, cw, reason, cost, 1)
-                    used_detail_table = True
-                    break
-                except sqlite3.Error:
-                    continue
+                    cols = {r[1] for r in conn.execute('PRAGMA table_info("session_model_usage")').fetchall()}
+                    if "input_tokens" in cols or "output_tokens" in cols or "actual_cost_usd" in cols:
+                        sel_parts = [
+                            "rowid AS _rid",
+                            ("session_id" if "session_id" in cols else "''") + " AS session_id",
+                            ("model" if "model" in cols else "''") + " AS model",
+                            ("billing_provider" if "billing_provider" in cols else "''") + " AS billing_provider",
+                            ("billing_base_url" if "billing_base_url" in cols else "''") + " AS billing_base_url",
+                            ("billing_mode" if "billing_mode" in cols else "''") + " AS billing_mode",
+                            ("task" if "task" in cols else "''") + " AS task",
+                            ("input_tokens" if "input_tokens" in cols else "0") + " AS input_tokens",
+                            ("output_tokens" if "output_tokens" in cols else "0") + " AS output_tokens",
+                            ("cache_read_tokens" if "cache_read_tokens" in cols else "0") + " AS cr",
+                            ("cache_write_tokens" if "cache_write_tokens" in cols else "0") + " AS cw",
+                            ("reasoning_tokens" if "reasoning_tokens" in cols else "0") + " AS r",
+                            ("actual_cost_usd" if "actual_cost_usd" in cols else "NULL") + " AS actual_cost_usd",
+                            ("estimated_cost_usd" if "estimated_cost_usd" in cols else "NULL") + " AS estimated_cost_usd",
+                            ("cost_status" if "cost_status" in cols else "''") + " AS cost_status",
+                            ("cost_source" if "cost_source" in cols else "''") + " AS cost_source",
+                            ("first_seen" if "first_seen" in cols else "NULL") + " AS first_seen",
+                            ("last_seen" if "last_seen" in cols else "NULL") + " AS last_seen",
+                        ]
+                        q = f'SELECT {", ".join(sel_parts)} FROM "session_model_usage"'
+                        rows = conn.execute(q).fetchall()
+                        if rows:
+                            used_detail_table = True
+                        for row in rows:
+                            last_ts = _parse_ts(row["last_seen"])
+                            fallback_ts = last_ts if last_ts is not None else _parse_ts(row["first_seen"])
+                            inp = _safe_int(row["input_tokens"])
+                            out = _safe_int(row["output_tokens"])
+                            cr = _safe_int(row["cr"])
+                            cw = _safe_int(row["cw"])
+                            reason = _safe_int(row["r"])
+                            model = str(row["model"] or "hermes")
 
-            if not used_detail_table and "sessions" in tables:
+                            # 1) Verified API actual & subscription_included candidate (strictly per spec 2.6)
+                            if billing_acc is not None and last_ts is not None:
+                                b_day = _ts_to_day(last_ts)
+                                if b_day >= b_floor:
+                                    bmode = str(row["billing_mode"] or "").strip().lower()
+                                    cstatus = str(row["cost_status"] or "").strip().lower()
+                                    csource = str(row["cost_source"] or "").strip().lower()
+
+                                    # Unique key prevents double-counting detail rows
+                                    uniq_key = (
+                                        profile_tag,
+                                        str(row["session_id"] or ""),
+                                        model,
+                                        str(row["billing_provider"] or ""),
+                                        str(row["billing_base_url"] or ""),
+                                        bmode,
+                                        str(row["task"] or ""),
+                                        str(row["first_seen"] or ""),
+                                        str(row["last_seen"] or ""),
+                                        int(row["_rid"]),
+                                    )
+                                    if uniq_key not in seen_actual_keys:
+                                        seen_actual_keys.add(uniq_key)
+                                        if (
+                                            cstatus == "actual"
+                                            and csource in _HERMES_ACTUAL_COST_SOURCES
+                                            and bmode not in _HERMES_INCLUDED_MODES
+                                        ):
+                                            actual_dec = _safe_nonneg_decimal(row["actual_cost_usd"])
+                                            if actual_dec is not None:
+                                                _add_billing_decimal(
+                                                    billing_acc, "hermes", b_day, "api_actual_usd", actual_dec
+                                                )
+                                        elif bmode == "subscription_included":
+                                            if (
+                                                inp + out + cr + cw + reason > 0
+                                                and pricing.resolve(model) is not None
+                                            ):
+                                                cand = pricing.estimate_cost(model, inp, out, cr, cw, reason)
+                                                cand_dec = _safe_nonneg_decimal(cand)
+                                                if cand_dec is not None:
+                                                    _add_billing_decimal(
+                                                        billing_acc,
+                                                        "hermes",
+                                                        b_day,
+                                                        "subscription_candidate_usd",
+                                                        cand_dec,
+                                                    )
+
+                            # 2) Legacy usage bucket (tokens & estimated cost)
+                            if fallback_ts is None or fallback_ts < cutoff_ts:
+                                continue
+                            if inp + out + cr + cw + reason <= 0:
+                                continue
+                            cost = _safe_float(row["actual_cost_usd"]) or _safe_float(row["estimated_cost_usd"])
+                            if cost <= 0:
+                                cost = pricing.estimate_cost(model, inp, out, cr, cw, reason)
+                            _acc_add(acc, "hermes", _ts_to_day(fallback_ts), model, inp, out, cr, cw, reason, cost, 1)
+                except sqlite3.Error:
+                    db_failed = True
+
+            # Fallback fine-grained usage tables for older Hermes schemas
+            if not used_detail_table and not db_failed:
+                for tbl in ("model_usage", "token_usage", "session_usage", "usage"):
+                    if tbl not in tables:
+                        continue
+                    try:
+                        cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()}
+                        if "input_tokens" not in cols and "output_tokens" not in cols:
+                            continue
+                        ts_col = (
+                            "last_seen"
+                            if "last_seen" in cols
+                            else ("first_seen" if "first_seen" in cols else ("created_at" if "created_at" in cols else None))
+                        )
+                        model_col = "model" if "model" in cols else "''"
+                        cr_col = "cache_read_tokens" if "cache_read_tokens" in cols else "0"
+                        cw_col = "cache_write_tokens" if "cache_write_tokens" in cols else "0"
+                        r_col = "reasoning_tokens" if "reasoning_tokens" in cols else "0"
+                        cost_col = (
+                            "actual_cost_usd"
+                            if "actual_cost_usd" in cols
+                            else ("estimated_cost_usd" if "estimated_cost_usd" in cols else "0")
+                        )
+                        q = (
+                            f'SELECT {model_col} AS model, input_tokens, output_tokens, {cr_col} AS cr, '
+                            f'{cw_col} AS cw, {r_col} AS r, {cost_col} AS cost_usd, '
+                            f'{ts_col if ts_col else "NULL"} AS ts FROM "{tbl}"'
+                        )
+                        rows = conn.execute(q).fetchall()
+                        for row in rows:
+                            ts = _parse_ts(row["ts"])
+                            if ts is None or ts < cutoff_ts:
+                                continue
+                            inp = _safe_int(row["input_tokens"])
+                            out = _safe_int(row["output_tokens"])
+                            cr = _safe_int(row["cr"])
+                            cw = _safe_int(row["cw"])
+                            reason = _safe_int(row["r"])
+                            if inp + out + cr + cw + reason <= 0:
+                                continue
+                            model = str(row["model"] or "hermes")
+                            cost = _safe_float(row["cost_usd"])
+                            if cost <= 0:
+                                cost = pricing.estimate_cost(model, inp, out, cr, cw, reason)
+                            _acc_add(acc, "hermes", _ts_to_day(ts), model, inp, out, cr, cw, reason, cost, 1)
+                        used_detail_table = True
+                        break
+                    except sqlite3.Error:
+                        db_failed = True
+                        break
+
+            if not used_detail_table and not db_failed and "sessions" in tables:
                 try:
                     cols = {r[1] for r in conn.execute('PRAGMA table_info("sessions")').fetchall()}
                     if "input_tokens" in cols or "output_tokens" in cols:
@@ -1020,8 +1356,16 @@ def collect_hermes_usage(
                         cr_col = "cache_read_tokens" if "cache_read_tokens" in cols else "0"
                         cw_col = "cache_write_tokens" if "cache_write_tokens" in cols else "0"
                         r_col = "reasoning_tokens" if "reasoning_tokens" in cols else "0"
-                        cost_col = "actual_cost_usd" if "actual_cost_usd" in cols else ("estimated_cost_usd" if "estimated_cost_usd" in cols else "0")
-                        q = f'SELECT {model_col} AS model, input_tokens, output_tokens, {cr_col} AS cr, {cw_col} AS cw, {r_col} AS r, {cost_col} AS cost_usd, COALESCE({ts_col}, started_at) AS ts FROM sessions'
+                        cost_col = (
+                            "actual_cost_usd"
+                            if "actual_cost_usd" in cols
+                            else ("estimated_cost_usd" if "estimated_cost_usd" in cols else "0")
+                        )
+                        q = (
+                            f"SELECT {model_col} AS model, input_tokens, output_tokens, {cr_col} AS cr, "
+                            f"{cw_col} AS cw, {r_col} AS r, {cost_col} AS cost_usd, "
+                            f"COALESCE({ts_col}, started_at) AS ts FROM sessions"
+                        )
                         for row in conn.execute(q).fetchall():
                             ts = _parse_ts(row["ts"])
                             if ts is None or ts < cutoff_ts:
@@ -1039,9 +1383,17 @@ def collect_hermes_usage(
                                 cost = pricing.estimate_cost(model, inp, out, cr, cw, reason)
                             _acc_add(acc, "hermes", _ts_to_day(ts), model, inp, out, cr, cw, reason, cost, 1)
                 except sqlite3.Error:
-                    pass
+                    db_failed = True
 
-            _merge_rows_into_result(result, _compact_rows(acc), cutoff_day)
+            if db_failed:
+                db_statuses.append("unavailable")
+            else:
+                db_statuses.append("complete")
+                _merge_rows_into_result(result, _compact_rows(acc), cutoff_day)
+
+    if dir_err > 0:
+        db_statuses.append("unavailable")
+    return combine_statuses(db_statuses)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,23 +1402,26 @@ def collect_hermes_usage(
 
 
 def collect_opencode_usage(
-    db_path: Path, cutoff_ts: float, cutoff_day: str, pricing: PricingTable, result: Dict[str, Any]
-) -> None:
-    if not db_path.is_file():
-        return
-    try:
-        if db_path.stat().st_mtime < cutoff_ts - 86400:
-            return
-    except OSError:
-        return
-    with sqlite_snapshot(db_path) as conn:
-        if conn is None:
-            return
+    db_path: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
+    with sqlite_snapshot_with_status(db_path) as (conn, snap_status):
+        if snap_status == "missing":
+            return resolve_missing_source_status("usage.opencode", prev_sources or {})
+        if snap_status != "ok" or conn is None:
+            return "unavailable"
         acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         try:
-            rows = conn.execute("SELECT time_created, data FROM message WHERE time_created >= ?", (int(cutoff_ts * 1000),)).fetchall()
+            rows = conn.execute(
+                "SELECT time_created, data FROM message WHERE time_created >= ?",
+                (int(cutoff_ts * 1000),),
+            ).fetchall()
         except sqlite3.Error:
-            return
+            return "unavailable"
         for row in rows:
             ts = _parse_ts(row["time_created"])
             if ts is None or ts < cutoff_ts:
@@ -1094,6 +1449,7 @@ def collect_opencode_usage(
                 cost = pricing.estimate_cost(model, inp, out, cr, cw, reason)
             _acc_add(acc, "opencode", _ts_to_day(ts), model, inp, out, cr, cw, reason, cost, 1)
         _merge_rows_into_result(result, _compact_rows(acc), cutoff_day)
+        return "complete"
 
 
 # ---------------------------------------------------------------------------
@@ -1101,75 +1457,127 @@ def collect_opencode_usage(
 # ---------------------------------------------------------------------------
 
 
+def _parse_gemini_file_checked(
+    path: Path, pricing: PricingTable
+) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+    for attempt in range(2):
+        try:
+            st_b = path.stat()
+            before = (st_b.st_dev, st_b.st_ino, st_b.st_size, st_b.st_mtime_ns, st_b.st_ctime_ns)
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+            st_a = path.stat()
+            after = (st_a.st_dev, st_a.st_ino, st_a.st_size, st_a.st_mtime_ns, st_a.st_ctime_ns)
+        except OSError:
+            return [], True, False, None
+        changed = before != after
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            if attempt == 0:
+                time.sleep(0.02)
+                continue
+            return [], True, changed, None
+        if changed:
+            if attempt == 0:
+                time.sleep(0.02)
+                continue
+            return [], True, True, None
+
+        acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        messages = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(messages, list):
+            return [], False, False, st_a
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            tok = msg.get("tokens")
+            if not isinstance(tok, dict):
+                continue
+            ts = _parse_ts(msg.get("timestamp"))
+            if ts is None:
+                continue
+            inp_total = _safe_int(tok.get("input"))
+            out = _safe_int(tok.get("output"))
+            cr = _safe_int(tok.get("cached"))
+            thoughts = _safe_int(tok.get("thoughts"))
+            if inp_total + out + cr + thoughts <= 0:
+                continue
+            non_cached_in = max(0, inp_total - cr)
+            model = str(msg.get("model") or "gemini")
+            cost = pricing.estimate_cost(
+                model,
+                input_tokens=non_cached_in,
+                output_tokens=out,
+                cache_read_tokens=cr,
+                cache_write_tokens=0,
+                reasoning_tokens=thoughts,
+            )
+            _acc_add(acc, "gemini", _ts_to_day(ts), model, non_cached_in, out, cr, 0, thoughts, cost, 1)
+        return _compact_rows(acc), False, False, st_a
+    return [], True, True, None
+
+
 def _parse_gemini_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
-    acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
-    except Exception:
-        return []
-    messages = data.get("messages") if isinstance(data, dict) else None
-    if not isinstance(messages, list):
-        return []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        tok = msg.get("tokens")
-        if not isinstance(tok, dict):
-            continue
-        ts = _parse_ts(msg.get("timestamp"))
-        if ts is None:
-            continue
-        inp_total = _safe_int(tok.get("input"))
-        out = _safe_int(tok.get("output"))
-        cr = _safe_int(tok.get("cached"))
-        thoughts = _safe_int(tok.get("thoughts"))
-        if inp_total + out + cr + thoughts <= 0:
-            continue
-        non_cached_in = max(0, inp_total - cr)
-        model = str(msg.get("model") or "gemini")
-        cost = pricing.estimate_cost(
-            model,
-            input_tokens=non_cached_in,
-            output_tokens=out,
-            cache_read_tokens=cr,
-            cache_write_tokens=0,
-            reasoning_tokens=thoughts,
-        )
-        _acc_add(acc, "gemini", _ts_to_day(ts), model, non_cached_in, out, cr, 0, thoughts, cost, 1)
-    return _compact_rows(acc)
+    rows, _, _, _ = _parse_gemini_file_checked(path, pricing)
+    return rows
 
 
 def collect_gemini_usage(
-    gemini_root: Path, cutoff_ts: float, cutoff_day: str, cache: UsageCache, pricing: PricingTable, result: Dict[str, Any]
-) -> None:
+    gemini_root: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    cache: UsageCache,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
     tmp_root = gemini_root / "tmp"
-    if not tmp_root.is_dir():
-        return
-    for path in tmp_root.rglob("session-*.json"):
+    can_scan, early = check_root_dir(tmp_root, "usage.gemini", prev_sources or {})
+    if not can_scan:
+        return early or "not_configured"
+
+    files, dir_err = _walk_matching_files(tmp_root, ".json", prefix="session-")
+    files_ok = 0
+    files_err = 0
+    for path in files:
         try:
             if path.stat().st_mtime < cutoff_ts - 86400:
+                files_ok += 1
                 continue
         except OSError:
+            files_err += 1
             continue
         rows = cache.get(path)
         if rows is None:
-            rows = _parse_gemini_file(path, pricing)
-            cache.put(path, rows)
+            rows, had_err, changed, st_res = _parse_gemini_file_checked(path, pricing)
+            if had_err or changed:
+                files_err += 1
+                continue
+            cache.put(path, rows, stat_result=st_res)
+        files_ok += 1
         _merge_rows_into_result(result, rows, cutoff_day)
+    return _summarize_file_scan_health(files_ok, files_err, dir_err)
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# 8. ZCode SQLite (WAL-safe snapshot)
 # ---------------------------------------------------------------------------
 
 
 def collect_zcode_usage(
-    db_path: Path, cutoff_ts: float, cutoff_day: str, pricing: PricingTable, result: Dict[str, Any]
-) -> None:
+    db_path: Path,
+    cutoff_ts: float,
+    cutoff_day: str,
+    pricing: PricingTable,
+    result: Dict[str, Any],
+    prev_sources: Optional[Dict[str, Any]] = None,
+) -> str:
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    with sqlite_snapshot(db_path) as conn:
-        if conn is None:
-            return
+    with sqlite_snapshot_with_status(db_path) as (conn, snap_status):
+        if snap_status == "missing":
+            return resolve_missing_source_status("usage.zcode", prev_sources or {})
+        if snap_status != "ok" or conn is None:
+            return "unavailable"
         try:
             rows = conn.execute(
                 """SELECT model_id, input_tokens, output_tokens, reasoning_tokens,
@@ -1187,13 +1595,27 @@ def collect_zcode_usage(
                     continue
                 model = str(model or "unknown")
                 _acc_add(
-                    acc, tool="zcode", day=_ts_to_day(stamp / 1000), model=model,
-                    inp=inp, out=out, cr=cr, cw=cw, thoughts=reason,
-                    cost_usd=pricing.estimate_cost(model, inp, out, cr, cw, reason), requests=1,
+                    acc,
+                    tool="zcode",
+                    day=_ts_to_day(stamp / 1000),
+                    model=model,
+                    inp=inp,
+                    out=out,
+                    cr=cr,
+                    cw=cw,
+                    thoughts=reason,
+                    cost_usd=pricing.estimate_cost(model, inp, out, cr, cw, reason),
+                    requests=1,
                 )
         except sqlite3.Error:
-            return
+            return "unavailable"
     _merge_rows_into_result(result, _compact_rows(acc), cutoff_day)
+    return "complete"
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 
 def collect_live_usage(
@@ -1204,14 +1626,28 @@ def collect_live_usage(
     now_ts: Optional[float] = None,
     pricing: Optional[PricingTable] = None,
     projects_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    source_statuses_out: Optional[Dict[str, str]] = None,
+    billing_out: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
+    billing_cutoff_day: Optional[str] = None,
+    prev_sources: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Scan local AI logs for the last `days` days and return {tool: {YYYY-MM-DD: bucket}}."""
     home_dir = home or Path.home()
     now = now_ts if now_ts is not None else time.time()
     now_dt = datetime.fromtimestamp(now, tz=BIZ_TZ)
-    cutoff_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=BIZ_TZ) - timedelta(days=days - 1)
+    today_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=BIZ_TZ)
+    cutoff_dt = today_dt - timedelta(days=days - 1)
     cutoff_ts = cutoff_dt.timestamp()
     cutoff_day = cutoff_dt.strftime("%Y-%m-%d")
+
+    # Extend file-mtime scan floor to month start when billing needs full current month
+    scan_cutoff_ts = cutoff_ts
+    if billing_cutoff_day:
+        try:
+            b_dt = datetime.strptime(billing_cutoff_day, "%Y-%m-%d").replace(tzinfo=BIZ_TZ)
+            scan_cutoff_ts = min(cutoff_ts, b_dt.timestamp())
+        except ValueError:
+            pass
 
     from ledger import resolve_data_dir
 
@@ -1221,17 +1657,100 @@ def collect_live_usage(
     cache = UsageCache(eff_cache_path, pricing_tbl.signature)
 
     result: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    billing_acc: Optional[Dict[str, Dict[str, Dict[str, Decimal]]]] = {} if billing_out is not None else None
+    statuses: Dict[str, str] = {}
 
-    collect_codex_usage(home_dir / ".codex" / "sessions", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
-    collect_workbuddy_usage(home_dir / ".workbuddy" / "projects", "workbuddy", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
-    collect_workbuddy_usage(home_dir / ".codebuddy" / "projects", "codebuddy", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
-    collect_claude_usage(home_dir / ".claude" / "projects", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
-    collect_pi_usage(home_dir / ".pi" / "agent" / "sessions", cutoff_ts, cutoff_day, cache, pricing_tbl, result, projects_out=projects_out)
-    collect_hermes_usage(home_dir / ".hermes", cutoff_ts, cutoff_day, pricing_tbl, result)
-    collect_opencode_usage(home_dir / ".local" / "share" / "opencode" / "opencode.db", cutoff_ts, cutoff_day, pricing_tbl, result)
-    collect_gemini_usage(home_dir / ".gemini", cutoff_ts, cutoff_day, cache, pricing_tbl, result)
-
-    collect_zcode_usage(home_dir / ".zcode" / "cli" / "db" / "db.sqlite", cutoff_ts, cutoff_day, pricing_tbl, result)
+    statuses["usage.codex"] = collect_codex_usage(
+        home_dir / ".codex" / "sessions",
+        scan_cutoff_ts,
+        cutoff_day,
+        cache,
+        pricing_tbl,
+        result,
+        projects_out=projects_out,
+        billing_acc=billing_acc,
+        billing_cutoff_day=billing_cutoff_day,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.workbuddy"] = collect_workbuddy_usage(
+        home_dir / ".workbuddy" / "projects",
+        "workbuddy",
+        cutoff_ts,
+        cutoff_day,
+        cache,
+        pricing_tbl,
+        result,
+        projects_out=projects_out,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.codebuddy"] = collect_workbuddy_usage(
+        home_dir / ".codebuddy" / "projects",
+        "codebuddy",
+        cutoff_ts,
+        cutoff_day,
+        cache,
+        pricing_tbl,
+        result,
+        projects_out=projects_out,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.claude_code"] = collect_claude_usage(
+        home_dir / ".claude" / "projects",
+        scan_cutoff_ts,
+        cutoff_day,
+        cache,
+        pricing_tbl,
+        result,
+        projects_out=projects_out,
+        billing_acc=billing_acc,
+        billing_cutoff_day=billing_cutoff_day,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.pi"] = collect_pi_usage(
+        home_dir / ".pi" / "agent" / "sessions",
+        cutoff_ts,
+        cutoff_day,
+        cache,
+        pricing_tbl,
+        result,
+        projects_out=projects_out,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.hermes"] = collect_hermes_usage(
+        home_dir / ".hermes",
+        cutoff_ts,
+        cutoff_day,
+        pricing_tbl,
+        result,
+        billing_acc=billing_acc,
+        billing_cutoff_day=billing_cutoff_day,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.opencode"] = collect_opencode_usage(
+        home_dir / ".local" / "share" / "opencode" / "opencode.db",
+        cutoff_ts,
+        cutoff_day,
+        pricing_tbl,
+        result,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.gemini"] = collect_gemini_usage(
+        home_dir / ".gemini",
+        cutoff_ts,
+        cutoff_day,
+        cache,
+        pricing_tbl,
+        result,
+        prev_sources=prev_sources,
+    )
+    statuses["usage.zcode"] = collect_zcode_usage(
+        home_dir / ".zcode" / "cli" / "db" / "db.sqlite",
+        cutoff_ts,
+        cutoff_day,
+        pricing_tbl,
+        result,
+        prev_sources=prev_sources,
+    )
 
     for tool_days in result.values():
         for bucket in tool_days.values():
@@ -1241,6 +1760,21 @@ def collect_live_usage(
                     sum(model[key] for key in ("in", "out", "cr", "cw", "thoughts")) if missing_price else 0
                 )
             bucket["unpriced_tokens"] = sum(model["unpriced_tokens"] for model in bucket["models"].values())
+
+    if source_statuses_out is not None:
+        source_statuses_out.update(statuses)
+
+    if billing_out is not None and billing_acc is not None:
+        for tool, day_map in billing_acc.items():
+            dst_tool = billing_out.setdefault(tool, {})
+            for day, vals in day_map.items():
+                entry: Dict[str, float] = {}
+                if "subscription_candidate_usd" in vals:
+                    entry["subscription_candidate_usd"] = round(float(vals["subscription_candidate_usd"]), 6)
+                if "api_actual_usd" in vals:
+                    entry["api_actual_usd"] = round(float(vals["api_actual_usd"]), 6)
+                if entry:
+                    dst_tool[day] = entry
 
     cache.save()
     return result

@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: - Main Snapshot (Schema v3, backward-compatible with v2)
+// MARK: - Main Snapshot (Schema v3, backward-compatible with v0.6 / v2)
 
 struct ClockSnapshot: Codable, Equatable {
     let schemaVersion: Int
@@ -13,6 +13,8 @@ struct ClockSnapshot: Codable, Equatable {
     let summary7d: Summary7D
     let days: [DayStats]
     let activeAgents: [ActiveAgent]
+    let sentinelTasks: [SentinelTask]?
+    let collection: CollectionSummary?
     let tokeiRef: TokeiRef
     let usage: UsagePayload?
     let elapsedMs: Double?
@@ -28,11 +30,227 @@ struct ClockSnapshot: Codable, Equatable {
         case summary7d = "summary_7d"
         case days
         case activeAgents = "active_agents"
+        case sentinelTasks = "sentinel_tasks"
+        case collection
         case tokeiRef = "tokei_ref"
         case usage
         case elapsedMs = "elapsed_ms"
     }
 }
+
+// MARK: - Collection Health (v0.7)
+
+enum CollectionHealthStatus: Codable, Equatable {
+    case complete
+    case partial
+    case unavailable
+    case notConfigured
+    case unknown(String)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "complete": self = .complete
+        case "partial": self = .partial
+        case "unavailable": self = .unavailable
+        case "not_configured": self = .notConfigured
+        default: self = .unknown(raw)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .complete: try container.encode("complete")
+        case .partial: try container.encode("partial")
+        case .unavailable: try container.encode("unavailable")
+        case .notConfigured: try container.encode("not_configured")
+        case .unknown(let raw): try container.encode(raw)
+        }
+    }
+
+    var isHealthy: Bool {
+        self == .complete || self == .notConfigured
+    }
+
+    var isDegraded: Bool {
+        self == .partial || self == .unavailable
+    }
+}
+
+struct CollectionHealth: Codable, Equatable {
+    let status: CollectionHealthStatus
+    let lastSuccessTs: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case lastSuccessTs = "last_success_ts"
+    }
+}
+
+struct CollectionSummary: Codable, Equatable {
+    let work: CollectionHealth
+    let usage: CollectionHealth
+    let projects: CollectionHealth
+    let sources: [String: CollectionHealth]
+}
+
+enum FastFreshness: String, Equatable {
+    case fresh
+    case degraded
+    case stale
+    case unavailable
+}
+
+// MARK: - Sentinel Tasks (v0.7)
+
+enum SentinelTaskState: Codable, Equatable {
+    case running
+    case waitingHuman
+    case justFinished
+    case unknown(String)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "running": self = .running
+        case "waiting_human": self = .waitingHuman
+        case "just_finished": self = .justFinished
+        default: self = .unknown(raw)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .running: try container.encode("running")
+        case .waitingHuman: try container.encode("waiting_human")
+        case .justFinished: try container.encode("just_finished")
+        case .unknown(let raw): try container.encode(raw)
+        }
+    }
+
+    var sortPriority: Int {
+        switch self {
+        case .waitingHuman: return 0
+        case .running: return 1
+        case .justFinished: return 2
+        case .unknown: return 3
+        }
+    }
+}
+
+enum SentinelEvidenceKind: Codable, Equatable {
+    case heartbeat
+    case explicitRunning
+    case explicitHumanRequest
+    case explicitSuccess
+    case unknown(String)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "heartbeat": self = .heartbeat
+        case "explicit_running": self = .explicitRunning
+        case "explicit_human_request": self = .explicitHumanRequest
+        case "explicit_success": self = .explicitSuccess
+        default: self = .unknown(raw)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .heartbeat: try container.encode("heartbeat")
+        case .explicitRunning: try container.encode("explicit_running")
+        case .explicitHumanRequest: try container.encode("explicit_human_request")
+        case .explicitSuccess: try container.encode("explicit_success")
+        case .unknown(let raw): try container.encode(raw)
+        }
+    }
+}
+
+enum SentinelWaitKind: Codable, Equatable {
+    case approval
+    case userInput
+    case secret
+    case other
+    case unknown(String)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "approval": self = .approval
+        case "user_input": self = .userInput
+        case "secret": self = .secret
+        case "other": self = .other
+        default: self = .unknown(raw)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .approval: try container.encode("approval")
+        case .userInput: try container.encode("user_input")
+        case .secret: try container.encode("secret")
+        case .other: try container.encode("other")
+        case .unknown(let raw): try container.encode(raw)
+        }
+    }
+}
+
+struct SentinelEvidence: Codable, Equatable {
+    let kind: SentinelEvidenceKind
+    let waitKind: SentinelWaitKind?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case waitKind = "wait_kind"
+    }
+}
+
+struct SentinelTask: Codable, Equatable, Identifiable {
+    let id: String
+    let sourceId: String
+    let tool: String
+    let displayName: String
+    let shortName: String
+    let color: String
+    let label: String
+    let state: SentinelTaskState
+    let startedAt: Double
+    let stateSinceTs: Double
+    let expiresAt: Double
+    let elapsedSeconds: Double
+    let projectPath: String?
+    let workspacePath: String?
+    let evidence: SentinelEvidence?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sourceId = "source_id"
+        case tool
+        case displayName = "display_name"
+        case shortName = "short_name"
+        case color
+        case label
+        case state
+        case startedAt = "started_at"
+        case stateSinceTs = "state_since_ts"
+        case expiresAt = "expires_at"
+        case elapsedSeconds = "elapsed_seconds"
+        case projectPath = "project_path"
+        case workspacePath = "workspace_path"
+        case evidence
+    }
+}
+
+// MARK: - Day & Guardrails Models
 
 struct Guardrails: Codable, Equatable {
     let mode: String?
@@ -47,6 +265,31 @@ struct Guardrails: Codable, Equatable {
         case maxTurnMinutes = "max_turn_minutes"
         case maxStepGapMinutes = "max_step_gap_minutes"
         case workdayHours = "workday_hours"
+    }
+}
+
+enum WorkDayStatus: Codable, Equatable {
+    case observed
+    case retained
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "observed": self = .observed
+        case "retained": self = .retained
+        default: self = .unknown
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .observed: try container.encode("observed")
+        case .retained: try container.encode("retained")
+        case .unknown: try container.encode("unknown")
+        }
     }
 }
 
@@ -65,9 +308,20 @@ struct DayStats: Codable, Equatable, Identifiable {
     let runs: Int
     let tools: [ToolBreakdown]
     let hourlySeconds: [Double]
+    let hourlyAvailable: Bool?
+    let workStatus: WorkDayStatus?
     let tokens: Int?
     let costUsd: Double?
+    let unpricedTokens: Int?
     let cacheHitRate: Double?
+
+    /// Returns true if 24-hour distribution has a trusted source (compatible with v0.6 native buckets).
+    var hasHourlyDistribution: Bool {
+        if let avail = hourlyAvailable {
+            return avail && hourlySeconds.count == 24
+        }
+        return hourlySeconds.count == 24
+    }
 
     enum CodingKeys: String, CodingKey {
         case date
@@ -83,8 +337,11 @@ struct DayStats: Codable, Equatable, Identifiable {
         case runs
         case tools
         case hourlySeconds = "hourly_seconds"
+        case hourlyAvailable = "hourly_available"
+        case workStatus = "work_status"
         case tokens
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
         case cacheHitRate = "cache_hit_rate"
     }
 }
@@ -101,6 +358,7 @@ struct ToolBreakdown: Codable, Equatable, Identifiable {
     let share: Double
     let tokens: Int?
     let costUsd: Double?
+    let unpricedTokens: Int?
 
     enum CodingKeys: String, CodingKey {
         case tool
@@ -113,11 +371,13 @@ struct ToolBreakdown: Codable, Equatable, Identifiable {
         case share
         case tokens
         case costUsd = "cost_usd"
+        case unpricedTokens = "unpriced_tokens"
     }
 }
 
 struct ActiveAgent: Codable, Equatable, Identifiable {
-    var id: String { "\(tool)-\(Int(startedAt))" }
+    var id: String { taskId ?? "\(tool)-\(Int(startedAt))" }
+    let taskId: String?
     let tool: String
     let displayName: String
     let shortName: String
@@ -127,6 +387,7 @@ struct ActiveAgent: Codable, Equatable, Identifiable {
     let label: String
 
     enum CodingKeys: String, CodingKey {
+        case taskId = "task_id"
         case tool
         case displayName = "display_name"
         case shortName = "short_name"
@@ -171,6 +432,7 @@ struct UsagePayload: Codable, Equatable {
     let history30d: [HistoryDayPoint]
     let heatmap: HeatmapPayload?
     let projects: [ProjectTrailItem]?
+    let projectTrails: [ProjectTrail]?
     let ledgerMeta: LedgerMeta
 
     enum CodingKeys: String, CodingKey {
@@ -179,6 +441,7 @@ struct UsagePayload: Codable, Equatable {
         case history30d = "history_30d"
         case heatmap
         case projects
+        case projectTrails = "project_trails"
         case ledgerMeta = "ledger_meta"
     }
 }
@@ -261,6 +524,16 @@ struct PeriodStats: Codable, Equatable {
     }
 }
 
+struct ToolBilling: Codable, Equatable {
+    let subscriptionCandidateUsd: Double?
+    let apiActualUsd: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case subscriptionCandidateUsd = "subscription_candidate_usd"
+        case apiActualUsd = "api_actual_usd"
+    }
+}
+
 struct UsageToolStats: Codable, Equatable, Identifiable {
     var id: String { tool }
     let tool: String
@@ -283,6 +556,7 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
     let runs: Int
     let shareTokens: Double
     let models: [ModelUsageStats]
+    let billing: ToolBilling?
 
     var effectiveCacheHitRate: Double {
         if let r = cacheHitRate { return r }
@@ -315,6 +589,7 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
         case runs
         case shareTokens = "share_tokens"
         case models
+        case billing
     }
 }
 
@@ -450,6 +725,8 @@ struct HeatmapDayTool: Codable, Equatable, Identifiable {
     }
 }
 
+// MARK: - Project Trail Models (Legacy + v0.7 Worktree-Merged Periods)
+
 struct ProjectTrailItem: Codable, Equatable, Identifiable {
     var id: String { path }
     let path: String
@@ -484,6 +761,114 @@ struct ProjectTrailItem: Codable, Equatable, Identifiable {
         case sessions
         case tools
     }
+}
+
+struct WorktreeSource: Codable, Equatable, Identifiable {
+    var id: String { path }
+    let path: String
+    let branch: String?
+}
+
+struct ProjectPeriodStats: Codable, Equatable {
+    let startDate: String
+    let endDate: String
+    let lastActiveDate: String
+    let agentSeconds: Double?
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let reasoningTokens: Int
+    let totalTokens: Int
+    let costUsd: Double
+    let cacheHitRate: Double
+    let sessions: Int
+    let tools: [ProjectToolBadge]
+    let worktreeSources: [WorktreeSource]
+
+    enum CodingKeys: String, CodingKey {
+        case startDate = "start_date"
+        case endDate = "end_date"
+        case lastActiveDate = "last_active_date"
+        case agentSeconds = "agent_seconds"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case reasoningTokens = "reasoning_tokens"
+        case totalTokens = "total_tokens"
+        case costUsd = "cost_usd"
+        case cacheHitRate = "cache_hit_rate"
+        case sessions
+        case tools
+        case worktreeSources = "worktree_sources"
+    }
+}
+
+struct ProjectTrail: Codable, Equatable, Identifiable {
+    var id: String { path }
+    let path: String
+    let name: String
+    let displayPath: String
+    let lastActiveDate: String
+    let group: String
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let reasoningTokens: Int
+    let totalTokens: Int
+    let costUsd: Double
+    let cacheHitRate: Double
+    let sessions: Int
+    let tools: [ProjectToolBadge]
+    let periods: [String: ProjectPeriodStats]
+
+    enum CodingKeys: String, CodingKey {
+        case path, name
+        case displayPath = "display_path"
+        case lastActiveDate = "last_active_date"
+        case group
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case reasoningTokens = "reasoning_tokens"
+        case totalTokens = "total_tokens"
+        case costUsd = "cost_usd"
+        case cacheHitRate = "cache_hit_rate"
+        case sessions
+        case tools
+        case periods
+    }
+}
+
+enum ProjectPeriodKey: String, CaseIterable, Identifiable, Codable {
+    case today
+    case week
+    case month
+    case all
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .today: return "今日"
+        case .week: return "本周"
+        case .month: return "本月"
+        case .all: return "全部"
+        }
+    }
+}
+
+struct ProjectTrailRow: Equatable, Identifiable {
+    var id: String { path }
+    let path: String
+    let name: String
+    let displayPath: String
+    let period: ProjectPeriodKey
+    let stats: ProjectPeriodStats
+    let isPinned: Bool
 }
 
 struct ProjectToolBadge: Codable, Equatable, Identifiable {
@@ -529,6 +914,7 @@ struct LedgerMeta: Codable, Equatable {
     let maxToolDays: Int
     let earliestDay: String
     let workHistoryFrom: String?
+    let projectWorkHistoryFrom: String?
     let skippedInvalidDays: Int?
 
     enum CodingKeys: String, CodingKey {
@@ -538,11 +924,24 @@ struct LedgerMeta: Codable, Equatable {
         case maxToolDays = "max_tool_days"
         case earliestDay = "earliest_day"
         case workHistoryFrom = "work_history_from"
+        case projectWorkHistoryFrom = "project_work_history_from"
         case skippedInvalidDays = "skipped_invalid_days"
     }
 }
 
-// MARK: - Slow-Track Quota Models
+// MARK: - Subscription Payback Row (v0.7)
+
+struct SubscriptionRow: Equatable, Identifiable {
+    var id: String { tool }
+    let tool: String
+    let displayName: String
+    let monthlyFeeCents: Int?
+    let subscriptionValueUsd: Decimal?
+    let paybackMultiple: Decimal?
+    let apiActualUsd: Decimal?
+}
+
+// MARK: - Slow-Track Quota Models (v1 + v0.7 Freshness & Pace)
 
 struct QuotaSnapshot: Codable, Equatable {
     let schemaVersion: Int
@@ -578,6 +977,105 @@ struct QuotaProvider: Codable, Equatable, Identifiable {
     }
 }
 
+enum QuotaPaceLevel: Codable, Equatable {
+    case onTrack
+    case watch
+    case risk
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "on_track": self = .onTrack
+        case "watch": self = .watch
+        case "risk": self = .risk
+        default: self = .unknown
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .onTrack: try container.encode("on_track")
+        case .watch: try container.encode("watch")
+        case .risk: try container.encode("risk")
+        case .unknown: try container.encode("unknown")
+        }
+    }
+}
+
+enum QuotaPaceReason: Codable, Equatable {
+    case stale
+    case missingReset
+    case unverifiedScope
+    case insufficientSamples
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        switch raw {
+        case "stale": self = .stale
+        case "missing_reset": self = .missingReset
+        case "unverified_scope": self = .unverifiedScope
+        case "insufficient_samples": self = .insufficientSamples
+        default: self = .unknown
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .stale: try container.encode("stale")
+        case .missingReset: try container.encode("missing_reset")
+        case .unverifiedScope: try container.encode("unverified_scope")
+        case .insufficientSamples: try container.encode("insufficient_samples")
+        case .unknown: try container.encode("unknown")
+        }
+    }
+}
+
+struct QuotaPace: Codable, Equatable {
+    let level: QuotaPaceLevel
+    let reason: QuotaPaceReason?
+    let sampleCount: Int
+    let ratePctPerHour: Double?
+    let projectedUsedPercent: Double?
+    let estimatedExhaustionTs: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case level
+        case reason
+        case sampleCount = "sample_count"
+        case ratePctPerHour = "rate_pct_per_hour"
+        case projectedUsedPercent = "projected_used_percent"
+        case estimatedExhaustionTs = "estimated_exhaustion_ts"
+    }
+
+    var summaryText: String {
+        switch level {
+        case .onTrack:
+            if let rate = ratePctPerHour, rate == 0 {
+                return "近期读数持平，配速平稳"
+            }
+            return "照近期配速，重置前额度充裕"
+        case .watch:
+            return "照近期配速，重置前将接近上限"
+        case .risk:
+            return "照近期配速，可能在重置前用尽"
+        case .unknown:
+            switch reason {
+            case .stale: return "读数已过期，暂无法预测配速"
+            case .missingReset: return "缺少重置时间，暂无法预测配速"
+            case .unverifiedScope: return "当前账号范围未核对，暂不预测配速"
+            case .insufficientSamples: return "同一额度周期样本不足"
+            case .unknown, .none: return "暂无配速预测"
+            }
+        }
+    }
+}
+
 struct QuotaWindow: Codable, Equatable, Identifiable {
     let id: String
     let label: String
@@ -586,6 +1084,8 @@ struct QuotaWindow: Codable, Equatable, Identifiable {
     let remainingPercent: Double
     let resetsAt: Int?
     let windowMinutes: Int?
+    let freshUntilTs: Double?
+    let pace: QuotaPace?
 
     enum CodingKeys: String, CodingKey {
         case id, label
@@ -594,6 +1094,8 @@ struct QuotaWindow: Codable, Equatable, Identifiable {
         case remainingPercent = "remaining_percent"
         case resetsAt = "resets_at"
         case windowMinutes = "window_minutes"
+        case freshUntilTs = "fresh_until_ts"
+        case pace
     }
 }
 
@@ -657,6 +1159,13 @@ enum UsagePeriodKey: String, CaseIterable, Identifiable {
         case .month: return "本月"
         case .year: return "今年"
         case .all: return "全部"
+        }
+    }
+
+    var cliArgument: String {
+        switch self {
+        case .lastWeek: return "last_week"
+        default: return rawValue
         }
     }
 }
@@ -786,7 +1295,18 @@ enum Formatters {
         return String(format: "$%.2f", amount)
     }
 
-    static func estimatedUSD(_ amount: Double, unpricedTokens: Int) -> String {
+    static func usd(_ decimal: Decimal) -> String {
+        let val = NSDecimalNumber(decimal: decimal).doubleValue
+        return String(format: "$%.2f", val)
+    }
+
+    static func paybackMultiple(_ decimal: Decimal) -> String {
+        let val = NSDecimalNumber(decimal: decimal).doubleValue
+        return String(format: "%.2f×", val)
+    }
+
+    static func estimatedUSD(_ amount: Double, unpricedTokens: Int, hasObservation: Bool = true) -> String {
+        guard hasObservation else { return "—" }
         guard unpricedTokens > 0 else { return usd(amount) }
         return amount > 0 ? "\(usd(amount))+" : "未计价"
     }

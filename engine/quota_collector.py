@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""AgentPulse — Independent slow-track subscription quota collector.
+"""AgentPulse — Independent slow-track subscription quota collector (v0.7).
 
 Runs on its own 300s cadence (or manual trigger), completely decoupled from the
 15s local work-hours/token fast track. Never raises uncaught exceptions; any
 unreachable provider degrades gracefully to its last cached reading.
+
+v0.7 additions:
+- `fresh_until_ts` on each window (Codex 360s, Claude 3600s, capped at resets_at).
+- `pace` estimation (`on_track | watch | risk | unknown`) persisted under
+  `quota_cache.json._pace_v1` with 5-minute bucket dedup and strict scope checks.
+- `highest_window` selected strictly from currently fresh windows with deterministic
+  `(provider_id, window_id)` tie-breaking.
 
 Zero external dependencies (Python 3.9+ stdlib only).
 """
@@ -41,7 +48,15 @@ BIZ_TZ = timezone(timedelta(hours=8))
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_QUOTA_TTL = 240.0
 CODEX_FAILURE_BACKOFF = 300.0
+CODEX_DISPLAY_TTL = 360.0
+CLAUDE_DISPLAY_TTL = 3600.0
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+PACE_WINDOW_SECONDS = 6 * 3600
+PACE_BUCKET_SECONDS = 300
+PACE_MIN_SAMPLES = 3
+PACE_MIN_SPAN_SECONDS = 1800
+PACE_MAX_SAMPLES = 96
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -64,6 +79,8 @@ def _iso_to_epoch(val: Any) -> Optional[int]:
         return None
     if isinstance(val, (int, float)):
         v = float(val)
+        if not math.isfinite(v) or v <= 0:
+            return None
         return int(v / 1000.0) if v > 1e11 else int(v)
     if isinstance(val, str):
         s = val.strip()
@@ -225,8 +242,14 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
     }
 
 
-def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool = False,
-                      allow_live: bool = False) -> Dict[str, Any]:
+def probe_codex_quota(
+    home: Path,
+    cache: Dict[str, Any],
+    now: float,
+    force: bool = False,
+    allow_live: bool = False,
+    account_scope_out: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
     if allow_live and _codex_is_custom_provider(home):
         return {
             "id": "codex",
@@ -250,6 +273,8 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
         and cached.get("limits")
         and (now - float(cached.get("fetched_at") or 0)) < CODEX_QUOTA_TTL
     ):
+        if account_scope_out is not None and account_key:
+            account_scope_out["codex"] = account_key
         return _format_codex_provider(
             cached["limits"], cached.get("plan"), float(cached["fetched_at"]), "ok", "已实时同步"
         )
@@ -261,7 +286,7 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
         try:
             req = urllib.request.Request(CODEX_USAGE_URL)
             req.add_header("Accept", "application/json")
-            req.add_header("User-Agent", "AgentPulse/0.6")
+            req.add_header("User-Agent", "AgentPulse/0.7")
             req.add_unredirected_header("Authorization", f"Bearer {auth_ctx['access_token']}")
             if auth_ctx.get("account_id"):
                 req.add_unredirected_header("ChatGPT-Account-Id", auth_ctx["account_id"])
@@ -286,6 +311,8 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
                     "plan": data.get("plan_type"),
                     "source": "live",
                 }
+                if account_scope_out is not None and account_key:
+                    account_scope_out["codex"] = account_key
                 return _format_codex_provider(limits, data.get("plan_type"), now, "ok", "实时探测")
             raise ValueError("missing Codex quota windows")
         except Exception:
@@ -324,13 +351,11 @@ def probe_codex_quota(home: Path, cache: Dict[str, Any], now: float, force: bool
 
 
 def _zstd_decompress(data: bytes) -> Optional[bytes]:
-    # 1. Try python zstandard if installed
     try:
         import zstandard  # type: ignore
         return zstandard.ZstdDecompressor().decompress(data, max_output_size=len(data) * 20)
     except Exception:
         pass
-    # 2. Try zstd CLI if available (e.g. Homebrew)
     zstd_bin = shutil.which("zstd") or (
         "/opt/homebrew/bin/zstd" if os.path.isfile("/opt/homebrew/bin/zstd") else None
     )
@@ -347,7 +372,6 @@ def _zstd_decompress(data: bytes) -> Optional[bytes]:
                 return proc.stdout
         except Exception:
             pass
-    # 3. Try libzstd via ctypes
     for lib_name in (ctypes.util.find_library("zstd"), "/opt/homebrew/lib/libzstd.dylib", "/usr/local/lib/libzstd.dylib"):
         if not lib_name:
             continue
@@ -477,7 +501,7 @@ def probe_claude_quota(home: Path, cache: Dict[str, Any], now: float) -> Dict[st
 
     if windows:
         updated = int(snap.get("updated") or now)
-        is_fresh = (now - updated) < 3600
+        is_fresh = (now - updated) < CLAUDE_DISPLAY_TTL
         return {
             "id": "claude",
             "name": "Claude",
@@ -624,6 +648,231 @@ def probe_grok_quota(cache: Dict[str, Any], now: float) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 4. Freshness & Pace Engine (v0.7)
+# ---------------------------------------------------------------------------
+
+
+def _window_fresh_until(provider: Dict[str, Any], window: Dict[str, Any], now: float) -> Optional[float]:
+    if provider.get("status") != "ok":
+        return None
+    fetched_at = provider.get("fetched_at")
+    if not isinstance(fetched_at, (int, float)) or not math.isfinite(float(fetched_at)) or float(fetched_at) <= 0:
+        return None
+    used = window.get("used_percent")
+    if not isinstance(used, (int, float)) or not math.isfinite(float(used)) or not (0.0 <= float(used) <= 100.0):
+        return None
+
+    pid = provider.get("id")
+    if pid == "codex":
+        ttl = CODEX_DISPLAY_TTL
+    elif pid == "claude":
+        ttl = CLAUDE_DISPLAY_TTL
+    else:
+        return None
+
+    limit = float(fetched_at) + ttl
+    resets_at = window.get("resets_at")
+    if resets_at is not None:
+        if not isinstance(resets_at, (int, float)) or not math.isfinite(float(resets_at)):
+            return None
+        if float(resets_at) <= now:
+            return None
+        limit = min(limit, float(resets_at))
+
+    if now >= limit:
+        return None
+    return round(limit, 3)
+
+
+def _load_pace_series(cache: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pace_root = cache.get("_pace_v1")
+    if not isinstance(pace_root, dict):
+        return []
+    raw_series = pace_root.get("series")
+    if not isinstance(raw_series, list):
+        return []
+    clean: List[Dict[str, Any]] = []
+    for item in raw_series:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("provider_id")
+        wid = item.get("window_id")
+        scope = item.get("account_scope")
+        resets_at = item.get("resets_at")
+        samples = item.get("samples")
+        if (
+            isinstance(pid, str)
+            and isinstance(wid, str)
+            and isinstance(scope, str)
+            and scope
+            and isinstance(resets_at, (int, float))
+            and isinstance(samples, list)
+        ):
+            valid_samples: List[Dict[str, Any]] = []
+            for s in samples:
+                if not isinstance(s, dict):
+                    continue
+                oat = s.get("observed_at")
+                up = s.get("used_percent")
+                if (
+                    isinstance(oat, (int, float))
+                    and isinstance(up, (int, float))
+                    and math.isfinite(float(oat))
+                    and math.isfinite(float(up))
+                    and 0.0 <= float(up) <= 100.0
+                ):
+                    valid_samples.append({"observed_at": int(oat), "used_percent": float(up)})
+            clean.append(
+                {
+                    "provider_id": pid,
+                    "window_id": wid,
+                    "account_scope": scope,
+                    "resets_at": int(resets_at),
+                    "samples": valid_samples,
+                }
+            )
+    return clean
+
+
+def _normalize_samples(samples: List[Dict[str, Any]], current_observed_at: int) -> List[Dict[str, Any]]:
+    floor_ts = current_observed_at - PACE_WINDOW_SECONDS
+    recent = [s for s in samples if s["observed_at"] >= floor_ts]
+    recent.sort(key=lambda s: s["observed_at"])
+
+    # Keep the latest real observation inside each 5-minute bucket
+    by_bucket: Dict[int, Dict[str, Any]] = {}
+    for s in recent:
+        b = s["observed_at"] // PACE_BUCKET_SECONDS
+        prev = by_bucket.get(b)
+        if prev is None or s["observed_at"] >= prev["observed_at"]:
+            by_bucket[b] = s
+
+    deduped = sorted(by_bucket.values(), key=lambda s: s["observed_at"])
+    return deduped[-PACE_MAX_SAMPLES:]
+
+
+def _compute_pace_for_window(
+    series_list: List[Dict[str, Any]],
+    provider: Dict[str, Any],
+    window: Dict[str, Any],
+    account_scope: Optional[str],
+    now: float,
+) -> Dict[str, Any]:
+    fresh_until = window.get("fresh_until_ts")
+    is_fresh = isinstance(fresh_until, (int, float)) and now < float(fresh_until)
+    if not is_fresh:
+        return {"level": "unknown", "reason": "stale", "sample_count": 0}
+
+    resets_at = window.get("resets_at")
+    if not isinstance(resets_at, (int, float)) or not math.isfinite(float(resets_at)) or float(resets_at) <= now:
+        return {"level": "unknown", "reason": "missing_reset", "sample_count": 0}
+    resets_int = int(resets_at)
+
+    if not account_scope:
+        return {"level": "unknown", "reason": "unverified_scope", "sample_count": 0}
+
+    pid = str(provider["id"])
+    wid = str(window["id"])
+    observed_at = int(provider["fetched_at"])
+    used = float(window["used_percent"])
+
+    # Remove rotated-window or switched-account series for this (provider_id, window_id)
+    matched: Optional[Dict[str, Any]] = None
+    kept: List[Dict[str, Any]] = []
+    for item in series_list:
+        if item["provider_id"] == pid and item["window_id"] == wid:
+            if item["account_scope"] == account_scope and item["resets_at"] == resets_int:
+                matched = item
+                kept.append(item)
+            # Else drop superseded window/account series
+        else:
+            kept.append(item)
+    series_list[:] = kept
+
+    if matched is None:
+        matched = {
+            "provider_id": pid,
+            "window_id": wid,
+            "account_scope": account_scope,
+            "resets_at": resets_int,
+            "samples": [],
+        }
+        series_list.append(matched)
+
+    samples = sorted(matched["samples"], key=lambda s: s["observed_at"])
+    if samples:
+        last = samples[-1]
+        if observed_at == last["observed_at"]:
+            # Same cache hit: do not add duplicate sample
+            pass
+        elif observed_at < last["observed_at"] or used < float(last["used_percent"]):
+            # Time rollback or usage drop: restart accumulation cleanly
+            samples = [{"observed_at": observed_at, "used_percent": used}]
+        else:
+            samples.append({"observed_at": observed_at, "used_percent": used})
+    else:
+        samples = [{"observed_at": observed_at, "used_percent": used}]
+
+    samples = _normalize_samples(samples, observed_at)
+    matched["samples"] = samples
+
+    if (
+        len(samples) < PACE_MIN_SAMPLES
+        or samples[-1]["observed_at"] != observed_at
+        or (samples[-1]["observed_at"] - samples[0]["observed_at"]) < PACE_MIN_SPAN_SECONDS
+    ):
+        return {
+            "level": "unknown",
+            "reason": "insufficient_samples",
+            "sample_count": len(samples),
+        }
+
+    first = samples[0]
+    last = samples[-1]
+    span_hours = (last["observed_at"] - first["observed_at"]) / 3600.0
+    rate = (float(last["used_percent"]) - float(first["used_percent"])) / span_hours
+    remaining_hours = max(0.0, (float(resets_int) - now) / 3600.0)
+    projected = used + rate * remaining_hours
+
+    if projected < 85.0:
+        level = "on_track"
+    elif projected < 100.0:
+        level = "watch"
+    else:
+        level = "risk"
+
+    exhaustion_ts: Optional[float] = None
+    if rate > 0.0:
+        ex_ts = now + ((100.0 - used) / rate) * 3600.0
+        if ex_ts <= float(resets_int):
+            exhaustion_ts = round(ex_ts, 1)
+
+    pace_obj: Dict[str, Any] = {
+        "level": level,
+        "sample_count": len(samples),
+        "rate_pct_per_hour": round(rate, 2),
+        "projected_used_percent": round(projected, 1),
+    }
+    if exhaustion_ts is not None:
+        pace_obj["estimated_exhaustion_ts"] = exhaustion_ts
+    return pace_obj
+
+
+def _prune_pace_series(series_list: List[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
+    floor_ts = int(now) - PACE_WINDOW_SECONDS
+    out: List[Dict[str, Any]] = []
+    for item in series_list:
+        if item["resets_at"] <= now:
+            continue
+        samples = [s for s in item["samples"] if s["observed_at"] >= floor_ts]
+        if not samples:
+            continue
+        item["samples"] = samples[-PACE_MAX_SAMPLES:]
+        out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -637,32 +886,71 @@ def collect_quotas(
     home_dir = home or Path.home()
     now = now_ts if now_ts is not None else time.time()
     cache_path = resolve_data_dir(home_dir, create=True) / "quota_cache.json"
+    account_scopes: Dict[str, Optional[str]] = {}
+
     with state_lock(cache_path):
         cache = _load_json(cache_path)
+        series_list = _load_pace_series(cache)
         providers: List[Dict[str, Any]] = [
-            probe_codex_quota(home_dir, cache, now, force=force, allow_live=allow_live),
+            probe_codex_quota(
+                home_dir,
+                cache,
+                now,
+                force=force,
+                allow_live=allow_live,
+                account_scope_out=account_scopes,
+            ),
             probe_claude_quota(home_dir, cache, now),
             probe_antigravity_quota(cache, now),
             probe_kimi_quota(cache),
             probe_grok_quota(cache, now),
         ]
+
+        # Annotate every window with fresh_until_ts and pace
+        for p in providers:
+            scope = account_scopes.get(p["id"])
+            for w in p.get("windows") or []:
+                fresh_until = _window_fresh_until(p, w, now)
+                if fresh_until is not None:
+                    w["fresh_until_ts"] = fresh_until
+                w["pace"] = _compute_pace_for_window(series_list, p, w, scope, now)
+
+        pruned_series = _prune_pace_series(series_list, now)
+        if pruned_series:
+            cache["_pace_v1"] = {"series": pruned_series}
+        elif "_pace_v1" in cache:
+            cache["_pace_v1"] = {"series": []}
+
         write_json(cache_path, cache)
 
-    # Extract top alert window (highest used_percent across current providers)
-    highest_win: Optional[Dict[str, Any]] = None
+    # Extract top alert window strictly from currently fresh windows; tie-break by (provider_id, window_id)
+    fresh_candidates: List[Tuple[float, str, str, Dict[str, Any]]] = []
     for p in providers:
-        if p["status"] != "ok":
+        if p.get("status") != "ok":
             continue
         for w in p.get("windows") or []:
-            if highest_win is None or w["used_percent"] > highest_win["used_percent"]:
-                highest_win = {
-                    "provider_id": p["id"],
-                    "provider_name": p["name"],
-                    "label": w["label"],
-                    "short_label": w["short_label"],
-                    "used_percent": w["used_percent"],
-                    "resets_at": w.get("resets_at"),
-                }
+            fu = w.get("fresh_until_ts")
+            if isinstance(fu, (int, float)) and now < float(fu):
+                fresh_candidates.append(
+                    (
+                        -float(w["used_percent"]),
+                        str(p["id"]),
+                        str(w["id"]),
+                        {
+                            "provider_id": p["id"],
+                            "provider_name": p["name"],
+                            "label": w["label"],
+                            "short_label": w["short_label"],
+                            "used_percent": w["used_percent"],
+                            "resets_at": w.get("resets_at"),
+                        },
+                    )
+                )
+
+    highest_win: Optional[Dict[str, Any]] = None
+    if fresh_candidates:
+        fresh_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        highest_win = fresh_candidates[0][3]
 
     return {
         "schema_version": 1,
@@ -681,12 +969,21 @@ def main() -> int:
     parser.add_argument("--live-codex", action="store_true", help="Allow a Codex quota request using local credentials")
     parser.add_argument("--claude-statusline", action="store_true", help="Read quota windows from Claude Code status line JSON on stdin")
     args = parser.parse_args()
+    env_now = os.environ.get("AGENTPULSE_NOW_TS")
+    forced_now: Optional[float] = None
+    if env_now:
+        try:
+            v = float(env_now)
+            if math.isfinite(v) and v > 0:
+                forced_now = v
+        except ValueError:
+            pass
     if args.claude_statusline:
-        capture_claude_statusline(Path.home(), json.load(sys.stdin), time.time())
+        capture_claude_statusline(Path.home(), json.load(sys.stdin), forced_now if forced_now is not None else time.time())
         return 0
 
     try:
-        payload = collect_quotas(force=args.force, allow_live=args.live_codex)
+        payload = collect_quotas(force=args.force, now_ts=forced_now, allow_live=args.live_codex)
     except (OSError, ValueError, OverflowError, TypeError):
         print("无法刷新额度，请检查本地额度文件与数据目录。", file=sys.stderr)
         return 1

@@ -63,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.image = makeStatusSymbol(active: false)
+            button.image = makeStatusSymbol(active: false, waiting: false, stale: false)
             button.imagePosition = .imageLeading
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 12.0, weight: .medium)
             button.title = " --"
@@ -110,8 +110,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func makeStatusSymbol(active: Bool) -> NSImage? {
-        let name = active ? "bolt.circle.fill" : "clock"
+    private func makeStatusSymbol(active: Bool, waiting: Bool, stale: Bool) -> NSImage? {
+        let name: String
+        if stale {
+            name = "clock.badge.exclamationmark"
+        } else if waiting {
+            name = "exclamationmark.circle.fill"
+        } else if active {
+            name = "bolt.circle.fill"
+        } else {
+            name = "clock"
+        }
         let cfg = NSImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)
         let img = NSImage(systemSymbolName: name, accessibilityDescription: "AgentPulse")?
             .withSymbolConfiguration(cfg)
@@ -119,30 +128,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return img
     }
 
-    private func updateStatusItemTitle() {
-        guard let button = statusItem?.button else { return }
-        guard let snap = store.snapshot else {
-            button.image = makeStatusSymbol(active: false)
-            button.title = " --"
-            return
-        }
-        let activeCount = snap.activeAgents.count
+    /// Pure formatter exposed for unit testing menu bar status presentation.
+    static func formatStatusBarTitle(for store: ClockStore) -> String {
+        guard store.snapshot != nil else { return " --" }
+        let freshness = store.fastFreshness
+        let runningCount = store.todayRunningCount
+        let waitingCount = store.sentinelTasks.filter { $0.state == .waitingHuman }.count
         let hrsStr = Formatters.menuBarHours(store.todayLiveSeconds)
-        button.image = makeStatusSymbol(active: activeCount > 0)
 
         var segments: [String] = []
-        if activeCount > 0 {
-            segments.append("\(hrsStr) · \(activeCount)")
+        if freshness == .stale || freshness == .unavailable {
+            segments.append("\(hrsStr) · 离线")
+        } else if waitingCount > 0 && runningCount > 0 {
+            segments.append("\(hrsStr) · 待拍板 \(waitingCount) / \(runningCount)")
+        } else if waitingCount > 0 {
+            segments.append("\(hrsStr) · 待拍板 \(waitingCount)")
+        } else if runningCount > 0 {
+            segments.append("\(hrsStr) · \(runningCount)")
         } else {
             segments.append(hrsStr)
         }
-        if store.menuBarShowCost && (store.todayCostUsd > 0 || store.todayTokens > 0) {
-            segments.append(Formatters.usd(store.todayCostUsd))
+
+        if store.menuBarShowCost && store.todayHasCostObservation {
+            segments.append(
+                Formatters.estimatedUSD(
+                    store.todayCostUsd,
+                    unpricedTokens: store.todayUnpricedTokens,
+                    hasObservation: true
+                )
+            )
         }
         if let quotaBadge = store.menuBarQuotaSummary {
             segments.append(quotaBadge)
         }
-        button.title = " " + segments.joined(separator: " | ")
+        return " " + segments.joined(separator: " | ")
+    }
+
+    private func updateStatusItemTitle() {
+        guard let button = statusItem?.button else { return }
+        guard store.snapshot != nil else {
+            button.image = makeStatusSymbol(active: false, waiting: false, stale: false)
+            button.title = " --"
+            return
+        }
+        let freshness = store.fastFreshness
+        let runningCount = store.todayRunningCount
+        let waitingCount = store.sentinelTasks.filter { $0.state == .waitingHuman }.count
+        button.image = makeStatusSymbol(
+            active: runningCount > 0,
+            waiting: waitingCount > 0,
+            stale: freshness == .stale || freshness == .unavailable
+        )
+        button.title = Self.formatStatusBarTitle(for: store)
     }
 
     // MARK: - NSMenuDelegate (Right-Click Quick Menu)
@@ -150,21 +187,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        if let snap = store.snapshot {
+        if store.snapshot != nil {
+            let costStr = Formatters.estimatedUSD(
+                store.todayCostUsd,
+                unpricedTokens: store.todayUnpricedTokens,
+                hasObservation: store.todayHasCostObservation
+            )
             let summary = NSMenuItem(
-                title: String(format: "今日 %.2fh（%.2f 员工日 · %@ · %@）",
-                              store.todayLiveSeconds / 3600.0,
-                              store.todayLiveSeconds / (8.0 * 3600.0),
-                              Formatters.compactTokens(store.todayTokens),
-                              Formatters.usd(store.todayCostUsd)),
+                title: String(
+                    format: "今日 %.2fh（%.2f 员工日 · %@ · %@）",
+                    store.todayLiveSeconds / 3600.0,
+                    store.todayLiveSeconds / (8.0 * 3600.0),
+                    Formatters.compactTokens(store.todayTokens),
+                    costStr
+                ),
                 action: nil,
                 keyEquivalent: ""
             )
             summary.isEnabled = false
             menu.addItem(summary)
 
-            if !snap.activeAgents.isEmpty {
-                let names = snap.activeAgents.map(\.shortName).joined(separator: "、")
+            let freshness = store.fastFreshness
+            if freshness == .stale || freshness == .unavailable {
+                let staleItem = NSMenuItem(
+                    title: "数据已暂停实时更新（最近成功 \(store.lastUpdatedTimeString)）",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                staleItem.isEnabled = false
+                menu.addItem(staleItem)
+            } else if freshness == .degraded {
+                let degItem = NSMenuItem(
+                    title: "部分数据源暂不可用（最近成功 \(store.lastUpdatedTimeString)）",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                degItem.isEnabled = false
+                menu.addItem(degItem)
+            }
+
+            let tasks = store.sentinelTasks
+            let waiting = tasks.filter { $0.state == .waitingHuman }
+            let running = tasks.filter { $0.state == .running }
+            if !waiting.isEmpty {
+                let names = waiting.map(\.shortName).joined(separator: "、")
+                let waitItem = NSMenuItem(title: "待拍板：\(names)", action: nil, keyEquivalent: "")
+                waitItem.isEnabled = false
+                menu.addItem(waitItem)
+            }
+            if !running.isEmpty {
+                let names = running.map(\.shortName).joined(separator: "、")
                 let liveItem = NSMenuItem(title: "在岗中：\(names)", action: nil, keyEquivalent: "")
                 liveItem.isEnabled = false
                 menu.addItem(liveItem)

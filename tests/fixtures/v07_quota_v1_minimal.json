@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-27T15:00:00+08:00",
+  "generated_ts": 1795762800.0,
+  "providers": [
+    {
+      "id": "codex",
+      "name": "Codex",
+      "color": "#10B981",
+      "plan": "Pro",
+      "status": "ok",
+      "status_text": "已实时同步",
+      "fetched_at": 1795762800,
+      "windows": [
+        {
+          "id": "codex_5h",
+          "label": "5 小时窗口",
+          "short_label": "C5",
+          "used_percent": 70.0,
+          "remaining_percent": 30.0,
+          "resets_at": 1795766400,
+          "window_minutes": 300,
+          "fresh_until_ts": 1795763160.0,
+          "pace": {
+            "level": "watch",
+            "sample_count": 3,
+            "rate_pct_per_hour": 20.0,
+            "projected_used_percent": 90.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "claude",
+      "name": "Claude",
+      "color": "#FB923C",
+      "plan": "Pro / Max",
+      "status": "ok",
+      "status_text": "桌面端缓存",
+      "fetched_at": 1795762600,
+      "windows": [
+        {
+          "id": "claude_7d",
+          "label": "7 天周额度",
+          "short_label": "CL7",
+          "used_percent": 35.0,
+          "remaining_percent": 65.0,
+          "resets_at": 1795849200,
+          "window_minutes": 10080,
+          "fresh_until_ts": 1795766200.0,
+          "pace": {
+            "level": "unknown",
+            "reason": "unverified_scope",
+            "sample_count": 0
+          }
+        }
+      ]
+    }
+  ],
+  "highest_window": {
+    "provider_id": "codex",
+    "provider_name": "Codex",
+    "label": "5 小时窗口",
+    "short_label": "C5",
+    "used_percent": 70.0,
+    "resets_at": 1795766400
+  }
+}

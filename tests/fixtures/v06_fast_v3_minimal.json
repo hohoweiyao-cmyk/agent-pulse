@@ -1,0 +1,107 @@
+{
+  "schema_version": 3,
+  "generated_at": "2026-11-27T15:00:00+08:00",
+  "generated_ts": 1795762800.0,
+  "timezone": "Asia/Shanghai",
+  "guardrails": {
+    "mode": "step_heartbeat",
+    "heartbeat_gap_minutes": 5,
+    "workday_hours": 8,
+    "max_turn_minutes": 0,
+    "max_step_gap_minutes": 5
+  },
+  "today": {
+    "date": "2026-11-27",
+    "short_date": "11/27",
+    "weekday": "周五",
+    "is_today": true,
+    "agent_seconds": 1800.0,
+    "agent_hours": 0.5,
+    "workdays": 0.06,
+    "wall_seconds": 1200.0,
+    "wall_hours": 0.33,
+    "leverage": 1.5,
+    "runs": 3,
+    "tools": [
+      {
+        "tool": "codex",
+        "display_name": "Codex",
+        "short_name": "Codex",
+        "color": "#34D399",
+        "agent_seconds": 1800.0,
+        "agent_hours": 0.5,
+        "runs": 3,
+        "share": 1.0,
+        "tokens": 10000,
+        "cost_usd": 1.25
+      }
+    ],
+    "hourly_seconds": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,1800.0,0,0,0,0,0,0,0,0,0],
+    "tokens": 10000,
+    "cost_usd": 1.25,
+    "cache_hit_rate": 0.5
+  },
+  "last_7_days": [
+    {
+      "date": "2026-11-27",
+      "short_date": "11/27",
+      "weekday": "周五",
+      "is_today": true,
+      "agent_seconds": 1800.0,
+      "agent_hours": 0.5,
+      "workdays": 0.06,
+      "wall_seconds": 1200.0,
+      "wall_hours": 0.33,
+      "leverage": 1.5,
+      "runs": 3,
+      "tools": [],
+      "hourly_seconds": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,1800.0,0,0,0,0,0,0,0,0,0],
+      "tokens": 10000,
+      "cost_usd": 1.25,
+      "cache_hit_rate": 0.5
+    }
+  ],
+  "summary_7d": {
+    "total_seconds": 1800.0,
+    "total_hours": 0.5,
+    "avg_daily_hours": 0.5,
+    "active_days": 1
+  },
+  "days": [
+    {
+      "date": "2026-11-27",
+      "short_date": "11/27",
+      "weekday": "周五",
+      "is_today": true,
+      "agent_seconds": 1800.0,
+      "agent_hours": 0.5,
+      "workdays": 0.06,
+      "wall_seconds": 1200.0,
+      "wall_hours": 0.33,
+      "leverage": 1.5,
+      "runs": 3,
+      "tools": [],
+      "hourly_seconds": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,1800.0,0,0,0,0,0,0,0,0,0],
+      "tokens": 10000,
+      "cost_usd": 1.25,
+      "cache_hit_rate": 0.5
+    }
+  ],
+  "active_agents": [
+    {
+      "tool": "codex",
+      "display_name": "Codex",
+      "short_name": "Codex",
+      "color": "#34D399",
+      "started_at": 1795762740.0,
+      "elapsed_seconds": 60.0,
+      "label": "demo"
+    }
+  ],
+  "tokei_ref": {
+    "available": true,
+    "today_tokens": 10000,
+    "today_cost_usd": 1.25
+  },
+  "usage": null
+}
