@@ -152,12 +152,24 @@ def make_sentinel_id(source_id: str, run_key: str) -> str:
     return hashlib.sha256(f"{source_id}\x00{run_key}".encode("utf-8")).hexdigest()
 
 
+def _is_finite_num(value: Any) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def parse_ts(value: Any) -> Optional[float]:
     """Parse ISO-8601 string or epoch sec/ms into Unix epoch float seconds."""
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        v = float(value)
+        try:
+            v = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if v <= 0 or not math.isfinite(v):
             return None
         if v > 1e14:
@@ -171,7 +183,7 @@ def parse_ts(value: Any) -> Optional[float]:
             return None
         try:
             return parse_ts(float(s))
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
@@ -397,8 +409,7 @@ class SegmentCache:
             sr = entry.get("source_rank")
             if not (
                 isinstance(sr, dict)
-                and type(sr.get("latest_event_ts")) in (int, float)
-                and math.isfinite(float(sr["latest_event_ts"]))
+                and _is_finite_num(sr.get("latest_event_ts"))
                 and type(sr.get("valid_record_count")) is int
             ):
                 self.dirty = True
@@ -415,10 +426,8 @@ class SegmentCache:
                 return None
             if (
                 not isinstance(row[0], str)
-                or type(row[1]) not in (int, float)
-                or type(row[2]) not in (int, float)
-                or not math.isfinite(float(row[1]))
-                or not math.isfinite(float(row[2]))
+                or not _is_finite_num(row[1])
+                or not _is_finite_num(row[2])
                 or row[3] not in (0, 1, True, False)
                 or (row[4] is not None and not isinstance(row[4], str))
                 or (row[5] is not None and not isinstance(row[5], str))
@@ -446,8 +455,7 @@ class SegmentCache:
             if not isinstance(completed, list) or any(
                 not isinstance(item, dict)
                 or not isinstance(item.get("run_key"), str)
-                or type(item.get("completed_ts")) not in (int, float)
-                or not math.isfinite(float(item["completed_ts"]))
+                or not _is_finite_num(item.get("completed_ts"))
                 for item in completed
             ):
                 self.dirty = True
@@ -1111,8 +1119,18 @@ def parse_codex_file_checked(
     session_label = ""
     struct_error = False
 
-    def emit_turn(key: str, start_ts: float, end_ts: Optional[float], active: bool) -> List[WorkSegment]:
-        steps = list(turn_steps.get(key, []))
+    pending_emits: List[Tuple[str, float, Optional[float], List[float], List[Tuple[float, float]]]] = []
+
+    def emit_turn(
+        key: str,
+        start_ts: float,
+        end_ts: Optional[float],
+        active: bool,
+        *,
+        steps_override: Optional[List[float]] = None,
+        spans_override: Optional[List[Tuple[float, float]]] = None,
+    ) -> List[WorkSegment]:
+        steps = list(steps_override) if steps_override is not None else list(turn_steps.get(key, []))
         if end_ts is not None and end_ts >= start_ts:
             steps.append(end_ts)
         cwd = turn_cwds.get(key) or session_cwd
@@ -1121,7 +1139,7 @@ def parse_codex_file_checked(
             tool="codex",
             turn_start=start_ts,
             step_timestamps=steps,
-            extra_spans=turn_spans.get(key),
+            extra_spans=spans_override if spans_override is not None else turn_spans.get(key),
             run_key=f"codex:{key}",
             label=lbl,
             is_active=active,
@@ -1196,14 +1214,14 @@ def parse_codex_file_checked(
                 if start_ts is None and end_ts is not None and payload.get("duration_ms") is not None:
                     try:
                         dur_s = float(payload["duration_ms"]) / 1000.0
-                        if dur_s > 0:
+                        if math.isfinite(dur_s) and dur_s > 0:
                             start_ts = end_ts - dur_s
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         pass
                 if start_ts is not None and end_ts is not None and end_ts > start_ts:
                     if key not in turn_cwds and pending_turn_cwd:
                         turn_cwds[key] = pending_turn_cwd
-                    emit_turn(key, start_ts, end_ts, active=False)
+                    pending_emits.append((key, start_ts, end_ts, list(turn_steps.get(key, [])), list(turn_spans.get(key, []))))
                     completed_meta.append({"run_key": f"codex:{key}", "completed_ts": float(end_ts)})
                 active_turn_id = None
                 pending_turn_cwd = None
@@ -1211,7 +1229,7 @@ def parse_codex_file_checked(
                 key = tid or active_turn_id
                 if key and key in turn_starts and key not in completed_turns:
                     completed_turns.add(key)
-                    emit_turn(key, turn_starts[key], line_ts, active=False)
+                    pending_emits.append((key, turn_starts[key], line_ts, list(turn_steps.get(key, [])), list(turn_spans.get(key, []))))
                 active_turn_id = None
                 pending_turn_cwd = None
             elif line_ts is not None:
@@ -1220,6 +1238,9 @@ def parse_codex_file_checked(
                     turn_steps.setdefault(key, []).append(line_ts)
         elif line_ts is not None and active_turn_id and active_turn_id in turn_starts:
             turn_steps.setdefault(active_turn_id, []).append(line_ts)
+
+    for key, start_ts, end_ts, steps_snap, spans_snap in pending_emits:
+        emit_turn(key, start_ts, end_ts, active=False, steps_override=steps_snap, spans_override=spans_snap)
 
     for key, start_ts in turn_starts.items():
         if key in completed_turns:
@@ -2654,7 +2675,7 @@ def _day_from_retained_work(
             "hourly_available": False,
             "work_status": "unknown",
             "tokens": int(day_u.get("total_tokens", 0)),
-            "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 2),
+            "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 6),
             "unpriced_tokens": int(day_u.get("unpriced_tokens", 0)),
             "cache_hit_rate": round(float(day_u.get("cache_hit_rate", 0.0)), 4),
         }
@@ -2689,7 +2710,7 @@ def _day_from_retained_work(
                 "runs": int(wt.get("runs", 0) or 0),
                 "share": round(sec / agent_sec, 4) if agent_sec > 0 else 0.0,
                 "tokens": int(tu.get("tokens", 0)),
-                "cost_usd": round(float(tu.get("cost_usd", 0.0)), 2),
+                "cost_usd": round(float(tu.get("cost_usd", 0.0)), 6),
                 "unpriced_tokens": int(tu.get("unpriced_tokens", 0)),
             }
         )
@@ -2711,7 +2732,7 @@ def _day_from_retained_work(
         "hourly_available": hourly_avail,
         "work_status": "retained",
         "tokens": int(day_u.get("total_tokens", 0)),
-        "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 2),
+        "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 6),
         "unpriced_tokens": int(day_u.get("unpriced_tokens", 0)),
         "cache_hit_rate": round(float(day_u.get("cache_hit_rate", 0.0)), 4),
     }
@@ -2832,7 +2853,7 @@ def aggregate_segments(
                     "runs": val["runs"],
                     "share": round(sec / agent_sec, 4) if agent_sec > 0 else 0.0,
                     "tokens": int(tu.get("tokens", 0)),
-                    "cost_usd": round(float(tu.get("cost_usd", 0.0)), 2),
+                    "cost_usd": round(float(tu.get("cost_usd", 0.0)), 6),
                     "unpriced_tokens": int(tu.get("unpriced_tokens", 0)),
                 }
             )
@@ -2856,7 +2877,7 @@ def aggregate_segments(
                 "hourly_available": True,
                 "work_status": "observed",
                 "tokens": int(day_u.get("total_tokens", 0)),
-                "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 2),
+                "cost_usd": round(float(day_u.get("cost_usd", 0.0)), 6),
                 "unpriced_tokens": int(day_u.get("unpriced_tokens", 0)),
                 "cache_hit_rate": round(float(day_u.get("cache_hit_rate", 0.0)), 4),
             }
@@ -2872,7 +2893,7 @@ def aggregate_segments(
         resolved_tokei_ref = {
             "available": True,
             "today_tokens": int(today_summary.get("tokens", 0)),
-            "today_cost_usd": round(float(today_summary.get("cost_usd", 0.0)), 2),
+            "today_cost_usd": round(float(today_summary.get("cost_usd", 0.0)), 6),
         }
 
     payload: Dict[str, Any] = {
@@ -3099,7 +3120,7 @@ def collect_all(
     native_ref = {
         "available": True,
         "today_tokens": int(today_u.get("total_tokens", 0)),
-        "today_cost_usd": round(float(today_u.get("cost_usd", 0.0)), 2),
+        "today_cost_usd": round(float(today_u.get("cost_usd", 0.0)), 6),
     }
 
     return aggregate_segments(
@@ -3149,11 +3170,23 @@ def format_usd(amount: float) -> str:
     return f"${amount:.2f}"
 
 
-def format_estimated_usd(amount: float, unpriced_tokens: int, *, has_observation: bool = True) -> str:
+def format_estimated_usd(
+    amount: float,
+    unpriced_tokens: int,
+    *,
+    has_observation: bool = True,
+    total_tokens: Optional[int] = None,
+    has_priced_cost: Optional[bool] = None,
+) -> str:
     if not has_observation:
         return "—"
     if unpriced_tokens > 0:
-        return f"{format_usd(amount)}+" if amount > 0 else "未计价"
+        priced = (
+            has_priced_cost
+            if has_priced_cost is not None
+            else (amount > 0 or (total_tokens is not None and total_tokens > unpriced_tokens))
+        )
+        return f"{format_usd(amount)}+" if priced else "未计价"
     return format_usd(amount)
 
 
@@ -3228,7 +3261,7 @@ def render_markdown_report(
         has_obs = (p_tok > 0 or p_cost > 0 or p_unpriced > 0)
         if has_obs:
             cache_pct = int(round(float(p_stats.get("cache_hit_rate", 0.0) or 0.0) * 100))
-            cost_str = format_estimated_usd(p_cost, p_unpriced, has_observation=True)
+            cost_str = format_estimated_usd(p_cost, p_unpriced, has_observation=True, total_tokens=p_tok)
             lines.append(
                 f"- **Token 与估算费用**：**{_format_tokens_short(p_tok)} tokens**（估算 **{cost_str}** · 缓存命中 {cache_pct}%）"
             )
@@ -3252,7 +3285,7 @@ def render_markdown_report(
                 t_has_obs = (t_tok > 0 or t_cost > 0 or t_unp > 0)
                 work_str = f"{format_duration_cn(t_sec)} ({t_hrs:.2f}h)" if t_sec > 0 else "—"
                 tok_str = _format_tokens_short(t_tok) if t_tok > 0 else "—"
-                cost_str = format_estimated_usd(t_cost, t_unp, has_observation=t_has_obs)
+                cost_str = format_estimated_usd(t_cost, t_unp, has_observation=t_has_obs, total_tokens=t_tok)
                 lines.append(
                     f"| {t['display_name']} | {work_str} | {pct:.0f}% | {t.get('runs', 0)} | {tok_str} | {cost_str} |"
                 )
@@ -3304,7 +3337,7 @@ def render_markdown_report(
     has_obs = (day_tok > 0 or day_cost > 0 or day_unp > 0)
     if has_obs:
         cache_pct = int(round(float(day.get("cache_hit_rate", 0.0) or 0.0) * 100))
-        cost_str = format_estimated_usd(day_cost, day_unp, has_observation=True)
+        cost_str = format_estimated_usd(day_cost, day_unp, has_observation=True, total_tokens=day_tok)
         lines.append(
             f"- **Token 与估算费用**：**{_format_tokens_short(day_tok)} tokens**（估算 **{cost_str}** · 缓存命中 {cache_pct}%）"
         )
@@ -3323,7 +3356,7 @@ def render_markdown_report(
             t_unp = int(t.get("unpriced_tokens", 0) or 0)
             t_has_obs = (t_tok > 0 or t_cost > 0 or t_unp > 0)
             tok_str = _format_tokens_short(t_tok) if t_tok > 0 else "—"
-            cost_str = format_estimated_usd(t_cost, t_unp, has_observation=t_has_obs)
+            cost_str = format_estimated_usd(t_cost, t_unp, has_observation=t_has_obs, total_tokens=t_tok)
             lines.append(
                 f"| {t['display_name']} | {format_duration_cn(t['agent_seconds'])} ({t['agent_hours']:.2f}h) | {pct:.0f}% | {t['runs']} | {tok_str} | {cost_str} |"
             )

@@ -326,6 +326,14 @@ struct DayStats: Codable, Equatable, Identifiable {
         workStatus == .unknown
     }
 
+    var formattedEstimatedCost: String {
+        let tok = tokens ?? 0
+        let cost = costUsd ?? 0.0
+        let unp = unpricedTokens ?? 0
+        let hasObs = tok > 0 || cost > 0 || unp > 0
+        return Formatters.estimatedUSD(cost, unpricedTokens: unp, hasObservation: hasObs, totalTokens: tok)
+    }
+
     /// Returns true if work hours come from a retained historical ledger bucket during degraded collection.
     var isWorkRetained: Bool {
         workStatus == .retained
@@ -576,6 +584,12 @@ struct PeriodStats: Codable, Equatable {
         workStatus == .unknown
     }
 
+    var formattedEstimatedCost: String {
+        let unp = unpricedTokens ?? 0
+        let hasObs = totalTokens > 0 || costUsd > 0 || unp > 0
+        return Formatters.estimatedUSD(costUsd, unpricedTokens: unp, hasObservation: hasObs, totalTokens: totalTokens)
+    }
+
     enum CodingKeys: String, CodingKey {
         case startDate = "start_date"
         case endDate = "end_date"
@@ -645,6 +659,12 @@ struct UsageToolStats: Codable, Equatable, Identifiable {
         sessions ?? max(runs, activeDays)
     }
 
+    var formattedEstimatedCost: String {
+        let unp = unpricedTokens ?? 0
+        let hasObs = totalTokens > 0 || costUsd > 0 || unp > 0
+        return Formatters.estimatedUSD(costUsd, unpricedTokens: unp, hasObservation: hasObs, totalTokens: totalTokens)
+    }
+
     enum CodingKeys: String, CodingKey {
         case tool
         case displayName = "display_name"
@@ -693,6 +713,12 @@ struct ModelUsageStats: Codable, Equatable, Identifiable {
         return denom > 0 ? Double(cacheReadTokens) / Double(denom) : 0.0
     }
 
+    var formattedEstimatedCost: String {
+        let unp = unpricedTokens ?? 0
+        let hasObs = totalTokens > 0 || costUsd > 0 || unp > 0
+        return Formatters.estimatedUSD(costUsd, unpricedTokens: unp, hasObservation: hasObs, totalTokens: totalTokens)
+    }
+
     enum CodingKeys: String, CodingKey {
         case model
         case inputTokens = "input_tokens"
@@ -731,6 +757,14 @@ struct RankedModelStats: Codable, Equatable, Identifiable {
     var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
     var effectiveHasCostObservation: Bool {
         totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0
+    }
+    var formattedEstimatedCost: String {
+        Formatters.estimatedUSD(
+            costUsd,
+            unpricedTokens: effectiveUnpricedTokens,
+            hasObservation: effectiveHasCostObservation,
+            totalTokens: totalTokens
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -776,12 +810,29 @@ struct HeatmapDay: Codable, Equatable, Identifiable {
     let unpricedTokens: Int?
     let hasCostObservation: Bool?
     let agentHours: Double
+    let workStatus: WorkDayStatus?
     let sessions: Int
     let tools: [HeatmapDayTool]
 
     var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
     var effectiveHasCostObservation: Bool {
         hasCostObservation ?? (totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0)
+    }
+    /// True when work hours for this heatmap day have no trusted observation (render "—" instead of 0.00h).
+    /// Legacy snapshots lacking `work_status` default to `false` for backward compatibility.
+    var isWorkUnknown: Bool {
+        workStatus == .unknown
+    }
+    var isWorkRetained: Bool {
+        workStatus == .retained
+    }
+    var formattedEstimatedCost: String {
+        Formatters.estimatedUSD(
+            costUsd,
+            unpricedTokens: effectiveUnpricedTokens,
+            hasObservation: effectiveHasCostObservation,
+            totalTokens: totalTokens
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -794,6 +845,7 @@ struct HeatmapDay: Codable, Equatable, Identifiable {
         case unpricedTokens = "unpriced_tokens"
         case hasCostObservation = "has_cost_observation"
         case agentHours = "agent_hours"
+        case workStatus = "work_status"
         case sessions
         case tools
     }
@@ -813,6 +865,14 @@ struct HeatmapDayTool: Codable, Equatable, Identifiable {
     var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
     var effectiveHasCostObservation: Bool {
         hasCostObservation ?? (totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0)
+    }
+    var formattedEstimatedCost: String {
+        Formatters.estimatedUSD(
+            costUsd,
+            unpricedTokens: effectiveUnpricedTokens,
+            hasObservation: effectiveHasCostObservation,
+            totalTokens: totalTokens
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -897,6 +957,14 @@ struct ProjectPeriodStats: Codable, Equatable {
     var effectiveUnpricedTokens: Int { unpricedTokens ?? 0 }
     var effectiveHasCostObservation: Bool {
         hasCostObservation ?? (totalTokens > 0 || costUsd > 0 || effectiveUnpricedTokens > 0)
+    }
+    var formattedEstimatedCost: String {
+        Formatters.estimatedUSD(
+            costUsd,
+            unpricedTokens: effectiveUnpricedTokens,
+            hasObservation: effectiveHasCostObservation,
+            totalTokens: totalTokens
+        )
     }
 
     init(
@@ -1051,6 +1119,9 @@ struct HistoryDayPoint: Codable, Equatable, Identifiable {
     let costUsd: Double
     let unpricedTokens: Int?
     let agentHours: Double
+    let workStatus: WorkDayStatus?
+
+    var isWorkUnknown: Bool { workStatus == .unknown }
 
     enum CodingKeys: String, CodingKey {
         case date
@@ -1061,6 +1132,7 @@ struct HistoryDayPoint: Codable, Equatable, Identifiable {
         case costUsd = "cost_usd"
         case unpricedTokens = "unpriced_tokens"
         case agentHours = "agent_hours"
+        case workStatus = "work_status"
     }
 }
 
@@ -1238,16 +1310,55 @@ struct QuotaWindow: Codable, Equatable, Identifiable {
     let label: String
     let shortLabel: String
     let usedPercent: Double
+    let rawUsedPercent: Double?
     let remainingPercent: Double
     let resetsAt: Int?
     let windowMinutes: Int?
     let freshUntilTs: Double?
     let pace: QuotaPace?
 
+    /// Unrounded percentage for exact threshold & ranking checks (falls back to `usedPercent` on legacy snapshots).
+    var effectiveThresholdPercent: Double {
+        if let raw = rawUsedPercent, raw.isFinite {
+            return raw
+        }
+        return usedPercent
+    }
+
+    /// True only when exact unrounded utilization reaches the 70% alert threshold (`>= 70.0`).
+    var isAboveAlertThreshold: Bool {
+        effectiveThresholdPercent >= 70.0
+    }
+
+    init(
+        id: String,
+        label: String,
+        shortLabel: String,
+        usedPercent: Double,
+        rawUsedPercent: Double? = nil,
+        remainingPercent: Double,
+        resetsAt: Int?,
+        windowMinutes: Int?,
+        freshUntilTs: Double?,
+        pace: QuotaPace?
+    ) {
+        self.id = id
+        self.label = label
+        self.shortLabel = shortLabel
+        self.usedPercent = usedPercent
+        self.rawUsedPercent = rawUsedPercent
+        self.remainingPercent = remainingPercent
+        self.resetsAt = resetsAt
+        self.windowMinutes = windowMinutes
+        self.freshUntilTs = freshUntilTs
+        self.pace = pace
+    }
+
     enum CodingKeys: String, CodingKey {
         case id, label
         case shortLabel = "short_label"
         case usedPercent = "used_percent"
+        case rawUsedPercent = "raw_used_percent"
         case remainingPercent = "remaining_percent"
         case resetsAt = "resets_at"
         case windowMinutes = "window_minutes"
@@ -1262,7 +1373,39 @@ struct HighestQuotaWindow: Codable, Equatable {
     let label: String
     let shortLabel: String
     let usedPercent: Double
+    let rawUsedPercent: Double?
     let resetsAt: Int?
+
+    /// Unrounded percentage for exact threshold & ranking checks (falls back to `usedPercent` on legacy snapshots).
+    var effectiveThresholdPercent: Double {
+        if let raw = rawUsedPercent, raw.isFinite {
+            return raw
+        }
+        return usedPercent
+    }
+
+    /// True only when exact unrounded utilization reaches the 70% alert threshold (`>= 70.0`).
+    var isAboveAlertThreshold: Bool {
+        effectiveThresholdPercent >= 70.0
+    }
+
+    init(
+        providerId: String,
+        providerName: String,
+        label: String,
+        shortLabel: String,
+        usedPercent: Double,
+        rawUsedPercent: Double? = nil,
+        resetsAt: Int?
+    ) {
+        self.providerId = providerId
+        self.providerName = providerName
+        self.label = label
+        self.shortLabel = shortLabel
+        self.usedPercent = usedPercent
+        self.rawUsedPercent = rawUsedPercent
+        self.resetsAt = resetsAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case providerId = "provider_id"
@@ -1270,6 +1413,7 @@ struct HighestQuotaWindow: Codable, Equatable {
         case label
         case shortLabel = "short_label"
         case usedPercent = "used_percent"
+        case rawUsedPercent = "raw_used_percent"
         case resetsAt = "resets_at"
     }
 }
@@ -1462,10 +1606,22 @@ enum Formatters {
         return String(format: "%.2f×", val)
     }
 
-    static func estimatedUSD(_ amount: Double, unpricedTokens: Int, hasObservation: Bool = true) -> String {
+    static func estimatedUSD(
+        _ amount: Double,
+        unpricedTokens: Int,
+        hasObservation: Bool = true,
+        totalTokens: Int? = nil,
+        hasPricedCost: Bool? = nil
+    ) -> String {
         guard hasObservation else { return "—" }
         guard unpricedTokens > 0 else { return usd(amount) }
-        return amount > 0 ? "\(usd(amount))+" : "未计价"
+        let priced: Bool
+        if let explicit = hasPricedCost {
+            priced = explicit
+        } else {
+            priced = amount > 0 || (totalTokens.map { $0 > unpricedTokens } ?? false)
+        }
+        return priced ? "\(usd(amount))+" : "未计价"
     }
 
     static func rate(_ amount: Double) -> String {

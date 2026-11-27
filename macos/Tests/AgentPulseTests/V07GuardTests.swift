@@ -329,4 +329,214 @@ final class V07GuardTests: XCTestCase {
         XCTAssertTrue(revealed.isEmpty)
         XCTAssertEqual(store.projectActionError, "项目目录不可用")
     }
+
+    // MARK: - Round-2 #5 Offline Quota updated=0 & 69.96% Unrounded Alert Threshold
+
+    func testR2_05QuotaUpdatedZeroRejectedAnd6996ThresholdPrecision() throws {
+        let store = ClockStore(defaults: defaults)
+        let nowTs: Double = 1795762800.0
+        store.nowEpoch = nowTs
+
+        // 1) Offline Claude cache with fetchedAt=0, 97% -> MUST NOT be fresh or enter highest/badge
+        let zeroUpdatedJson = """
+        {
+          "schema_version": 1,
+          "generated_at": "2026-11-27T15:00:00+08:00",
+          "generated_ts": \(nowTs),
+          "providers": [
+            {
+              "id": "claude", "name": "Claude", "color": "#FB923C", "plan": "Pro",
+              "status": "stale", "status_text": "缺少有效观测时间", "fetched_at": 0,
+              "windows": [
+                {"id":"claude_5h","label":"5 小时窗口","short_label":"CL5","used_percent":97.0,"raw_used_percent":97.0,"remaining_percent":3.0,"resets_at":\(Int(nowTs + 3600)),"window_minutes":300}
+              ]
+            }
+          ],
+          "highest_window": null
+        }
+        """
+        let snapZero = try JSONDecoder().decode(QuotaSnapshot.self, from: Data(zeroUpdatedJson.utf8))
+        store.applyQuotaSnapshotIfNewer(snapZero)
+        XCTAssertFalse(store.quotaWindowIsFresh(provider: snapZero.providers[0], window: snapZero.providers[0].windows[0]))
+        XCTAssertNil(store.highestFreshQuotaWindow)
+        XCTAssertNil(store.activeAlertQuotaWindow)
+        XCTAssertNil(store.menuBarQuotaSummary)
+
+        // 2) Fresh Claude 69.96% (rounded display 70.0%) vs Codex 69.98% -> 69.98% ranks first, NEITHER triggers >= 70% alert!
+        let sub70Json = """
+        {
+          "schema_version": 1,
+          "generated_at": "2026-11-27T15:01:00+08:00",
+          "generated_ts": \(nowTs + 60),
+          "providers": [
+            {
+              "id": "claude", "name": "Claude", "color": "#FB923C", "plan": "Pro",
+              "status": "ok", "status_text": "Claude Code 状态栏", "fetched_at": \(Int(nowTs + 30)),
+              "windows": [
+                {"id":"claude_5h","label":"5 小时窗口","short_label":"CL5","used_percent":70.0,"raw_used_percent":69.96,"remaining_percent":30.0,"resets_at":\(Int(nowTs + 7200)),"window_minutes":300,"fresh_until_ts":\(nowTs + 3630)}
+              ]
+            },
+            {
+              "id": "codex", "name": "Codex", "color": "#10B981", "plan": "Pro",
+              "status": "ok", "status_text": "实时探测", "fetched_at": \(Int(nowTs + 30)),
+              "windows": [
+                {"id":"codex_5h","label":"5 小时窗口","short_label":"C5","used_percent":70.0,"raw_used_percent":69.98,"remaining_percent":30.0,"resets_at":\(Int(nowTs + 7200)),"window_minutes":300,"fresh_until_ts":\(nowTs + 390)}
+              ]
+            }
+          ],
+          "highest_window": {"provider_id":"codex","provider_name":"Codex","label":"5 小时窗口","short_label":"C5","used_percent":70.0,"raw_used_percent":69.98,"resets_at":\(Int(nowTs + 7200))}
+        }
+        """
+        store.nowEpoch = nowTs + 65
+        let snapSub70 = try JSONDecoder().decode(QuotaSnapshot.self, from: Data(sub70Json.utf8))
+        store.applyQuotaSnapshotIfNewer(snapSub70)
+        XCTAssertEqual(snapSub70.providers[0].windows[0].effectiveThresholdPercent, 69.96, accuracy: 0.0001)
+        XCTAssertFalse(snapSub70.providers[0].windows[0].isAboveAlertThreshold)
+        XCTAssertEqual(store.highestFreshQuotaWindow?.providerId, "codex")
+        XCTAssertEqual(store.highestFreshQuotaWindow?.effectiveThresholdPercent ?? 0, 69.98, accuracy: 0.0001)
+        XCTAssertFalse(store.highestFreshQuotaWindow?.isAboveAlertThreshold ?? true)
+        XCTAssertNil(store.activeAlertQuotaWindow)
+
+        // 3) Exact 70.00% -> triggers alert!
+        let at70Json = sub70Json
+            .replacingOccurrences(of: "\"generated_ts\": \(nowTs + 60)", with: "\"generated_ts\": \(nowTs + 120)")
+            .replacingOccurrences(of: "69.98", with: "70.0")
+        store.nowEpoch = nowTs + 125
+        let snapAt70 = try JSONDecoder().decode(QuotaSnapshot.self, from: Data(at70Json.utf8))
+        store.applyQuotaSnapshotIfNewer(snapAt70)
+        XCTAssertTrue(store.highestFreshQuotaWindow?.isAboveAlertThreshold ?? false)
+        XCTAssertEqual(store.activeAlertQuotaWindow?.providerId, "codex")
+    }
+
+    // MARK: - Round-2 #6 Future Month Rollback & Incomplete Last-Week Rejection
+
+    func testR2_06ClockRollbackRejectsFutureMonthAndIncompleteLastWeek() throws {
+        let store = ClockStore(defaults: defaults)
+        let data = try Data(contentsOf: fixtureURL("v07_fast_v3_minimal.json"))
+        let snapFri = try JSONDecoder().decode(ClockSnapshot.self, from: data) // today=2026-11-27 (Fri), week=11/23..11/27, month=11/01..11/27 ($40)
+        XCTAssertTrue(store.setSubscriptionFee(cents: 2000, for: "codex"))
+        store.nowEpoch = snapFri.generatedTs + 5
+        store.applySnapshotIfNewer(snapFri)
+        XCTAssertEqual(store.subscriptionRows.first(where: { $0.tool == "codex" })?.paybackMultiple, Decimal(2))
+
+        // 1) Roll back Shanghai clock 1 day to 2026-11-26 15:00 +0800 -> MUST reject 11/27 future month/week/today/projects/payback!
+        store.handleClockTick(snapFri.generatedTs - 86400.0)
+        XCTAssertEqual(store.currentShanghaiDay, "2026-11-26")
+        XCTAssertNil(store.periodStats(for: .today))
+        XCTAssertNil(store.periodStats(for: .week))
+        XCTAssertNil(store.periodStats(for: .month))
+        XCTAssertNil(store.periodStats(for: .year))
+        XCTAssertNil(store.periodStats(for: .all))
+        XCTAssertFalse(store.currentMonthSubscriptionDataAvailable)
+        let rolledCodex = store.subscriptionRows.first(where: { $0.tool == "codex" })
+        XCTAssertNil(rolledCodex?.subscriptionValueUsd)
+        XCTAssertNil(rolledCodex?.paybackMultiple)
+        XCTAssertTrue(store.projectTrailRows(for: .month).isEmpty)
+        XCTAssertNotNil(store.periodUnavailableHint(for: .month))
+
+        // 2) Keep Friday 2026-11-27 snapshot until Monday 2026-11-30 15:00 +0800 (+3 days) -> lastWeek MUST NOT return partial 23..27!
+        let monTs = snapFri.generatedTs + 3 * 86400.0
+        store.handleClockTick(monTs)
+        XCTAssertEqual(store.currentShanghaiDay, "2026-11-30")
+        XCTAssertNil(store.periodStats(for: .lastWeek))
+        let lwHint = store.periodUnavailableHint(for: .lastWeek) ?? ""
+        XCTAssertTrue(lwHint.contains("2026-11-27") && lwHint.contains("2026-11-29"))
+
+        // 3) Complete Sunday 2026-11-29 snapshot (week covers 2026-11-23..2026-11-29) on Monday 2026-11-30 -> valid lastWeek & export!
+        var obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let sunTs = snapFri.generatedTs + 2 * 86400.0
+        obj["generated_ts"] = sunTs
+        var todayObj = obj["today"] as! [String: Any]
+        todayObj["date"] = "2026-11-29"
+        obj["today"] = todayObj
+        var usageObj = obj["usage"] as! [String: Any]
+        var periodsObj = usageObj["periods"] as! [String: Any]
+        var weekObj = periodsObj["week"] as! [String: Any]
+        weekObj["start_date"] = "2026-11-23"
+        weekObj["end_date"] = "2026-11-29"
+        periodsObj["week"] = weekObj
+        usageObj["periods"] = periodsObj
+        obj["usage"] = usageObj
+        let snapSun = try JSONDecoder().decode(ClockSnapshot.self, from: try JSONSerialization.data(withJSONObject: obj))
+
+        let storeSun = ClockStore(defaults: defaults)
+        storeSun.nowEpoch = monTs
+        storeSun.applySnapshotIfNewer(snapSun)
+        let validLW = storeSun.periodStats(for: .lastWeek)
+        XCTAssertNotNil(validLW)
+        XCTAssertEqual(validLW?.startDate, "2026-11-23")
+        XCTAssertEqual(validLW?.endDate, "2026-11-29")
+        XCTAssertNil(storeSun.periodUnavailableHint(for: .lastWeek))
+    }
+
+    // MARK: - Round-2 #7 HeatmapDay Decodes Unknown Work Status
+
+    func testR2_07HeatmapDayDecodesUnknownWorkStatusAndLegacyDefaultsFalse() throws {
+        let json = """
+        {
+          "days": [
+            {"date":"2026-11-24","short_date":"11/24","weekday":"周二","is_today":false,"total_tokens":0,"cost_usd":0.0,"unpriced_tokens":0,"has_cost_observation":false,"agent_hours":0.0,"work_status":"observed","sessions":0,"tools":[]},
+            {"date":"2026-11-25","short_date":"11/25","weekday":"周三","is_today":false,"total_tokens":0,"cost_usd":0.0,"unpriced_tokens":0,"has_cost_observation":false,"agent_hours":1.5,"work_status":"retained","sessions":0,"tools":[]},
+            {"date":"2026-11-26","short_date":"11/26","weekday":"周四","is_today":false,"total_tokens":0,"cost_usd":0.0,"unpriced_tokens":0,"has_cost_observation":false,"agent_hours":0.0,"sessions":0,"tools":[]},
+            {"date":"2026-11-27","short_date":"11/27","weekday":"周五","is_today":true,"total_tokens":0,"cost_usd":0.0,"unpriced_tokens":0,"has_cost_observation":false,"agent_hours":0.0,"work_status":"unknown","sessions":0,"tools":[]}
+          ],
+          "current_streak": 0,
+          "longest_streak": 0,
+          "total_active_days": 0
+        }
+        """
+        let hm = try JSONDecoder().decode(HeatmapPayload.self, from: Data(json.utf8))
+        XCTAssertFalse(hm.days[0].isWorkUnknown)
+        XCTAssertFalse(hm.days[1].isWorkUnknown)
+        XCTAssertTrue(hm.days[1].isWorkRetained)
+        XCTAssertFalse(hm.days[2].isWorkUnknown) // legacy without work_status
+        XCTAssertTrue(hm.days[3].isWorkUnknown)
+    }
+
+    // MARK: - Round-2 #8 Sub-cent ($0.00175) & Zero-Priced Mixed Cost Formatting
+
+    func testR2_08SubcentAndZeroPricedMixedCostFormattingAllSurfaces() throws {
+        // Direct formatter matrix: sub-cent mixed, zero-priced mixed, pure unpriced, confirmed zero, no observation
+        XCTAssertEqual(Formatters.estimatedUSD(0.00175, unpricedTokens: 1000, hasObservation: true, totalTokens: 2000), "$0.00+")
+        XCTAssertEqual(Formatters.estimatedUSD(0.00175, unpricedTokens: 1000, hasObservation: true), "$0.00+")
+        XCTAssertEqual(Formatters.estimatedUSD(0.0, unpricedTokens: 1000, hasObservation: true, totalTokens: 2000), "$0.00+")
+        XCTAssertEqual(Formatters.estimatedUSD(0.0, unpricedTokens: 1000, hasObservation: true, totalTokens: 1000), "未计价")
+        XCTAssertEqual(Formatters.estimatedUSD(0.0, unpricedTokens: 0, hasObservation: true, totalTokens: 1000), "$0.00")
+        XCTAssertEqual(Formatters.estimatedUSD(0.0, unpricedTokens: 0, hasObservation: false, totalTokens: 0), "—")
+
+        // Verify menu bar + ClockStore + HeatmapDay + ProjectPeriodStats consistency for sub-cent & mixed zero-priced
+        let baseData = try Data(contentsOf: fixtureURL("v07_fast_v3_minimal.json"))
+        var obj = try JSONSerialization.jsonObject(with: baseData) as! [String: Any]
+        var usage = obj["usage"] as! [String: Any]
+        var periods = usage["periods"] as! [String: Any]
+        var pToday = periods["today"] as! [String: Any]
+        pToday["total_tokens"] = 2000
+        pToday["cost_usd"] = 0.00175
+        pToday["unpriced_tokens"] = 1000
+        periods["today"] = pToday
+        usage["periods"] = periods
+        obj["usage"] = usage
+        let snapSub = try JSONDecoder().decode(ClockSnapshot.self, from: try JSONSerialization.data(withJSONObject: obj))
+
+        let store = ClockStore(defaults: defaults)
+        store.nowEpoch = snapSub.generatedTs + 5
+        store.applySnapshotIfNewer(snapSub)
+        XCTAssertEqual(store.todayEstimatedCostText, "$0.00+")
+        XCTAssertTrue(AppDelegate.formatStatusBarTitle(for: store).contains("$0.00+"))
+        XCTAssertEqual(snapSub.usage?.periods.today.formattedEstimatedCost, "$0.00+")
+
+        // Heatmap & ProjectPeriodStats mixed zero-priced (cost=0.0, total=2000, unpriced=1000 -> "$0.00+")
+        let hmJson = """
+        {"date":"2026-11-27","short_date":"11/27","weekday":"周五","is_today":true,"total_tokens":2000,"cost_usd":0.0,"unpriced_tokens":1000,"has_cost_observation":true,"agent_hours":0.0,"work_status":"observed","sessions":1,"tools":[{"tool":"codex","display_name":"Codex","color":"#34D399","total_tokens":2000,"cost_usd":0.00175,"unpriced_tokens":1000,"has_cost_observation":true,"agent_hours":0.0}]}
+        """
+        let hmDay = try JSONDecoder().decode(HeatmapDay.self, from: Data(hmJson.utf8))
+        XCTAssertEqual(hmDay.formattedEstimatedCost, "$0.00+")
+        XCTAssertEqual(hmDay.tools[0].formattedEstimatedCost, "$0.00+")
+
+        let ppJson = """
+        {"start_date":"2026-11-27","end_date":"2026-11-27","last_active_date":"2026-11-27","agent_seconds":null,"input_tokens":2000,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"total_tokens":2000,"cost_usd":0.0,"unpriced_tokens":1000,"has_cost_observation":true,"cache_hit_rate":0.0,"sessions":1,"tools":[],"worktree_sources":[]}
+        """
+        let pp = try JSONDecoder().decode(ProjectPeriodStats.self, from: Data(ppJson.utf8))
+        XCTAssertEqual(pp.formattedEstimatedCost, "$0.00+")
+    }
 }

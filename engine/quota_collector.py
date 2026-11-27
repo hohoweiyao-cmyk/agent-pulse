@@ -74,12 +74,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _safe_finite_float(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        v = float(val)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _iso_to_epoch(val: Any) -> Optional[int]:
-    if val is None or val == "":
+    if val is None or val == "" or isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
-        v = float(val)
-        if not math.isfinite(v) or v <= 0:
+        v = _safe_finite_float(val)
+        if v is None or v <= 0:
             return None
         return int(v / 1000.0) if v > 1e11 else int(v)
     if isinstance(val, str):
@@ -205,33 +215,38 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
     primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else None
     secondary = limits.get("secondary") if isinstance(limits.get("secondary"), dict) else None
     if primary and primary.get("used_percent") is not None:
-        used = float(primary["used_percent"])
-        windows.append(
-            {
-                "id": "codex_5h",
-                "label": "5 小时窗口",
-                "short_label": "C5",
-                "used_percent": round(used, 1),
-                "_raw_used_percent": used,
-                "remaining_percent": round(max(0.0, 100.0 - used), 1),
-                "resets_at": primary.get("resets_at"),
-                "window_minutes": primary.get("window_minutes") or 300,
-            }
-        )
+        used = _safe_finite_float(primary.get("used_percent"))
+        if used is not None and 0.0 <= used <= 100.0:
+            windows.append(
+                {
+                    "id": "codex_5h",
+                    "label": "5 小时窗口",
+                    "short_label": "C5",
+                    "used_percent": round(used, 1),
+                    "raw_used_percent": round(used, 6),
+                    "_raw_used_percent": used,
+                    "remaining_percent": round(max(0.0, 100.0 - used), 1),
+                    "resets_at": primary.get("resets_at"),
+                    "window_minutes": primary.get("window_minutes") or 300,
+                }
+            )
     if secondary and secondary.get("used_percent") is not None:
-        used = float(secondary["used_percent"])
-        windows.append(
-            {
-                "id": "codex_7d",
-                "label": "7 天窗口",
-                "short_label": "C7",
-                "used_percent": round(used, 1),
-                "_raw_used_percent": used,
-                "remaining_percent": round(max(0.0, 100.0 - used), 1),
-                "resets_at": secondary.get("resets_at"),
-                "window_minutes": secondary.get("window_minutes") or 10080,
-            }
-        )
+        used = _safe_finite_float(secondary.get("used_percent"))
+        if used is not None and 0.0 <= used <= 100.0:
+            windows.append(
+                {
+                    "id": "codex_7d",
+                    "label": "7 天窗口",
+                    "short_label": "C7",
+                    "used_percent": round(used, 1),
+                    "raw_used_percent": round(used, 6),
+                    "_raw_used_percent": used,
+                    "remaining_percent": round(max(0.0, 100.0 - used), 1),
+                    "resets_at": secondary.get("resets_at"),
+                    "window_minutes": secondary.get("window_minutes") or 10080,
+                }
+            )
+    fetched_num = _safe_finite_float(fetched_at)
     return {
         "id": "codex",
         "name": "Codex",
@@ -239,7 +254,7 @@ def _format_codex_provider(limits: Dict[str, Any], plan: Optional[str], fetched_
         "plan": (plan or limits.get("plan_type") or "Plus / Pro").title(),
         "status": status,
         "status_text": status_text,
-        "fetched_at": int(fetched_at),
+        "fetched_at": int(fetched_num) if (fetched_num is not None and fetched_num > 0) else 0,
         "windows": windows,
     }
 
@@ -251,7 +266,10 @@ def _limits_has_unreset_window(limits: Any, now: float) -> bool:
         win = limits.get(key)
         if isinstance(win, dict) and win.get("used_percent") is not None:
             reset_at = win.get("resets_at")
-            if reset_at is None or (isinstance(reset_at, (int, float)) and float(reset_at) > now):
+            if reset_at is None:
+                return True
+            r_num = _safe_finite_float(reset_at)
+            if r_num is not None and r_num > now:
                 return True
     return False
 
@@ -354,11 +372,11 @@ def probe_codex_quota(
 
     # Fallback 2: Cached snapshot (retains last readings and original fetched_at even after reset)
     if cached.get("limits"):
-        orig_ts = float(cached.get("fetched_at") or 0)
+        orig_ts = _safe_finite_float(cached.get("fetched_at")) or 0.0
         unreset = _limits_has_unreset_window(cached.get("limits"), now)
         msg = "上次缓存快照" if unreset else "窗口已重置，保留上次读数"
         return _format_codex_provider(
-            cached["limits"], cached.get("plan"), orig_ts if orig_ts > 0 else now, "stale", msg
+            cached["limits"], cached.get("plan"), orig_ts if orig_ts > 0 else 0.0, "stale", msg
         )
 
     return {
@@ -479,9 +497,9 @@ def capture_claude_statusline(home: Path, payload: Any, now: float) -> None:
         window = limits.get(source)
         if not isinstance(window, dict):
             continue
-        used = window.get("used_percentage")
+        used = _safe_finite_float(window.get("used_percentage"))
         reset = _iso_to_epoch(window.get("resets_at"))
-        if type(used) in (float, int) and 0 <= used <= 100 and reset and reset > now:
+        if used is not None and 0 <= used <= 100 and reset and reset > now:
             snapshot[key] = used
             snapshot[f"{key}_reset"] = reset
     if "q5" not in snapshot and "q7" not in snapshot:
@@ -496,8 +514,8 @@ def probe_claude_quota(home: Path, cache: Dict[str, Any], now: float) -> Dict[st
     cli = _load_json(resolve_data_dir(home, create=False) / "claude_statusline_quota.json")
 
     def _valid_ts(item: Dict[str, Any]) -> int:
-        v = item.get("updated")
-        if isinstance(v, (int, float)) and math.isfinite(float(v)) and float(v) > 0:
+        v = _safe_finite_float(item.get("updated"))
+        if v is not None and v > 0:
             return int(v)
         return 0
 
@@ -510,58 +528,57 @@ def probe_claude_quota(home: Path, cache: Dict[str, Any], now: float) -> Dict[st
     else:
         snap = {}
 
-    if snap and snap.get("source") != "cli" and _valid_ts(snap) <= now:
+    if snap and snap.get("source") != "cli" and 0 < _valid_ts(snap) <= now:
         cache["claude"] = snap
 
     windows: List[Dict[str, Any]] = []
     if snap:
         if snap.get("q5") is not None:
-            try:
-                used = float(snap["q5"])
-                if math.isfinite(used) and 0.0 <= used <= 100.0:
-                    windows.append(
-                        {
-                            "id": "claude_5h",
-                            "label": "5 小时窗口",
-                            "short_label": "CL5",
-                            "used_percent": round(used, 1),
-                            "_raw_used_percent": used,
-                            "remaining_percent": round(max(0.0, 100.0 - used), 1),
-                            "resets_at": snap.get("q5_reset"),
-                            "window_minutes": 300,
-                        }
-                    )
-            except (TypeError, ValueError):
-                pass
+            used = _safe_finite_float(snap.get("q5"))
+            if used is not None and 0.0 <= used <= 100.0:
+                windows.append(
+                    {
+                        "id": "claude_5h",
+                        "label": "5 小时窗口",
+                        "short_label": "CL5",
+                        "used_percent": round(used, 1),
+                        "raw_used_percent": round(used, 6),
+                        "_raw_used_percent": used,
+                        "remaining_percent": round(max(0.0, 100.0 - used), 1),
+                        "resets_at": snap.get("q5_reset"),
+                        "window_minutes": 300,
+                    }
+                )
         if snap.get("q7") is not None:
-            try:
-                used = float(snap["q7"])
-                if math.isfinite(used) and 0.0 <= used <= 100.0:
-                    windows.append(
-                        {
-                            "id": "claude_7d",
-                            "label": "7 天周额度",
-                            "short_label": "CL7",
-                            "used_percent": round(used, 1),
-                            "_raw_used_percent": used,
-                            "remaining_percent": round(max(0.0, 100.0 - used), 1),
-                            "resets_at": snap.get("q7_reset"),
-                            "window_minutes": 10080,
-                        }
-                    )
-            except (TypeError, ValueError):
-                pass
+            used = _safe_finite_float(snap.get("q7"))
+            if used is not None and 0.0 <= used <= 100.0:
+                windows.append(
+                    {
+                        "id": "claude_7d",
+                        "label": "7 天周额度",
+                        "short_label": "CL7",
+                        "used_percent": round(used, 1),
+                        "raw_used_percent": round(used, 6),
+                        "_raw_used_percent": used,
+                        "remaining_percent": round(max(0.0, 100.0 - used), 1),
+                        "resets_at": snap.get("q7_reset"),
+                        "window_minutes": 10080,
+                    }
+                )
 
     if windows:
-        updated = _valid_ts(snap) or int(now)
-        not_future = (updated <= now)
+        updated = _valid_ts(snap)
+        has_valid_obs = updated > 0
+        not_future = has_valid_obs and (updated <= now)
         any_unreset = any(
             (w.get("resets_at") is None)
-            or (isinstance(w.get("resets_at"), (int, float)) and float(w["resets_at"]) > now)
+            or ((_safe_finite_float(w.get("resets_at")) or 0.0) > now)
             for w in windows
         )
-        is_fresh = not_future and any_unreset and (0.0 <= (now - updated) < CLAUDE_DISPLAY_TTL)
-        if not not_future:
+        is_fresh = has_valid_obs and not_future and any_unreset and (0.0 <= (now - updated) < CLAUDE_DISPLAY_TTL)
+        if not has_valid_obs:
+            status_text = "缺少有效观测时间，保留上次读数"
+        elif not not_future:
             status_text = "观测时间异常（晚于当前时钟）"
         elif not any_unreset:
             status_text = "窗口已重置，保留上次读数"
@@ -724,16 +741,11 @@ def probe_grok_quota(cache: Dict[str, Any], now: float) -> Dict[str, Any]:
 def _window_fresh_until(provider: Dict[str, Any], window: Dict[str, Any], now: float) -> Optional[float]:
     if provider.get("status") != "ok":
         return None
-    fetched_at = provider.get("fetched_at")
-    if (
-        not isinstance(fetched_at, (int, float))
-        or not math.isfinite(float(fetched_at))
-        or float(fetched_at) <= 0
-        or float(fetched_at) > now
-    ):
+    fetched_at = _safe_finite_float(provider.get("fetched_at"))
+    if fetched_at is None or fetched_at <= 0 or fetched_at > now:
         return None
-    used = window.get("_raw_used_percent", window.get("used_percent"))
-    if not isinstance(used, (int, float)) or not math.isfinite(float(used)) or not (0.0 <= float(used) <= 100.0):
+    used = _safe_finite_float(window.get("_raw_used_percent", window.get("raw_used_percent", window.get("used_percent"))))
+    if used is None or not (0.0 <= used <= 100.0):
         return None
 
     pid = provider.get("id")
@@ -744,14 +756,13 @@ def _window_fresh_until(provider: Dict[str, Any], window: Dict[str, Any], now: f
     else:
         return None
 
-    limit = float(fetched_at) + ttl
+    limit = fetched_at + ttl
     resets_at = window.get("resets_at")
     if resets_at is not None:
-        if not isinstance(resets_at, (int, float)) or not math.isfinite(float(resets_at)):
+        r_num = _safe_finite_float(resets_at)
+        if r_num is None or r_num <= now:
             return None
-        if float(resets_at) <= now:
-            return None
-        limit = min(limit, float(resets_at))
+        limit = min(limit, r_num)
 
     if now >= limit:
         return None
@@ -786,16 +797,14 @@ def _load_pace_series(cache: Dict[str, Any]) -> List[Dict[str, Any]]:
             for s in samples:
                 if not isinstance(s, dict):
                     continue
-                oat = s.get("observed_at")
-                up = s.get("used_percent")
+                oat = _safe_finite_float(s.get("observed_at"))
+                up = _safe_finite_float(s.get("used_percent"))
                 if (
-                    isinstance(oat, (int, float))
-                    and isinstance(up, (int, float))
-                    and math.isfinite(float(oat))
-                    and math.isfinite(float(up))
-                    and 0.0 <= float(up) <= 100.0
+                    oat is not None
+                    and up is not None
+                    and 0.0 <= up <= 100.0
                 ):
-                    valid_samples.append({"observed_at": int(oat), "used_percent": float(up)})
+                    valid_samples.append({"observed_at": int(oat), "used_percent": up})
             clean.append(
                 {
                     "provider_id": pid,
@@ -1006,21 +1015,26 @@ def collect_quotas(
         if p.get("status") != "ok":
             continue
         for w in p.get("windows") or []:
-            fu = w.get("fresh_until_ts")
-            if isinstance(fu, (int, float)) and now < float(fu):
+            fu = _safe_finite_float(w.get("fresh_until_ts"))
+            if fu is not None and now < fu:
+                raw_used = _safe_finite_float(w.get("raw_used_percent"))
+                eff_used = raw_used if raw_used is not None else float(w["used_percent"])
+                hw_entry: Dict[str, Any] = {
+                    "provider_id": p["id"],
+                    "provider_name": p["name"],
+                    "label": w["label"],
+                    "short_label": w["short_label"],
+                    "used_percent": w["used_percent"],
+                    "resets_at": w.get("resets_at"),
+                }
+                if raw_used is not None:
+                    hw_entry["raw_used_percent"] = raw_used
                 fresh_candidates.append(
                     (
-                        -float(w["used_percent"]),
+                        -eff_used,
                         str(p["id"]),
                         str(w["id"]),
-                        {
-                            "provider_id": p["id"],
-                            "provider_name": p["name"],
-                            "label": w["label"],
-                            "short_label": w["short_label"],
-                            "used_percent": w["used_percent"],
-                            "resets_at": w.get("resets_at"),
-                        },
+                        hw_entry,
                     )
                 )
 

@@ -818,6 +818,450 @@ class TestV07Guardrails(unittest.TestCase):
         self.assertEqual(trails[str(p_work_only)]["cost_usd"], 0.0)
         self.assertFalse(trails[str(p_work_only)]["has_cost_observation"])
 
+    # ------------------------------------------------------------------
+    # Round-2 #1: Valid JSON with bad metering token field preserves old bucket
+    # ------------------------------------------------------------------
+    def test_r2_01_bad_token_field_in_valid_json_preserves_old_bucket_and_recovers(self):
+        cx_dir = self.home / ".codex" / "sessions" / "2026" / "11" / "27"
+        cx_dir.mkdir(parents=True)
+        t0 = NOW_DT - timedelta(minutes=20)
+        f = cx_dir / "rollout-bad-field.jsonl"
+
+        base_head = [
+            {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "s-bf", "originator": "codex_cli_rs", "cwd": str(self.home / "proj-bf")}},
+            {"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+            # Explicitly empty info event & omitted optional fields must stay valid
+            {"timestamp": _iso(t0 + timedelta(seconds=5)), "type": "event_msg", "payload": {"type": "token_count", "info": None}},
+            {"timestamp": _iso(t0 + timedelta(seconds=10)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000}}}},
+        ]
+        good_second = {
+            "timestamp": _iso(t0 + timedelta(seconds=20)),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 4000, "output_tokens": 0}}},
+        }
+        f.write_text("\n".join(json.dumps(x) for x in base_head + [good_second]) + "\n", encoding="utf-8")
+
+        r1 = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS)
+        self.assertEqual(r1["collection"]["sources"]["usage.codex"]["status"], "complete")
+        self.assertEqual(r1["usage"]["periods"]["today"]["total_tokens"], 5000)
+        old_bucket = copy.deepcopy(lg.load_ledger(self.home / ".agent-pulse" / "ledger.json")["live_tools"]["codex"][TODAY_STR])
+
+        # Corrupt ONLY the second event's input_tokens with bad string / bool / float / negative
+        for bad_val in ("broken", True, 1.5, -10, ""):
+            bad_second = copy.deepcopy(good_second)
+            bad_second["payload"]["info"]["last_token_usage"]["input_tokens"] = bad_val
+            f.write_text("\n".join(json.dumps(x) for x in base_head + [bad_second]) + "\n", encoding="utf-8")
+            r_bad = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS + 15)
+            self.assertIn(r_bad["collection"]["sources"]["usage.codex"]["status"], ("partial", "unavailable"), f"bad_val={bad_val!r}")
+            self.assertEqual(r_bad["usage"]["periods"]["today"]["total_tokens"], 5000, f"bad_val={bad_val!r}")
+            self.assertEqual(
+                lg.load_ledger(self.home / ".agent-pulse" / "ledger.json")["live_tools"]["codex"][TODAY_STR],
+                old_bucket,
+                f"bad_val={bad_val!r}",
+            )
+
+        # Recover with updated 5,000 second event -> 6,000 total
+        recovered_second = copy.deepcopy(good_second)
+        recovered_second["payload"]["info"]["last_token_usage"]["input_tokens"] = 5000
+        f.write_text("\n".join(json.dumps(x) for x in base_head + [recovered_second]) + "\n", encoding="utf-8")
+        r_ok = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS + 30)
+        self.assertEqual(r_ok["collection"]["sources"]["usage.codex"]["status"], "complete")
+        self.assertEqual(r_ok["usage"]["periods"]["today"]["total_tokens"], 6000)
+
+    # ------------------------------------------------------------------
+    # Round-2 #2: Codex cross-file cumulative order & cross-format mirrors
+    # ------------------------------------------------------------------
+    def test_r2_02_codex_cross_file_cumulative_order_and_cross_format_mirror(self):
+        t0 = NOW_DT - timedelta(minutes=25)
+        tbl = pr.PricingTable({"gpt-5.3-codex": {"in": 1.75, "out": 0.0, "cache_read": 0.0, "cache_write": 0.0}}, {})
+
+        # Subtest A: full file (1M + 3M) + tail-only copy (3M) in BOTH filename orders!
+        full_events = [
+            {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "sess-cum", "originator": "codex_cli_rs"}},
+            {"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+            {"timestamp": _iso(t0 + timedelta(seconds=10)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1_000_000, "output_tokens": 0}}}},
+            {"timestamp": _iso(t0 + timedelta(seconds=50)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 3_000_000, "output_tokens": 0}}}},
+        ]
+        tail_events = [
+            {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "sess-cum", "originator": "codex_cli_rs"}},
+            {"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+            {"timestamp": _iso(t0 + timedelta(seconds=50)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 3_000_000, "output_tokens": 0}}}},
+        ]
+        for names in (("a-full.jsonl", "z-tail.jsonl"), ("z-full.jsonl", "a-tail.jsonl")):
+            with tempfile.TemporaryDirectory() as td:
+                h = Path(td)
+                d = h / ".codex" / "sessions" / "2026" / "11" / "27"
+                d.mkdir(parents=True)
+                (d / names[0]).write_text("\n".join(json.dumps(x) for x in full_events) + "\n", encoding="utf-8")
+                (d / names[1]).write_text("\n".join(json.dumps(x) for x in tail_events) + "\n", encoding="utf-8")
+                with patch.object(pr.PricingTable, "load", return_value=tbl):
+                    cold = _strip_perf(c.collect_all(home=h, days=7, use_cache=True, now_ts=NOW_TS))
+                    warm = _strip_perf(c.collect_all(home=h, days=7, use_cache=True, now_ts=NOW_TS))
+                    nc = _strip_perf(c.collect_all(home=h, days=7, use_cache=False, now_ts=NOW_TS))
+                self.assertEqual(cold, warm, f"order={names}")
+                self.assertEqual(cold, nc, f"order={names}")
+                self.assertEqual(cold["usage"]["periods"]["today"]["total_tokens"], 3_000_000, f"order={names}")
+                codex_m = next(t for t in cold["usage"]["periods"]["month"]["tools"] if t["tool"] == "codex")
+                self.assertAlmostEqual(codex_m["billing"]["subscription_candidate_usd"], 5.25, places=4, msg=f"order={names}")
+
+        # Subtest B: legacy token_count and new token_usage_record split across TWO files (both with & without thread_token_usage)
+        legacy_file_events = [
+            {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "sess-mirror", "originator": "codex_cli_rs"}},
+            {"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+            {"timestamp": _iso(t0 + timedelta(seconds=20)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1_000_000, "output_tokens": 0}, "last_token_usage": {"input_tokens": 1_000_000, "output_tokens": 0}}}},
+        ]
+        for include_thread_total in (True, False):
+            new_payload = {"usage": {"input_tokens": 1_000_000, "output_tokens": 0}, "response_id": "resp-split-1", "thread_id": "sess-mirror"}
+            if include_thread_total:
+                new_payload["thread_token_usage"] = {"input_tokens": 1_000_000, "output_tokens": 0}
+            new_file_events = [
+                {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "sess-mirror", "originator": "codex_cli_rs"}},
+                {"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+                {"timestamp": _iso(t0 + timedelta(seconds=20)), "type": "token_usage_record", "payload": new_payload},
+            ]
+            for names in (("a-old.jsonl", "z-new.jsonl"), ("z-old.jsonl", "a-new.jsonl")):
+                with tempfile.TemporaryDirectory() as td:
+                    h = Path(td)
+                    d = h / ".codex" / "sessions" / "2026" / "11" / "27"
+                    d.mkdir(parents=True)
+                    (d / names[0]).write_text("\n".join(json.dumps(x) for x in legacy_file_events) + "\n", encoding="utf-8")
+                    (d / names[1]).write_text("\n".join(json.dumps(x) for x in new_file_events) + "\n", encoding="utf-8")
+                    with patch.object(pr.PricingTable, "load", return_value=tbl):
+                        cold = _strip_perf(c.collect_all(home=h, days=7, use_cache=True, now_ts=NOW_TS))
+                        warm = _strip_perf(c.collect_all(home=h, days=7, use_cache=True, now_ts=NOW_TS))
+                        nc = _strip_perf(c.collect_all(home=h, days=7, use_cache=False, now_ts=NOW_TS))
+                    self.assertEqual(cold, warm)
+                    self.assertEqual(cold, nc)
+                    self.assertEqual(cold["usage"]["periods"]["today"]["total_tokens"], 1_000_000)
+                    codex_m = next(t for t in cold["usage"]["periods"]["month"]["tools"] if t["tool"] == "codex")
+                    self.assertAlmostEqual(codex_m["billing"]["subscription_candidate_usd"], 1.75, places=4)
+
+        # Subtest C: two same-amount independent events in one session + duplicate file copy -> counted twice, not once or 4x
+        with tempfile.TemporaryDirectory() as td:
+            h = Path(td)
+            d = h / ".codex" / "sessions" / "2026" / "11" / "27"
+            d.mkdir(parents=True)
+            indep_events = [
+                {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "sess-indep", "originator": "codex_cli_rs"}},
+                {"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+                {"timestamp": _iso(t0 + timedelta(seconds=10)), "type": "token_usage_record", "payload": {"usage": {"input_tokens": 1_000_000, "output_tokens": 0}, "response_id": "r-indep-1"}},
+                {"timestamp": _iso(t0 + timedelta(seconds=10)), "type": "token_usage_record", "payload": {"usage": {"input_tokens": 1_000_000, "output_tokens": 0}, "response_id": "r-indep-2"}},
+            ]
+            (d / "indep-1.jsonl").write_text("\n".join(json.dumps(x) for x in indep_events) + "\n", encoding="utf-8")
+            (d / "indep-2-copy.jsonl").write_text("\n".join(json.dumps(x) for x in indep_events) + "\n", encoding="utf-8")
+            with patch.object(pr.PricingTable, "load", return_value=tbl):
+                cold = _strip_perf(c.collect_all(home=h, days=7, use_cache=True, now_ts=NOW_TS))
+                warm = _strip_perf(c.collect_all(home=h, days=7, use_cache=True, now_ts=NOW_TS))
+                nc = _strip_perf(c.collect_all(home=h, days=7, use_cache=False, now_ts=NOW_TS))
+            self.assertEqual(cold, warm)
+            self.assertEqual(cold, nc)
+            self.assertEqual(cold["usage"]["periods"]["today"]["total_tokens"], 2_000_000)
+            codex_m = next(t for t in cold["usage"]["periods"]["month"]["tools"] if t["tool"] == "codex")
+            self.assertAlmostEqual(codex_m["billing"]["subscription_candidate_usd"], 3.50, places=4)
+
+    # ------------------------------------------------------------------
+    # Round-2 #3: Late same-turn cwd attribution & v0.6 upgrade project dedup
+    # ------------------------------------------------------------------
+    def test_r2_03_late_turn_cwd_attribution_and_v06_upgrade_project_reconciliation(self):
+        t0 = NOW_DT - timedelta(minutes=15)
+        tbl = pr.PricingTable({"gpt-5.3-codex": {"in": 1.75, "out": 0.0, "cache_read": 0.0, "cache_write": 0.0}}, {})
+
+        # Part A: session cwd A, turn t1 emits usage BEFORE turn_context(turn_id=t1, cwd=B)
+        proj_a = self.home / "proj-late-A"
+        proj_b = self.home / "proj-late-B"
+        proj_a.mkdir()
+        proj_b.mkdir()
+        cx_dir = self.home / ".codex" / "sessions" / "2026" / "11" / "27"
+        cx_dir.mkdir(parents=True)
+        late_events = [
+            {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "s-late-cwd", "originator": "codex_cli_rs", "cwd": str(proj_a)}},
+            {"timestamp": _iso(t0), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-late", "started_at": _iso(t0)}},
+            {"timestamp": _iso(t0 + timedelta(seconds=10)), "type": "event_msg", "payload": {"type": "token_count", "turn_id": "t-late", "info": {"total_token_usage": {"input_tokens": 1_000_000, "output_tokens": 0}}}},
+            {"timestamp": _iso(t0 + timedelta(seconds=20)), "type": "turn_context", "payload": {"turn_id": "t-late", "model": "gpt-5.3-codex", "cwd": str(proj_b)}},
+            {"timestamp": _iso(t0 + timedelta(seconds=30)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-late", "started_at": _iso(t0), "completed_at": _iso(t0 + timedelta(seconds=30))}},
+        ]
+        (cx_dir / "late-cwd.jsonl").write_text("\n".join(json.dumps(x) for x in late_events) + "\n", encoding="utf-8")
+
+        with patch.object(pr.PricingTable, "load", return_value=tbl):
+            p_late = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS)
+        trails_a = {t["path"]: t for t in p_late["usage"]["project_trails"]}
+        self.assertNotIn(str(proj_a), trails_a)
+        self.assertIn(str(proj_b), trails_a)
+        self.assertAlmostEqual(trails_a[str(proj_b)]["periods"]["today"]["agent_seconds"], 30.0, delta=0.5)
+        self.assertEqual(trails_a[str(proj_b)]["periods"]["today"]["total_tokens"], 1_000_000)
+        self.assertAlmostEqual(trails_a[str(proj_b)]["periods"]["today"]["cost_usd"], 1.75, places=4)
+
+        # Part B: Simulate realistic v0.6 ledger upgrade (v0.6 placed 1M tokens in proj-A for today,
+        # plus historical proj-hist 30 days ago outside the 7-day scan window)
+        with tempfile.TemporaryDirectory() as td_up:
+            h_up = Path(td_up)
+            up_a = h_up / "proj-up-A"
+            up_b = h_up / "proj-up-B"
+            up_hist = h_up / "proj-hist-old"
+            for d in (up_a, up_b, up_hist):
+                d.mkdir()
+            hist_day = (NOW_DT - timedelta(days=30)).strftime("%Y-%m-%d")
+
+            # Seed realistic v0.6 ledger (no `collection`, no `project_work_days`, stale today attribution on up_a)
+            data_dir = h_up / ".agent-pulse"
+            data_dir.mkdir(mode=0o700)
+            v06_ledger = {
+                "version": 1,
+                "updated_at": _iso(NOW_DT - timedelta(minutes=1)),
+                "tokei_import_meta": None,
+                "imported_tools": {},
+                "live_tools": {
+                    "codex": {
+                        TODAY_STR: {
+                            "in": 1_000_000, "out": 0, "cr": 0, "cw": 0, "thoughts": 0,
+                            "cost_usd": 1.75, "requests": 1, "sessions": 1,
+                            "models": {"gpt-5.3-codex": {"in": 1_000_000, "out": 0, "cr": 0, "cw": 0, "thoughts": 0, "cost_usd": 1.75, "requests": 1}},
+                        }
+                    }
+                },
+                "projects": {
+                    str(up_a): {
+                        TODAY_STR: {"in": 1_000_000, "out": 0, "cr": 0, "cw": 0, "thoughts": 0, "cost_usd": 1.75, "sessions": 1, "tools": ["codex"]}
+                    },
+                    str(up_hist): {
+                        hist_day: {"in": 200_000, "out": 0, "cr": 0, "cw": 0, "thoughts": 0, "cost_usd": 0.35, "sessions": 1, "tools": ["codex"]}
+                    },
+                },
+                "work_days": {},
+            }
+            (data_dir / "ledger.json").write_text(json.dumps(v06_ledger), encoding="utf-8")
+
+            # Place Codex log where turn_context(cwd=up_b) precedes usage
+            cx_up = h_up / ".codex" / "sessions" / "2026" / "11" / "27"
+            cx_up.mkdir(parents=True)
+            up_events = [
+                {"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "s-up", "originator": "codex_cli_rs", "cwd": str(up_a)}},
+                {"timestamp": _iso(t0), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-up", "started_at": _iso(t0)}},
+                {"timestamp": _iso(t0 + timedelta(seconds=1)), "type": "turn_context", "payload": {"turn_id": "t-up", "model": "gpt-5.3-codex", "cwd": str(up_b)}},
+                {"timestamp": _iso(t0 + timedelta(seconds=20)), "type": "event_msg", "payload": {"type": "token_count", "turn_id": "t-up", "info": {"total_token_usage": {"input_tokens": 1_000_000, "output_tokens": 0}}}},
+                {"timestamp": _iso(t0 + timedelta(seconds=30)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-up", "started_at": _iso(t0), "completed_at": _iso(t0 + timedelta(seconds=30))}},
+            ]
+            (cx_up / "up.jsonl").write_text("\n".join(json.dumps(x) for x in up_events) + "\n", encoding="utf-8")
+
+            with patch.object(pr.PricingTable, "load", return_value=tbl):
+                p_up = c.collect_all(home=h_up, days=7, use_cache=False, now_ts=NOW_TS)
+
+            # Global today = 1M / $1.75
+            self.assertEqual(p_up["usage"]["periods"]["today"]["total_tokens"], 1_000_000)
+            self.assertAlmostEqual(p_up["usage"]["periods"]["today"]["cost_usd"], 1.75, places=4)
+
+            # Legacy usage.projects: ONLY up_b (1M) + preserved out-of-window up_hist (200k); up_a reconciled away!
+            legacy_projs = {p["path"]: p for p in p_up["usage"]["projects"]}
+            self.assertNotIn(str(up_a), legacy_projs)
+            self.assertIn(str(up_b), legacy_projs)
+            self.assertEqual(legacy_projs[str(up_b)]["total_tokens"], 1_000_000)
+            self.assertIn(str(up_hist), legacy_projs)
+            self.assertEqual(legacy_projs[str(up_hist)]["total_tokens"], 200_000)
+
+            # New usage.project_trails: ONLY up_b (today=1M/$1.75/30s) + up_hist (all=200k); NO duplicate on up_a!
+            up_trails = {t["path"]: t for t in p_up["usage"]["project_trails"]}
+            self.assertNotIn(str(up_a), up_trails)
+            self.assertEqual(up_trails[str(up_b)]["periods"]["today"]["total_tokens"], 1_000_000)
+            self.assertAlmostEqual(up_trails[str(up_b)]["periods"]["today"]["cost_usd"], 1.75, places=4)
+            self.assertEqual(up_trails[str(up_hist)]["periods"]["all"]["total_tokens"], 200_000)
+
+    # ------------------------------------------------------------------
+    # Round-2 #4: OverflowError on huge integer (10**309) in v5 caches
+    # ------------------------------------------------------------------
+    def test_r2_04_overflow_huge_int_in_v5_caches_falls_back_cleanly(self):
+        cx_dir = self.home / ".codex" / "sessions" / "2026" / "11" / "27"
+        cx_dir.mkdir(parents=True)
+        t0 = NOW_DT - timedelta(minutes=20)
+        f = cx_dir / "overflow-test.jsonl"
+        f.write_text("\n".join([
+            json.dumps({"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "s-ovf", "originator": "codex_cli_rs", "cwd": str(self.home / "p")}}),
+            json.dumps({"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "gpt-5.3-codex"}}),
+            json.dumps({"timestamp": _iso(t0), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-ovf", "started_at": _iso(t0)}}),
+            json.dumps({"timestamp": _iso(t0 + timedelta(seconds=30)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-ovf", "started_at": _iso(t0), "completed_at": _iso(t0 + timedelta(seconds=30))}}),
+            json.dumps({"timestamp": _iso(t0 + timedelta(seconds=31)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 12000, "output_tokens": 500}}}}),
+        ]) + "\n", encoding="utf-8")
+        os.utime(f, (NOW_TS - 300, NOW_TS - 300))
+
+        # Seed valid v5 usage_cache.json and cache.json
+        c.collect_all(home=self.home, days=7, use_cache=True, now_ts=NOW_TS)
+        ucache_path = self.home / ".agent-pulse" / "usage_cache.json"
+        scache_path = self.home / ".agent-pulse" / "cache.json"
+        raw_uc = json.loads(ucache_path.read_text(encoding="utf-8"))
+        raw_sc = json.loads(scache_path.read_text(encoding="utf-8"))
+
+        huge_int = 10 ** 309
+        for k in raw_uc["files"]:
+            raw_uc["files"][k]["rows"][0]["cost_usd"] = huge_int
+        ucache_path.write_text(json.dumps(raw_uc), encoding="utf-8")
+
+        for k in raw_sc["files"]:
+            if raw_sc["files"][k].get("segs"):
+                raw_sc["files"][k]["segs"][0][1] = huge_int
+        scache_path.write_text(json.dumps(raw_sc), encoding="utf-8")
+
+        env = dict(os.environ, HOME=str(self.home), AGENTPULSE_NOW_TS=str(NOW_TS))
+        script = str(ROOT / "engine" / "collector.py")
+        p_fast = subprocess.run(["/usr/bin/python3", "-I", "-B", script, "--days", "7", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+        p_nc = subprocess.run(["/usr/bin/python3", "-I", "-B", script, "--days", "7", "--json", "--no-cache"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+
+        self.assertEqual(p_fast.returncode, 0, p_fast.stderr)
+        self.assertEqual(p_nc.returncode, 0, p_nc.stderr)
+        self.assertEqual(_strip_perf(json.loads(p_fast.stdout)), _strip_perf(json.loads(p_nc.stdout)))
+
+    # ------------------------------------------------------------------
+    # Round-2 #5: Offline Claude updated=0 never fabricates now; 69.96% raw precision
+    # ------------------------------------------------------------------
+    def test_r2_05_offline_quota_updated_zero_and_raw_precision_6996(self):
+        t_now = 1795676400.0
+        data_dir = self.home / ".agent-pulse"
+        data_dir.mkdir(mode=0o700, exist_ok=True)
+
+        # Case A: Offline Claude cache with 97%, future reset, updated=0 -> MUST be stale, fetched_at=0, highest_window=None
+        (data_dir / "quota_cache.json").write_text(json.dumps({
+            "claude": {"q5": 97.0, "q5_reset": int(t_now + 3600), "updated": 0}
+        }), encoding="utf-8")
+        q_zero = qc.collect_quotas(home=self.home, force=False, now_ts=t_now, allow_live=False)
+        claude_zero = next(p for p in q_zero["providers"] if p["id"] == "claude")
+        self.assertEqual(claude_zero["status"], "stale")
+        self.assertEqual(claude_zero["fetched_at"], 0)
+        self.assertNotIn("fresh_until_ts", claude_zero["windows"][0])
+        self.assertIsNone(q_zero["highest_window"])
+
+        # Case B: Statusline 69.96% -> display used_percent=70.0, raw_used_percent=69.96 (< 70.0!)
+        qc.capture_claude_statusline(
+            self.home,
+            {"rate_limits": {"five_hour": {"used_percentage": 69.96, "resets_at": int(t_now + 7200)}}},
+            t_now - 30,
+        )
+        q_6996 = qc.collect_quotas(home=self.home, force=False, now_ts=t_now, allow_live=False)
+        claude_6996 = next(p for p in q_6996["providers"] if p["id"] == "claude")
+        self.assertEqual(claude_6996["status"], "ok")
+        self.assertEqual(claude_6996["windows"][0]["used_percent"], 70.0)
+        self.assertAlmostEqual(claude_6996["windows"][0]["raw_used_percent"], 69.96, places=4)
+        self.assertIsNotNone(q_6996["highest_window"])
+        self.assertAlmostEqual(q_6996["highest_window"]["raw_used_percent"], 69.96, places=4)
+        self.assertLess(q_6996["highest_window"]["raw_used_percent"], 70.0)
+
+        # Case C: Statusline 70.00% -> raw_used_percent=70.0 (>= 70.0!)
+        qc.capture_claude_statusline(
+            self.home,
+            {"rate_limits": {"five_hour": {"used_percentage": 70.0, "resets_at": int(t_now + 7200)}}},
+            t_now - 10,
+        )
+        q_70 = qc.collect_quotas(home=self.home, force=False, now_ts=t_now, allow_live=False)
+        self.assertAlmostEqual(q_70["highest_window"]["raw_used_percent"], 70.0, places=4)
+        self.assertGreaterEqual(q_70["highest_window"]["raw_used_percent"], 70.0)
+
+    # ------------------------------------------------------------------
+    # Round-2 #7: 26-week heatmap work_status=unknown aligns with today & report
+    # ------------------------------------------------------------------
+    def test_r2_07_heatmap_work_status_unknown_aligns_with_today_and_report(self):
+        cx_dir = self.home / ".codex" / "sessions" / "2026" / "11" / "27"
+        cx_dir.mkdir(parents=True)
+        (cx_dir / "bad.jsonl").write_text("{corrupt_json\n", encoding="utf-8")
+
+        p_unk = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS)
+        self.assertEqual(p_unk["today"]["work_status"], "unknown")
+        self.assertEqual(p_unk["usage"]["periods"]["today"]["work_status"], "unknown")
+        hm_today = p_unk["usage"]["heatmap"]["days"][-1]
+        self.assertEqual(hm_today["date"], TODAY_STR)
+        self.assertEqual(hm_today["work_status"], "unknown")
+        self.assertEqual(p_unk["usage"]["history_30d"][-1]["work_status"], "unknown")
+        md_day = c.render_markdown_report(p_unk)
+        self.assertIn("**—**", md_day)
+        self.assertNotIn("**0.00 h**", md_day)
+
+        # Clean empty scan -> heatmap work_status becomes observed
+        (cx_dir / "bad.jsonl").unlink()
+        p_obs = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS + 15)
+        self.assertEqual(p_obs["today"]["work_status"], "observed")
+        self.assertEqual(p_obs["usage"]["heatmap"]["days"][-1]["work_status"], "observed")
+
+    # ------------------------------------------------------------------
+    # Round-2 #8: Sub-cent ($0.00175) & zero-priced mixed cost formatting
+    # ------------------------------------------------------------------
+    def test_r2_08_subcent_and_zero_priced_mixed_cost_formatting_all_surfaces(self):
+        cx_dir = self.home / ".codex" / "sessions" / "2026" / "11" / "27"
+        cx_dir.mkdir(parents=True)
+        t0 = NOW_DT - timedelta(minutes=20)
+        p_subcent = self.home / "proj-subcent"
+        p_mixzero = self.home / "proj-mixzero"
+        p_pure_unp = self.home / "proj-pure-unp"
+        p_zero_only = self.home / "proj-zero-only"
+        for d in (p_subcent, p_mixzero, p_pure_unp, p_zero_only):
+            d.mkdir()
+
+        # 1) Sub-cent mixed: 1,000 priced ($0.00175) + 1,000 unpriced -> "$0.00+"
+        (cx_dir / "subcent.jsonl").write_text("\n".join([
+            json.dumps({"timestamp": _iso(t0), "type": "session_meta", "payload": {"id": "s-sc", "originator": "codex_cli_rs", "cwd": str(p_subcent)}}),
+            json.dumps({"timestamp": _iso(t0), "type": "turn_context", "payload": {"model": "priced-175"}}),
+            json.dumps({"timestamp": _iso(t0 + timedelta(seconds=5)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "output_tokens": 0}}}}),
+            json.dumps({"timestamp": _iso(t0 + timedelta(seconds=10)), "type": "turn_context", "payload": {"model": "mystery-unpriced"}}),
+            json.dumps({"timestamp": _iso(t0 + timedelta(seconds=15)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "output_tokens": 0}}}}),
+        ]) + "\n", encoding="utf-8")
+
+        # 2) Mixed zero-priced (on yesterday): 1,000 free ($0) + 1,000 unpriced -> "$0.00+"
+        y_dt = NOW_DT - timedelta(days=1)
+        y_day = y_dt.strftime("%Y-%m-%d")
+        (cx_dir / "mixzero.jsonl").write_text("\n".join([
+            json.dumps({"timestamp": _iso(y_dt), "type": "session_meta", "payload": {"id": "s-mz", "originator": "codex_cli_rs", "cwd": str(p_mixzero)}}),
+            json.dumps({"timestamp": _iso(y_dt), "type": "turn_context", "payload": {"model": "free-zero"}}),
+            json.dumps({"timestamp": _iso(y_dt + timedelta(seconds=5)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "output_tokens": 0}}}}),
+            json.dumps({"timestamp": _iso(y_dt + timedelta(seconds=10)), "type": "turn_context", "payload": {"model": "mystery-unpriced"}}),
+            json.dumps({"timestamp": _iso(y_dt + timedelta(seconds=15)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "output_tokens": 0}}}}),
+        ]) + "\n", encoding="utf-8")
+
+        # 3) Pure unpriced (2 days ago) & Confirmed zero (3 days ago)
+        d2 = NOW_DT - timedelta(days=2)
+        d3 = NOW_DT - timedelta(days=3)
+        (cx_dir / "pure-unp.jsonl").write_text("\n".join([
+            json.dumps({"timestamp": _iso(d2), "type": "session_meta", "payload": {"id": "s-pu", "originator": "codex_cli_rs", "cwd": str(p_pure_unp)}}),
+            json.dumps({"timestamp": _iso(d2), "type": "turn_context", "payload": {"model": "mystery-unpriced"}}),
+            json.dumps({"timestamp": _iso(d2 + timedelta(seconds=5)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "output_tokens": 0}}}}),
+        ]) + "\n", encoding="utf-8")
+        (cx_dir / "zero-only.jsonl").write_text("\n".join([
+            json.dumps({"timestamp": _iso(d3), "type": "session_meta", "payload": {"id": "s-zo", "originator": "codex_cli_rs", "cwd": str(p_zero_only)}}),
+            json.dumps({"timestamp": _iso(d3), "type": "turn_context", "payload": {"model": "free-zero"}}),
+            json.dumps({"timestamp": _iso(d3 + timedelta(seconds=5)), "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "output_tokens": 0}}}}),
+        ]) + "\n", encoding="utf-8")
+
+        tbl = pr.PricingTable(
+            {
+                "priced-175": {"in": 1.75, "out": 0.0, "cache_read": 0.0, "cache_write": 0.0},
+                "free-zero": {"in": 0.0, "out": 0.0, "cache_read": 0.0, "cache_write": 0.0},
+            },
+            {},
+        )
+        with patch.object(pr.PricingTable, "load", return_value=tbl):
+            payload = c.collect_all(home=self.home, days=7, use_cache=False, now_ts=NOW_TS)
+
+        # Verify sub-cent precision preserved (0.00175) across today, period, heatmap, projects, trails!
+        self.assertAlmostEqual(payload["today"]["cost_usd"], 0.00175, places=6)
+        self.assertAlmostEqual(payload["usage"]["periods"]["today"]["cost_usd"], 0.00175, places=6)
+        hm_map = {d["date"]: d for d in payload["usage"]["heatmap"]["days"]}
+        self.assertAlmostEqual(hm_map[TODAY_STR]["cost_usd"], 0.00175, places=6)
+        projs = {p["path"]: p for p in payload["usage"]["projects"]}
+        self.assertAlmostEqual(projs[str(p_subcent)]["cost_usd"], 0.00175, places=6)
+        trails = {t["path"]: t["periods"]["all"] for t in payload["usage"]["project_trails"]}
+        self.assertAlmostEqual(trails[str(p_subcent)]["cost_usd"], 0.00175, places=6)
+
+        # Verify formatting across all 5 states
+        self.assertEqual(c.format_estimated_usd(0.00175, 1000, has_observation=True, total_tokens=2000), "$0.00+")
+        self.assertEqual(c.format_estimated_usd(0.0, 1000, has_observation=True, total_tokens=2000), "$0.00+")
+        self.assertEqual(c.format_estimated_usd(0.0, 1000, has_observation=True, total_tokens=1000), "未计价")
+        self.assertEqual(c.format_estimated_usd(0.0, 0, has_observation=True, total_tokens=1000), "$0.00")
+        self.assertEqual(c.format_estimated_usd(0.0, 0, has_observation=False, total_tokens=0), "—")
+
+        # Verify CLI Markdown reports for today (sub-cent mixed) & yesterday (zero-priced mixed) & d2 (pure unpriced)
+        md_today = c.render_markdown_report(payload)
+        md_today_p = c.render_markdown_report(payload, period="today")
+        md_yest = c.render_markdown_report(payload, target_date=y_day)
+        md_d2 = c.render_markdown_report(payload, target_date=d2.strftime("%Y-%m-%d"))
+        self.assertIn("**$0.00+**", md_today)
+        self.assertIn("**$0.00+**", md_today_p)
+        self.assertIn("**$0.00+**", md_yest)
+        self.assertIn("**未计价**", md_d2)
+
 
 if __name__ == "__main__":
     unittest.main()

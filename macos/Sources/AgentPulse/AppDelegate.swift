@@ -150,13 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if store.menuBarShowCost && store.todayHasCostObservation {
-            segments.append(
-                Formatters.estimatedUSD(
-                    store.todayCostUsd,
-                    unpricedTokens: store.todayUnpricedTokens,
-                    hasObservation: true
-                )
-            )
+            segments.append(store.todayEstimatedCostText)
         }
         if let quotaBadge = store.menuBarQuotaSummary {
             segments.append(quotaBadge)
@@ -188,11 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         if store.snapshot != nil {
-            let costStr = Formatters.estimatedUSD(
-                store.todayCostUsd,
-                unpricedTokens: store.todayUnpricedTokens,
-                hasObservation: store.todayHasCostObservation
-            )
+            let costStr = store.todayEstimatedCostText
             let summaryTitle: String
             if let liveSecs = store.todayLiveSecondsIfKnown {
                 summaryTitle = String(

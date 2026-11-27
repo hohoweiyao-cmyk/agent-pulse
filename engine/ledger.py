@@ -132,10 +132,12 @@ def _safe_int(v: Any) -> int:
 
 
 def _safe_float(v: Any) -> float:
+    if isinstance(v, bool):
+        return 0.0
     try:
         n = float(v)
         return n if n > 0 and math.isfinite(n) else 0.0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
@@ -261,6 +263,7 @@ def update_ledger_with_live(
     live_cutoff_day: str,
     now_ts: float,
     live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    replace_projects_window: Optional[Tuple[str, str]] = None,
 ) -> bool:
     """Merge live_usage & live_projects into ledger for days >= live_cutoff_day. Returns True if changed."""
     live_tools = ledger.setdefault("live_tools", {})
@@ -275,8 +278,23 @@ def update_ledger_with_live(
                 t_dst[day_key] = bucket
                 changed = True
 
-    if live_projects:
+    if live_projects is not None:
         proj_store = ledger.setdefault("projects", {})
+        if replace_projects_window is not None:
+            win_start, win_end = replace_projects_window
+            for proj_path in list(proj_store.keys()):
+                p_dst = proj_store.get(proj_path)
+                if not isinstance(p_dst, dict):
+                    continue
+                new_days = live_projects.get(proj_path) or {}
+                for day_key in list(p_dst.keys()):
+                    if valid_day(day_key) and win_start <= day_key <= win_end and day_key not in new_days:
+                        del p_dst[day_key]
+                        changed = True
+                if not p_dst:
+                    del proj_store[proj_path]
+                    changed = True
+
         for proj_path, day_map in live_projects.items():
             p_dst = proj_store.setdefault(proj_path, {})
             for day_key, bucket in day_map.items():
@@ -514,7 +532,7 @@ def _build_period_summary(
                 "cache_write_tokens": mv["cw"],
                 "reasoning_tokens": mv["thoughts"],
                 "total_tokens": m_tok,
-                "cost_usd": round(mv["cost_usd"], 4),
+                "cost_usd": round(mv["cost_usd"], 6),
                 "unpriced_tokens": mv.get("unpriced_tokens", 0),
                 "cache_hit_rate": m_hit,
                 "rate_in": round(rates["in"], 4) if rates else None,
@@ -536,7 +554,7 @@ def _build_period_summary(
                     "cache_write_tokens": mv["cw"],
                     "reasoning_tokens": mv["thoughts"],
                     "total_tokens": m_tok,
-                    "cost_usd": round(mv["cost_usd"], 4),
+                    "cost_usd": round(mv["cost_usd"], 6),
                     "unpriced_tokens": mv.get("unpriced_tokens", 0),
                     "cache_hit_rate": m_hit,
                 }
@@ -553,7 +571,7 @@ def _build_period_summary(
             "cache_write_tokens": v["cw"],
             "reasoning_tokens": v["thoughts"],
             "total_tokens": tok,
-            "cost_usd": round(v["cost_usd"], 2),
+            "cost_usd": round(v["cost_usd"], 6),
             "unpriced_tokens": v.get("unpriced_tokens", 0),
             "cache_hit_rate": t_hit,
             "sessions": t_sessions,
@@ -597,7 +615,7 @@ def _build_period_summary(
         "cache_write_tokens": total_cw,
         "reasoning_tokens": total_thoughts,
         "total_tokens": total_tokens,
-        "cost_usd": round(total_cost, 2),
+        "cost_usd": round(total_cost, 6),
         "unpriced_tokens": sum(t["unpriced_tokens"] for t in tools_list),
         "cache_hit_rate": cache_hit_rate,
         "active_days": len(active_days_set),
@@ -660,22 +678,42 @@ def _abbreviate_path(path_str: str, home_dir: Optional[Path]) -> str:
     return path_str
 
 
-def _build_projects_list(
+def _combine_usage_projects(
     ledger: Dict[str, Any],
     live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
-    today_dt: datetime,
-    home_dir: Optional[Path],
-) -> List[Dict[str, Any]]:
+    replace_projects_window: Optional[Tuple[str, str]] = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
     combined: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for proj_path, day_map in (ledger.get("projects") or {}).items():
         if isinstance(day_map, dict):
             combined[proj_path] = {dk: bv for dk, bv in day_map.items() if valid_day(dk)}
+    if live_projects is not None and replace_projects_window is not None:
+        win_start, win_end = replace_projects_window
+        for proj_path in list(combined.keys()):
+            new_days = live_projects.get(proj_path) or {}
+            dmap = combined[proj_path]
+            for dk in list(dmap.keys()):
+                if win_start <= dk <= win_end and dk not in new_days:
+                    del dmap[dk]
+            if not dmap:
+                del combined[proj_path]
     if live_projects:
         for proj_path, day_map in live_projects.items():
             dst = combined.setdefault(proj_path, {})
             for dk, bv in day_map.items():
                 if valid_day(dk):
                     dst[dk] = bv
+    return combined
+
+
+def _build_projects_list(
+    ledger: Dict[str, Any],
+    live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    today_dt: datetime,
+    home_dir: Optional[Path],
+    replace_projects_window: Optional[Tuple[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    combined = _combine_usage_projects(ledger, live_projects, replace_projects_window=replace_projects_window)
 
     today_str = today_dt.strftime("%Y-%m-%d")
     week_floor = (today_dt - timedelta(days=6)).strftime("%Y-%m-%d")
@@ -753,7 +791,7 @@ def _build_projects_list(
                 "cache_write_tokens": p_cw,
                 "reasoning_tokens": p_th,
                 "total_tokens": total_tok,
-                "cost_usd": round(p_cost, 2),
+                "cost_usd": round(p_cost, 6),
                 "unpriced_tokens": p_unpriced,
                 "cache_hit_rate": hit,
                 "sessions": p_sess,
@@ -909,7 +947,7 @@ def _build_project_trails(
                 "cache_write_tokens": p_cw,
                 "reasoning_tokens": p_th,
                 "total_tokens": total_tok,
-                "cost_usd": round(p_cost, 2),
+                "cost_usd": round(p_cost, 6),
                 "unpriced_tokens": p_unpriced,
                 "has_cost_observation": has_usage,
                 "cache_hit_rate": hit,
@@ -996,10 +1034,15 @@ def build_usage_payload(
                 rec["hourly_seconds"] = [round(float(x), 1) for x in hs]
             observed_work[day["date"]] = rec
 
+    now_dt = datetime.fromtimestamp(now_ts, tz=BIZ_TZ)
+    today_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=BIZ_TZ)
+    today_str = today_dt.strftime("%Y-%m-%d")
+
     def _compute_gates(
         prev_col: Dict[str, Any],
     ) -> Tuple[
         Optional[Dict[str, str]],
+        bool,
         bool,
         bool,
         bool,
@@ -1014,6 +1057,7 @@ def build_usage_payload(
         if source_statuses is None:
             norm_statuses = None
             proj_u_ok = True
+            proj_u_has_complete = True
             w_ok = True
             pw_ok = True
             w_status = "complete"
@@ -1026,6 +1070,7 @@ def build_usage_payload(
             )
             proj_usage_status = combine_statuses([norm_statuses.get(s, "not_configured") for s in PROJECT_USAGE_SOURCE_IDS])
             proj_u_ok = proj_usage_status in ("complete", "not_configured")
+            proj_u_has_complete = proj_usage_status == "complete"
             w_status = combine_statuses([norm_statuses.get(s, "not_configured") for s in WORK_SOURCE_IDS])
             w_ok = w_status in ("complete", "not_configured")
 
@@ -1061,6 +1106,7 @@ def build_usage_payload(
         return (
             norm_statuses,
             proj_u_ok,
+            proj_u_has_complete,
             w_ok,
             pw_ok,
             w_status,
@@ -1076,6 +1122,8 @@ def build_usage_payload(
     rejected_stale_commit = False
     collection_payload: Optional[Dict[str, Any]] = None
     normalized_statuses: Optional[Dict[str, str]] = None
+    proj_usage_complete = False
+    proj_usage_has_complete = False
     work_complete = True
     gated_live_usage: Dict[str, Dict[str, Dict[str, Any]]] = {}
     gated_live_projects: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -1108,6 +1156,7 @@ def build_usage_payload(
                 (
                     normalized_statuses,
                     proj_usage_complete,
+                    proj_usage_has_complete,
                     work_complete,
                     project_work_complete,
                     work_status_norm,
@@ -1119,12 +1168,18 @@ def build_usage_payload(
                     gated_live_billing,
                 ) = _compute_gates(prev_col)
 
+                replace_win = (
+                    (live_cutoff_day, today_str)
+                    if (proj_usage_complete and proj_usage_has_complete and gated_live_projects is not None)
+                    else None
+                )
                 changed = update_ledger_with_live(
                     ledger,
                     gated_live_usage,
                     live_cutoff_day,
                     now_ts,
                     live_projects=gated_live_projects,
+                    replace_projects_window=replace_win,
                 )
 
                 if work_complete:
@@ -1217,7 +1272,8 @@ def build_usage_payload(
         prev_col = ledger.get("collection") if isinstance(ledger.get("collection"), dict) else {}
         (
             normalized_statuses,
-            _,
+            proj_usage_complete,
+            proj_usage_has_complete,
             work_complete,
             _,
             _,
@@ -1246,9 +1302,6 @@ def build_usage_payload(
 
     merged, tokei_won = _reconcile_merged_tools_with_winners(ledger, proj_live_usage)
 
-    now_dt = datetime.fromtimestamp(now_ts, tz=BIZ_TZ)
-    today_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=BIZ_TZ)
-    today_str = today_dt.strftime("%Y-%m-%d")
     yesterday_str = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
     this_mon = today_dt - timedelta(days=today_dt.weekday())
     week_start_str = this_mon.strftime("%Y-%m-%d")
@@ -1308,19 +1361,31 @@ def build_usage_payload(
             d_acc["cw"] += b_cw
             d_acc["thoughts"] += b_th
             d_acc["total_tokens"] += b_tok
-            d_acc["cost_usd"] = round(d_acc["cost_usd"] + b_cost, 4)
+            d_acc["cost_usd"] = round(d_acc["cost_usd"] + b_cost, 6)
             unp_b = _unpriced_tokens(b, b_tok, b_cost)
             d_acc["unpriced_tokens"] += unp_b
             d_acc["sessions"] += b_sess
             t_cur = d_acc["tools"].setdefault(tool, {"tokens": 0, "cost_usd": 0.0, "unpriced_tokens": 0})
             t_cur["tokens"] += b_tok
-            t_cur["cost_usd"] = round(t_cur["cost_usd"] + b_cost, 4)
+            t_cur["cost_usd"] = round(t_cur["cost_usd"] + b_cost, 6)
             t_cur["unpriced_tokens"] += unp_b
 
     for d_val in daily_usage_map.values():
         denom = d_val["in"] + d_val["cr"] + d_val["cw"]
         d_val["cache_hit_rate"] = round(d_val["cr"] / denom, 4) if denom > 0 else 0.0
-        d_val["cost_usd"] = round(d_val["cost_usd"], 2)
+        d_val["cost_usd"] = round(d_val["cost_usd"], 6)
+
+    effective_work_complete = work_complete and (not rejected_stale_commit)
+
+    def _day_work_status(day_key: str, wd_entry: Dict[str, Any]) -> str:
+        has_wd = bool(wd_entry)
+        if effective_work_complete:
+            if has_wd and day_key not in proj_observed_work and (
+                float(wd_entry.get("agent_seconds", 0.0) or 0.0) > 0 or int(wd_entry.get("runs", 0) or 0) > 0
+            ):
+                return "retained"
+            return "observed"
+        return "retained" if has_wd else "unknown"
 
     history_30d: List[Dict[str, Any]] = []
     for i in range(29, -1, -1):
@@ -1335,9 +1400,10 @@ def build_usage_payload(
                 "weekday": WEEKDAY_CN[dt.weekday()],
                 "is_today": dk == today_str,
                 "total_tokens": int(du.get("total_tokens", 0)),
-                "cost_usd": round(float(du.get("cost_usd", 0.0)), 2),
+                "cost_usd": round(float(du.get("cost_usd", 0.0)), 6),
                 "unpriced_tokens": int(du.get("unpriced_tokens", 0)),
                 "agent_hours": round(float(wd.get("agent_hours", 0.0)), 2),
+                "work_status": _day_work_status(dk, wd),
             }
         )
 
@@ -1355,7 +1421,7 @@ def build_usage_payload(
         for tk, tv in (du.get("tools") or {}).items():
             meta = USAGE_TOOL_META.get(tk, {"name": tk, "short": tk, "color": "#94A3B8"})
             t_tok = int(tv.get("tokens", 0))
-            t_cost = round(float(tv.get("cost_usd", 0.0)), 2)
+            t_cost = round(float(tv.get("cost_usd", 0.0)), 6)
             t_unp = int(tv.get("unpriced_tokens", 0))
             day_tools_map[tk] = {
                 "tool": tk,
@@ -1391,7 +1457,7 @@ def build_usage_payload(
             reverse=True,
         )[:6]
         d_tok = int(du.get("total_tokens", 0))
-        d_cost = round(float(du.get("cost_usd", 0.0)), 2)
+        d_cost = round(float(du.get("cost_usd", 0.0)), 6)
         d_unp = int(du.get("unpriced_tokens", 0))
         heatmap_days.append(
             {
@@ -1404,6 +1470,7 @@ def build_usage_payload(
                 "unpriced_tokens": d_unp,
                 "has_cost_observation": bool(d_tok > 0 or d_cost > 0 or d_unp > 0),
                 "agent_hours": round(float(wd.get("agent_hours", 0.0)), 2),
+                "work_status": _day_work_status(dk, wd),
                 "sessions": int(du.get("sessions", 0)),
                 "tools": day_tools_sorted,
             }
@@ -1417,7 +1484,6 @@ def build_usage_payload(
     ]
     earliest_day = min(earliest_candidates)
 
-    effective_work_complete = work_complete and (not rejected_stale_commit)
     periods = {
         "today": _build_period_summary(
             merged, today_str, today_str, work_by_day, pricing=pricing, billing_by_tool=billing_by_tool, tokei_won=tokei_won, work_complete=effective_work_complete
@@ -1450,19 +1516,19 @@ def build_usage_payload(
     )
 
     eff_home = home or Path.home()
-    projects_list = _build_projects_list(ledger, proj_live_projects, today_dt, eff_home)
+    proj_replace_win = (
+        (live_cutoff_day, today_str)
+        if (proj_usage_complete and proj_usage_has_complete and proj_live_projects is not None and not rejected_stale_commit)
+        else None
+    )
+    projects_list = _build_projects_list(
+        ledger, proj_live_projects, today_dt, eff_home, replace_projects_window=proj_replace_win
+    )
 
     # Combined usage & work projects for worktree-merged project_trails
-    usage_projects_combined: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for proj_path, day_map in (ledger.get("projects") or {}).items():
-        if isinstance(day_map, dict):
-            usage_projects_combined[proj_path] = {dk: bv for dk, bv in day_map.items() if valid_day(dk)}
-    if proj_live_projects:
-        for proj_path, day_map in proj_live_projects.items():
-            dst = usage_projects_combined.setdefault(proj_path, {})
-            for dk, bv in day_map.items():
-                if valid_day(dk):
-                    dst[dk] = bv
+    usage_projects_combined = _combine_usage_projects(
+        ledger, proj_live_projects, replace_projects_window=proj_replace_win
+    )
 
     work_projects_combined: Dict[str, Dict[str, Dict[str, Any]]] = {}
     raw_pw = ledger.get("project_work_days")

@@ -217,6 +217,21 @@ final class ClockStore: ObservableObject {
         return shanghaiDayString(for: monday.timeIntervalSince1970)
     }
 
+    /// Returns the full Monday...Sunday range (YYYY-MM-DD) of the previous ISO week in Asia/Shanghai.
+    static func shanghaiPreviousWeekRange(for epoch: Double) -> (start: String, end: String) {
+        let cal = shanghaiCalendar()
+        let startOfDay = cal.startOfDay(for: Date(timeIntervalSince1970: epoch))
+        let weekday = cal.component(.weekday, from: startOfDay) // 1=Sun, 2=Mon ... 7=Sat
+        let daysFromMonday = (weekday + 5) % 7
+        let thisMonday = cal.date(byAdding: .day, value: -daysFromMonday, to: startOfDay) ?? startOfDay
+        let prevMonday = cal.date(byAdding: .day, value: -7, to: thisMonday) ?? thisMonday
+        let prevSunday = cal.date(byAdding: .day, value: -1, to: thisMonday) ?? thisMonday
+        return (
+            shanghaiDayString(for: prevMonday.timeIntervalSince1970),
+            shanghaiDayString(for: prevSunday.timeIntervalSince1970)
+        )
+    }
+
     var currentShanghaiDay: String {
         Self.shanghaiDayString(for: nowEpoch)
     }
@@ -428,13 +443,21 @@ final class ClockStore: ObservableObject {
     // MARK: - Clock-Validated Period Projections (Frozen Contract for DetailCardsView / DashboardViews)
 
     /// Returns validated `PeriodStats` strictly covering the current Shanghai calendar period for `nowEpoch`.
-    /// Prevents views from displaying yesterday's/last-week's/last-month's totals after a day/month rollover.
+    /// Prevents views from displaying yesterday's/last-week's/last-month's totals after a day/month rollover,
+    /// future data after a clock rollback, or incomplete historical periods (e.g. Fri snapshot on Mon for last_week).
     func periodStats(for period: UsagePeriodKey) -> PeriodStats? {
         guard let snap = snapshot, let periods = snap.usage?.periods else { return nil }
         let curDay = currentShanghaiDay
         let curMonth = currentShanghaiMonth
         let curYear = currentShanghaiYear
         let curWeekStart = currentShanghaiWeekStart
+
+        // Never accept snapshots whose calendar day is in the future relative to current Shanghai clock
+        guard snap.today.date <= curDay else { return nil }
+
+        func isWithinCurrentClock(_ stats: PeriodStats) -> Bool {
+            stats.startDate <= stats.endDate && stats.endDate <= curDay
+        }
 
         switch period {
         case .today:
@@ -446,34 +469,71 @@ final class ClockStore: ObservableObject {
             return periods.today
         case .yesterday:
             let curYesterday = Self.shanghaiDayString(addingDays: -1, to: nowEpoch)
-            if let y = periods.yesterday, y.endDate == curYesterday {
+            if let y = periods.yesterday,
+               y.startDate == curYesterday,
+               y.endDate == curYesterday,
+               isWithinCurrentClock(y) {
                 return y
             }
-            if periods.today.endDate == curYesterday {
+            if periods.today.startDate == curYesterday,
+               periods.today.endDate == curYesterday,
+               isWithinCurrentClock(periods.today) {
                 return periods.today
             }
             return nil
         case .week:
-            guard periods.week.startDate == curWeekStart else { return nil }
+            guard periods.week.startDate == curWeekStart,
+                  isWithinCurrentClock(periods.week) else {
+                return nil
+            }
             return periods.week
         case .lastWeek:
-            let prevWeekStart = Self.shanghaiWeekStartString(for: nowEpoch - 7 * 86400)
-            if let lw = periods.lastWeek, lw.startDate == prevWeekStart {
+            let prevWeek = Self.shanghaiPreviousWeekRange(for: nowEpoch)
+            if let lw = periods.lastWeek,
+               lw.startDate == prevWeek.start,
+               lw.endDate == prevWeek.end,
+               isWithinCurrentClock(lw) {
                 return lw
             }
-            if periods.week.startDate == prevWeekStart {
+            if periods.week.startDate == prevWeek.start,
+               periods.week.endDate == prevWeek.end,
+               isWithinCurrentClock(periods.week) {
                 return periods.week
             }
             return nil
         case .month:
-            guard String(periods.month.startDate.prefix(7)) == curMonth else { return nil }
+            guard String(periods.month.startDate.prefix(7)) == curMonth,
+                  isWithinCurrentClock(periods.month) else {
+                return nil
+            }
             return periods.month
         case .year:
-            guard String(periods.year.startDate.prefix(4)) == curYear else { return nil }
+            guard String(periods.year.startDate.prefix(4)) == curYear,
+                  isWithinCurrentClock(periods.year) else {
+                return nil
+            }
             return periods.year
         case .all:
-            return periods.all ?? periods.year
+            let candidate = periods.all ?? periods.year
+            guard isWithinCurrentClock(candidate) else { return nil }
+            return candidate
         }
+    }
+
+    /// Explains why `periodStats(for:)` returned `nil` (for views to show precise refresh / coverage hints).
+    func periodUnavailableHint(for period: UsagePeriodKey) -> String? {
+        guard let snap = snapshot, periodStats(for: period) == nil else { return nil }
+        let curDay = currentShanghaiDay
+        if snap.today.date > curDay {
+            return "快照日期（\(snap.today.date)）晚于当前时钟，等待重新采集"
+        }
+        if period == .lastWeek, let periods = snap.usage?.periods {
+            let prevWeek = Self.shanghaiPreviousWeekRange(for: nowEpoch)
+            if periods.week.startDate == prevWeek.start && periods.week.endDate < prevWeek.end {
+                return "当前快照仅覆盖至 \(periods.week.endDate)（缺少上周完整末日 \(prevWeek.end)），等待刷新"
+            }
+        }
+        return "等待刷新获取最新记录，或切换到其他周期查看历史明细"
     }
 
     /// Returns clock-validated `DayStats` for 24h pulse charts in `DetailCardsView` (today / yesterday only).
@@ -486,6 +546,7 @@ final class ClockStore: ObservableObject {
             }
             return snap.today
         case .yesterday:
+            guard snap.today.date <= currentShanghaiDay else { return nil }
             let curYesterday = Self.shanghaiDayString(addingDays: -1, to: nowEpoch)
             return snap.days.first(where: { $0.date == curYesterday })
         default:
@@ -518,6 +579,15 @@ final class ClockStore: ObservableObject {
         return todayTokens > 0 || todayCostUsd > 0 || todayUnpricedTokens > 0
     }
 
+    var todayEstimatedCostText: String {
+        Formatters.estimatedUSD(
+            todayCostUsd,
+            unpricedTokens: todayUnpricedTokens,
+            hasObservation: todayHasCostObservation,
+            totalTokens: todayTokens
+        )
+    }
+
     var displayedDayTokens: Int {
         if isViewingToday { return todayTokens }
         return displayedDay?.tokens ?? 0
@@ -537,6 +607,15 @@ final class ClockStore: ObservableObject {
         if isViewingToday { return todayHasCostObservation }
         guard let day = displayedDay else { return false }
         return (day.tokens ?? 0) > 0 || (day.costUsd ?? 0) > 0 || (day.unpricedTokens ?? 0) > 0
+    }
+
+    var displayedDayEstimatedCostText: String {
+        Formatters.estimatedUSD(
+            displayedDayCostUsd,
+            unpricedTokens: displayedDayUnpricedTokens,
+            hasObservation: displayedDayHasCostObservation,
+            totalTokens: displayedDayTokens
+        )
     }
 
     var lastTrustedSuccessTimestamp: Double? {
@@ -566,7 +645,8 @@ final class ClockStore: ObservableObject {
         if let genTs = quotaSnapshot?.generatedTs, Double(provider.fetchedAt) > genTs {
             return false
         }
-        guard window.usedPercent.isFinite, window.usedPercent >= 0, window.usedPercent <= 100 else {
+        let effectiveUsed = window.effectiveThresholdPercent
+        guard effectiveUsed.isFinite, effectiveUsed >= 0, effectiveUsed <= 100 else {
             return false
         }
         if let resetsAt = window.resetsAt, Double(resetsAt) <= nowEpoch {
@@ -602,9 +682,10 @@ final class ClockStore: ObservableObject {
                     label: window.label,
                     shortLabel: window.shortLabel,
                     usedPercent: window.usedPercent,
+                    rawUsedPercent: window.rawUsedPercent,
                     resetsAt: window.resetsAt
                 )
-                candidates.append((window.usedPercent, provider.id, window.id, item))
+                candidates.append((window.effectiveThresholdPercent, provider.id, window.id, item))
             }
         }
         candidates.sort { lhs, rhs in
@@ -613,6 +694,12 @@ final class ClockStore: ObservableObject {
             return lhs.wid < rhs.wid
         }
         return candidates.first?.item
+    }
+
+    /// Returns the highest fresh quota window ONLY when its unrounded utilization reaches the 70% alert threshold.
+    var activeAlertQuotaWindow: HighestQuotaWindow? {
+        guard let hw = highestFreshQuotaWindow, hw.isAboveAlertThreshold else { return nil }
+        return hw
     }
 
     /// Compact quota badges for the macOS menu bar (fresh readings only).
@@ -656,11 +743,15 @@ final class ClockStore: ObservableObject {
     }
 
     private func projectPeriodMatchesCurrentClock(_ stats: ProjectPeriodStats, for period: ProjectPeriodKey, snapshotToday: String) -> Bool {
+        let curDay = currentShanghaiDay
+        guard snapshotToday <= curDay, stats.endDate <= curDay, stats.startDate <= stats.endDate else {
+            return false
+        }
         switch period {
         case .today:
-            return snapshotToday == currentShanghaiDay
-                && stats.startDate == currentShanghaiDay
-                && stats.endDate == currentShanghaiDay
+            return snapshotToday == curDay
+                && stats.startDate == curDay
+                && stats.endDate == curDay
         case .week:
             return stats.startDate == currentShanghaiWeekStart
         case .month:
@@ -705,9 +796,10 @@ final class ClockStore: ObservableObject {
 
         // Legacy v0.6 fallback: `usage.projects` stores multi-day cumulative totals ONLY,
         // so it must NEVER masquerade as `.today`, `.week`, or `.month` spend — project `.all` only.
-        guard period == .all, let legacy = usage.projects else { return [] }
+        guard period == .all, snap.today.date <= currentShanghaiDay, let legacy = usage.projects else { return [] }
         var rows: [ProjectTrailRow] = []
         for item in legacy {
+            guard item.lastActiveDate <= currentShanghaiDay else { continue }
             let pStats = ProjectPeriodStats(
                 startDate: item.lastActiveDate,
                 endDate: item.lastActiveDate,
@@ -783,11 +875,17 @@ final class ClockStore: ObservableObject {
         return true
     }
 
-    /// True only when the loaded snapshot's month period actually covers the current Shanghai calendar month.
+    /// True only when the loaded snapshot's month period actually covers the current Shanghai calendar month
+    /// and does not extend into the future relative to the current Shanghai day.
     var currentMonthSubscriptionDataAvailable: Bool {
         guard let snap = snapshot, let monthPeriod = snap.usage?.periods.month else { return false }
-        return String(snap.today.date.prefix(7)) == currentShanghaiMonth
-            && String(monthPeriod.startDate.prefix(7)) == currentShanghaiMonth
+        let curDay = currentShanghaiDay
+        let curMonth = currentShanghaiMonth
+        return snap.today.date <= curDay
+            && String(snap.today.date.prefix(7)) == curMonth
+            && String(monthPeriod.startDate.prefix(7)) == curMonth
+            && monthPeriod.startDate <= monthPeriod.endDate
+            && monthPeriod.endDate <= curDay
     }
 
     var subscriptionRows: [SubscriptionRow] {
@@ -1199,7 +1297,12 @@ final class ClockStore: ObservableObject {
     func copyToolSummary(_ tool: UsageToolStats, periodTitle: String) {
         let hitPct = Int(round(tool.effectiveCacheHitRate * 100))
         let hasObs = tool.totalTokens > 0 || tool.costUsd > 0 || (tool.unpricedTokens ?? 0) > 0
-        let estimate = Formatters.estimatedUSD(tool.costUsd, unpricedTokens: tool.unpricedTokens ?? 0, hasObservation: hasObs)
+        let estimate = Formatters.estimatedUSD(
+            tool.costUsd,
+            unpricedTokens: tool.unpricedTokens ?? 0,
+            hasObservation: hasObs,
+            totalTokens: tool.totalTokens
+        )
         var lines: [String] = [
             "### \(tool.displayName) · \(periodTitle)",
             "- 总 Token：\(Formatters.compactTokens(tool.totalTokens))（估算 \(estimate) · Cache Hit \(hitPct)%）",
@@ -1213,7 +1316,12 @@ final class ClockStore: ObservableObject {
             for m in tool.models.prefix(8) {
                 let mHit = Int(round(m.effectiveCacheHitRate * 100))
                 let mObs = m.totalTokens > 0 || m.costUsd > 0 || (m.unpricedTokens ?? 0) > 0
-                let amount = Formatters.estimatedUSD(m.costUsd, unpricedTokens: m.unpricedTokens ?? 0, hasObservation: mObs)
+                let amount = Formatters.estimatedUSD(
+                    m.costUsd,
+                    unpricedTokens: m.unpricedTokens ?? 0,
+                    hasObservation: mObs,
+                    totalTokens: m.totalTokens
+                )
                 lines.append("  - `\(m.model)`: \(Formatters.compactTokens(m.totalTokens)) tok · \(mHit)% · \(amount)")
             }
         }

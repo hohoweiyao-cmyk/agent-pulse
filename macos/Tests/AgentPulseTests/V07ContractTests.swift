@@ -225,6 +225,7 @@ final class V07ContractTests: XCTestCase {
         defaults.set(["/tmp/demo-repo-wt"], forKey: ClockStore.Keys.pinnedProjects)
         let store = ClockStore(defaults: defaults)
         let snap = try JSONDecoder().decode(ClockSnapshot.self, from: Data(contentsOf: fixtureURL("v07_fast_v3_minimal.json")))
+        store.nowEpoch = snap.generatedTs + 5
         store.applySnapshotIfNewer(snap)
 
         let todayRows = store.projectTrailRows(for: .today)
@@ -245,6 +246,7 @@ final class V07ContractTests: XCTestCase {
         defaults.set(["codex": -5, "bad_high": 2_000_000, "bad_bool": true], forKey: ClockStore.Keys.subscriptionFeesUSDCents)
         let store = ClockStore(defaults: defaults)
         let snap = try JSONDecoder().decode(ClockSnapshot.self, from: Data(contentsOf: fixtureURL("v07_fast_v3_minimal.json")))
+        store.nowEpoch = snap.generatedTs + 5
         store.applySnapshotIfNewer(snap)
 
         // Initially unconfigured (invalid values ignored)

@@ -69,10 +69,13 @@ def _normalize_project_path(raw: Any) -> str:
 
 
 def _parse_ts(value: Any) -> Optional[float]:
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        v = float(value)
+        try:
+            v = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if v <= 0 or not math.isfinite(v):
             return None
         if v > 1e14:
@@ -86,7 +89,7 @@ def _parse_ts(value: Any) -> Optional[float]:
             return None
         try:
             return _parse_ts(float(s))
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
@@ -114,19 +117,62 @@ def _ts_to_day(ts: float) -> str:
 
 
 def _safe_int(val: Any) -> int:
+    if isinstance(val, bool):
+        return 0
     try:
         v = int(val)
         return v if v > 0 else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
 def _safe_float(val: Any) -> float:
+    if isinstance(val, bool):
+        return 0.0
     try:
         v = float(val)
         return v if v > 0 and math.isfinite(v) else 0.0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+
+
+def _parse_strict_nonneg_int(d: Dict[str, Any], key: str) -> Tuple[int, bool]:
+    """Parse an optional non-negative integer metering field.
+
+    Omitted or explicit `None` -> `(0, True)`.
+    Invalid type/value (bool, bad string, fractional/non-finite float, negative int) -> `(0, False)`.
+    """
+    if key not in d or d[key] is None:
+        return 0, True
+    val = d[key]
+    if isinstance(val, bool):
+        return 0, False
+    if type(val) is int:
+        return (val, True) if val >= 0 else (0, False)
+    if type(val) is float:
+        try:
+            if math.isfinite(val) and val >= 0.0 and val.is_integer():
+                return int(val), True
+        except (ValueError, OverflowError):
+            pass
+    return 0, False
+
+
+def _parse_strict_nonneg_float(d: Dict[str, Any], key: str) -> Tuple[Optional[float], bool]:
+    """Parse an optional non-negative finite float field; invalid provided values return `(None, False)`."""
+    if key not in d or d[key] is None:
+        return None, True
+    val = d[key]
+    if isinstance(val, bool):
+        return None, False
+    if type(val) in (int, float):
+        try:
+            f = float(val)
+            if math.isfinite(f) and f >= 0.0:
+                return f, True
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return None, False
 
 
 def _safe_nonneg_decimal(val: Any) -> Optional[Decimal]:
@@ -167,7 +213,66 @@ def _is_nonneg_int(val: Any) -> bool:
 
 
 def _is_nonneg_finite_num(val: Any) -> bool:
-    return type(val) in (int, float) and math.isfinite(float(val)) and float(val) >= 0.0
+    if type(val) not in (int, float):
+        return False
+    try:
+        f = float(val)
+        return math.isfinite(f) and f >= 0.0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _is_finite_num(val: Any) -> bool:
+    if type(val) not in (int, float):
+        return False
+    try:
+        return math.isfinite(float(val))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _is_valid_token_tuple_list(val: Any) -> bool:
+    return isinstance(val, list) and len(val) == 5 and all(_is_nonneg_int(x) for x in val)
+
+
+def _is_valid_codex_bundle(bundle: Any) -> bool:
+    if not isinstance(bundle, dict):
+        return False
+    if not (
+        isinstance(bundle.get("session_id"), str)
+        and isinstance(bundle.get("originator"), str)
+        and isinstance(bundle.get("session_cwd"), str)
+        and isinstance(bundle.get("turn_cwds"), dict)
+        and isinstance(bundle.get("events"), list)
+    ):
+        return False
+    for tid, pair in bundle["turn_cwds"].items():
+        if not (
+            isinstance(tid, str)
+            and isinstance(pair, list)
+            and len(pair) == 2
+            and _is_finite_num(pair[0])
+            and isinstance(pair[1], str)
+        ):
+            return False
+    for ev in bundle["events"]:
+        if not isinstance(ev, dict):
+            return False
+        if not (
+            _is_finite_num(ev.get("ts"))
+            and isinstance(ev.get("model"), str)
+            and isinstance(ev.get("turn_id"), str)
+            and isinstance(ev.get("is_response"), bool)
+            and isinstance(ev.get("response_id"), str)
+            and isinstance(ev.get("cwd"), str)
+            and isinstance(ev.get("explicit_cwd"), bool)
+        ):
+            return False
+        if ev.get("last") is not None and not _is_valid_token_tuple_list(ev["last"]):
+            return False
+        if ev.get("total") is not None and not _is_valid_token_tuple_list(ev["total"]):
+            return False
+    return True
 
 
 def _is_valid_usage_cache_row(row: Any) -> bool:
@@ -237,13 +342,25 @@ class UsageCache:
             and entry["size"] == st.st_size
             and isinstance(entry.get("rows"), list)
         ):
-            if require_codex_dedup and entry.get("codex_dedup") is not True:
+            if require_codex_dedup and (
+                entry.get("codex_dedup") is not True or not _is_valid_codex_bundle(entry.get("codex_bundle"))
+            ):
                 self.dirty = True
                 return None
             rows = entry["rows"]
             if all(_is_valid_usage_cache_row(r) for r in rows):
                 return rows
             self.dirty = True
+        return None
+
+    def get_codex_bundle(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        rows = self.get(file_path, require_codex_dedup=True)
+        if rows is None:
+            return None
+        key = hashlib.sha256(os.fsencode(file_path)).hexdigest()
+        entry = self.files.get(key)
+        if isinstance(entry, dict) and isinstance(entry.get("codex_bundle"), dict):
+            return entry["codex_bundle"]
         return None
 
     def put(
@@ -253,6 +370,7 @@ class UsageCache:
         *,
         stat_result: Optional[os.stat_result] = None,
         codex_dedup: bool = False,
+        codex_bundle: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
             st = stat_result if stat_result is not None else file_path.stat()
@@ -267,6 +385,8 @@ class UsageCache:
         }
         if codex_dedup:
             entry["codex_dedup"] = True
+        if codex_bundle is not None:
+            entry["codex_bundle"] = codex_bundle
         self.files[key] = entry
         self.dirty = True
 
@@ -550,31 +670,71 @@ class CodexUsageEvent:
     project_cwd: str = ""
 
 
-def _codex_mirrored_events(events: List[CodexUsageEvent], response_totals: set) -> set:
-    """Pair a delta-only response with at most one nearby legacy mirror."""
-    legacy = defaultdict(deque)
-    ordered = sorted(enumerate(events), key=lambda entry: entry[1].timestamp)
-    for idx, event in ordered:
-        if not event.response and (event.turn, event.total) not in response_totals:
-            legacy[event.turn, event.model, event.tokens].append((idx, event.timestamp))
+_CODEX_TOKEN_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
 
-    duplicates = set()
-    for _, event in ordered:
+
+def _parse_codex_token_tuple(d: Dict[str, Any]) -> Tuple[CodexTokens, bool]:
+    vals: List[int] = []
+    for k in _CODEX_TOKEN_KEYS:
+        v, ok = _parse_strict_nonneg_int(d, k)
+        if not ok:
+            return (0, 0, 0, 0, 0), False
+        vals.append(v)
+    return (vals[0], vals[1], vals[2], vals[3], vals[4]), True
+
+
+def _codex_mirrored_events_session(
+    events: List[CodexUsageEvent],
+) -> Tuple[set, Dict[int, Tuple[str, str]]]:
+    """Pair each delta-only response with at most one nearby legacy mirror across the merged session."""
+    ordered = sorted(enumerate(events), key=lambda entry: (entry[1].timestamp, entry[0]))
+    legacy_indices = [
+        idx for idx, ev in ordered if not ev.response
+    ]
+    used_legacy: set = set()
+    enrichments: Dict[int, Tuple[str, str]] = {}
+
+    for resp_idx, event in ordered:
         if not event.response or event.total is not None:
             continue
-        candidates = legacy.get((event.turn, event.model, event.tokens))
-        if candidates is None:
-            continue
-        while candidates and candidates[0][1] < event.timestamp - 2:
-            candidates.popleft()
-        if candidates and candidates[0][1] <= event.timestamp + 2:
-            duplicates.add(candidates.popleft()[0])
-    return duplicates
+        best_match: Optional[Tuple[float, int]] = None
+        for leg_idx in legacy_indices:
+            if leg_idx in used_legacy:
+                continue
+            leg = events[leg_idx]
+            dt = abs(leg.timestamp - event.timestamp)
+            if dt > 2.0:
+                continue
+            if leg.tokens != event.tokens:
+                continue
+            if event.turn_id and leg.turn_id and event.turn_id != leg.turn_id:
+                continue
+            if event.model != "unknown" and leg.model != "unknown" and event.model != leg.model:
+                continue
+            cand = (dt, leg_idx)
+            if best_match is None or cand < best_match:
+                best_match = cand
+        if best_match is not None:
+            leg_idx = best_match[1]
+            used_legacy.add(leg_idx)
+            leg = events[leg_idx]
+            new_model = event.model if event.model != "unknown" else leg.model
+            new_cwd = event.project_cwd or leg.project_cwd
+            if new_model != event.model or new_cwd != event.project_cwd:
+                enrichments[resp_idx] = (new_model, new_cwd)
+    return used_legacy, enrichments
 
 
-def _parse_codex_file_checked(
-    path: Path, pricing: PricingTable
-) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+def _parse_codex_file_raw(
+    path: Path,
+) -> Tuple[Dict[str, Any], bool, bool, Optional[os.stat_result]]:
+    """Extract raw structured metering events and turn→cwd context from one Codex JSONL file."""
     res = read_jsonl_checked(
         path,
         keyword_filter=(
@@ -591,21 +751,19 @@ def _parse_codex_file_checked(
         ),
     )
     if res.permission_error or res.missing:
-        return [], True, res.identity_changed, None
+        return {}, True, res.identity_changed, None
 
     originator = ""
     session_cwd = ""
     pending_turn_cwd = ""
     active_turn_id = ""
     current_turn_id = ""
-    turn_cwds: Dict[str, str] = {}
+    turn_cwds: Dict[str, Tuple[float, str]] = {}
+    turn_models: Dict[str, str] = {}
     session_id: Optional[str] = None
-    response_ids = set()
     current_model = "unknown"
-    prev_total: Optional[CodexTokens] = None
     turn = 0
-    events: List[CodexUsageEvent] = []
-    response_totals: set = set()
+    raw_events: List[Dict[str, Any]] = []
     struct_error = False
 
     for _, obj in res.records:
@@ -630,18 +788,23 @@ def _parse_codex_file_checked(
 
         if typ == "turn_context":
             turn += 1
+            tc_ts = _parse_ts(obj.get("timestamp")) or 0.0
+            tc_tid = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
             m = payload.get("model")
             if isinstance(m, str) and m.strip():
                 current_model = m.strip()
-            tc_tid = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
+                if tc_tid:
+                    turn_models[tc_tid] = current_model
+                elif active_turn_id:
+                    turn_models[active_turn_id] = current_model
             if tc_tid:
                 current_turn_id = tc_tid
             tc_cwd = _normalize_project_path(payload.get("cwd"))
             if tc_cwd:
                 if tc_tid:
-                    turn_cwds[tc_tid] = tc_cwd
+                    turn_cwds[tc_tid] = (tc_ts, tc_cwd)
                 elif active_turn_id:
-                    turn_cwds[active_turn_id] = tc_cwd
+                    turn_cwds[active_turn_id] = (tc_ts, tc_cwd)
                 else:
                     pending_turn_cwd = tc_cwd
             continue
@@ -649,11 +812,12 @@ def _parse_codex_file_checked(
         if typ == "event_msg" and payload.get("type") in ("task_started", "task_complete", "turn_aborted", "task_aborted"):
             ptype = str(payload.get("type") or "")
             tid = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
+            ev_ts = _parse_ts(obj.get("timestamp")) or 0.0
             if ptype == "task_started":
                 active_turn_id = tid or f"turn-{turn + 1}"
                 current_turn_id = tid or active_turn_id
                 if pending_turn_cwd and active_turn_id not in turn_cwds:
-                    turn_cwds[active_turn_id] = pending_turn_cwd
+                    turn_cwds[active_turn_id] = (ev_ts, pending_turn_cwd)
                 pending_turn_cwd = ""
             else:
                 if tid:
@@ -677,9 +841,6 @@ def _parse_codex_file_checked(
             if not isinstance(last, dict) or (owner and session_id and owner != session_id):
                 continue
             if isinstance(response_id, str) and response_id:
-                if response_id in response_ids:
-                    continue
-                response_ids.add(response_id)
                 response_id_str = response_id
         elif typ == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
@@ -701,97 +862,290 @@ def _parse_codex_file_checked(
             struct_error = True
             continue
 
-        d_in = d_cr = d_cw = d_out = d_reason = 0
-        cur_tuple = None
+        total_tuple: Optional[CodexTokens] = None
+        last_tuple: Optional[CodexTokens] = None
         if isinstance(total, dict):
-            cur_in = _safe_int(total.get("input_tokens"))
-            cur_cr = _safe_int(total.get("cached_input_tokens"))
-            cur_cw = _safe_int(total.get("cache_write_input_tokens"))
-            cur_out = _safe_int(total.get("output_tokens"))
-            cur_r = _safe_int(total.get("reasoning_output_tokens"))
-            cur_tuple = (cur_in, cur_cr, cur_cw, cur_out, cur_r)
-            if is_response:
-                response_totals.add((turn, cur_tuple))
-            if prev_total is not None:
-                if cur_tuple == prev_total:
-                    continue
-                if (
-                    cur_in >= prev_total[0]
-                    and cur_cr >= prev_total[1]
-                    and cur_cw >= prev_total[2]
-                    and cur_out >= prev_total[3]
-                    and cur_r >= prev_total[4]
-                ):
-                    d_in = cur_in - prev_total[0]
-                    d_cr = cur_cr - prev_total[1]
-                    d_cw = cur_cw - prev_total[2]
-                    d_out = cur_out - prev_total[3]
-                    d_reason = cur_r - prev_total[4]
-                elif isinstance(last, dict):
-                    d_in = _safe_int(last.get("input_tokens"))
-                    d_cr = _safe_int(last.get("cached_input_tokens"))
-                    d_cw = _safe_int(last.get("cache_write_input_tokens"))
-                    d_out = _safe_int(last.get("output_tokens"))
-                    d_reason = _safe_int(last.get("reasoning_output_tokens"))
+            total_tuple, ok_tot = _parse_codex_token_tuple(total)
+            if not ok_tot:
+                struct_error = True
+                continue
+        if isinstance(last, dict):
+            last_tuple, ok_last = _parse_codex_token_tuple(last)
+            if not ok_last:
+                struct_error = True
+                continue
+        if total_tuple is None and last_tuple is None:
+            continue
+
+        ev_turn_id = str(payload.get("turn_id") or payload.get("root_turn_id") or active_turn_id or current_turn_id or "")
+        raw_events.append(
+            {
+                "ts": float(ts),
+                "model": current_model,
+                "turn_id": ev_turn_id,
+                "is_response": is_response,
+                "response_id": response_id_str,
+                "last": list(last_tuple) if last_tuple is not None else None,
+                "total": list(total_tuple) if total_tuple is not None else None,
+                "fallback_cwd": pending_turn_cwd,
+            }
+        )
+
+    # Pass 2: resolve late-arriving same-turn turn_context cwd & model within this file
+    finalized_events: List[Dict[str, Any]] = []
+    for ev in raw_events:
+        tid = ev["turn_id"]
+        model = ev["model"]
+        if model == "unknown" and tid and tid in turn_models:
+            model = turn_models[tid]
+        explicit = False
+        if tid and tid in turn_cwds:
+            cwd = turn_cwds[tid][1]
+            explicit = True
+        elif ev["fallback_cwd"]:
+            cwd = ev["fallback_cwd"]
+            explicit = True
+        else:
+            cwd = session_cwd
+        finalized_events.append(
+            {
+                "ts": ev["ts"],
+                "model": model,
+                "turn_id": tid,
+                "is_response": ev["is_response"],
+                "response_id": ev["response_id"],
+                "last": ev["last"],
+                "total": ev["total"],
+                "cwd": cwd,
+                "explicit_cwd": explicit,
+            }
+        )
+
+    bundle: Dict[str, Any] = {
+        "session_id": session_id or "",
+        "originator": originator,
+        "session_cwd": session_cwd,
+        "turn_cwds": {k: [round(float(v[0]), 3), v[1]] for k, v in turn_cwds.items()},
+        "events": finalized_events,
+    }
+    had_err = res.had_error or struct_error
+    return bundle, had_err, res.identity_changed, res.stat_result
+
+
+def _codex_event_richness(ev: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        1 if ev["total"] is not None else 0,
+        1 if ev["model"] != "unknown" else 0,
+        1 if ev["cwd"] else 0,
+        1 if ev["turn_id"] else 0,
+        1 if ev["last"] is not None else 0,
+        -ev["ts"],
+        ev["model"],
+        ev["cwd"],
+        ev["turn_id"],
+    )
+
+
+def _reduce_codex_session_bundles(
+    bundles: List[Dict[str, Any]],
+    pricing: PricingTable,
+) -> List[Dict[str, Any]]:
+    """Merge all files of one Codex session (order-independently), dedup, and compute deltas."""
+    if not bundles:
+        return []
+
+    is_t3 = any(b.get("originator") == "T3 Code" for b in bundles)
+    tool_key = "t3_codex" if is_t3 else "codex"
+    session_id = next((b.get("session_id") for b in bundles if b.get("session_id")), "")
+
+    # Order-independent session_cwd selection
+    cwd_candidates: List[Tuple[float, str]] = []
+    for b in bundles:
+        scwd = b.get("session_cwd") or ""
+        if scwd:
+            evs = b.get("events") or []
+            min_ts = min((float(e["ts"]) for e in evs), default=float("inf"))
+            cwd_candidates.append((min_ts, scwd))
+    cwd_candidates.sort(key=lambda x: (x[0], x[1]))
+    merged_session_cwd = cwd_candidates[0][1] if cwd_candidates else ""
+
+    # Order-independent turn_cwds merge across all files of the session
+    merged_turn_cwds: Dict[str, Tuple[float, str]] = {}
+    for b in bundles:
+        for tid, pair in (b.get("turn_cwds") or {}).items():
+            cand = (float(pair[0]), str(pair[1]))
+            prev = merged_turn_cwds.get(tid)
+            if prev is None or cand > prev:
+                merged_turn_cwds[tid] = cand
+
+    # Cross-file raw event deduplication (completely independent of file read order)
+    resp_by_id: Dict[str, Dict[str, Any]] = {}
+    cum_by_key: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    delta_by_key: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+    for b in bundles:
+        delta_occ: Dict[Tuple[Any, ...], int] = {}
+        for raw_ev in b.get("events") or []:
+            tid = str(raw_ev.get("turn_id") or "")
+            if tid and tid in merged_turn_cwds:
+                eff_cwd = merged_turn_cwds[tid][1]
+            elif raw_ev.get("explicit_cwd") and raw_ev.get("cwd"):
+                eff_cwd = str(raw_ev["cwd"])
             else:
-                d_in, d_cr, d_cw, d_out, d_reason = cur_tuple
-            if is_response:
-                d_in, d_cr, d_cw, d_out, d_reason = (
-                    _safe_int(last.get(key))
-                    for key in (
-                        "input_tokens",
-                        "cached_input_tokens",
-                        "cache_write_input_tokens",
-                        "output_tokens",
-                        "reasoning_output_tokens",
-                    )
-                )
-            prev_total = cur_tuple
-        elif isinstance(last, dict):
-            d_in = _safe_int(last.get("input_tokens"))
-            d_cr = _safe_int(last.get("cached_input_tokens"))
-            d_cw = _safe_int(last.get("cache_write_input_tokens"))
-            d_out = _safe_int(last.get("output_tokens"))
-            d_reason = _safe_int(last.get("reasoning_output_tokens"))
+                eff_cwd = str(raw_ev.get("cwd") or merged_session_cwd)
+
+            ev = {
+                "ts": float(raw_ev["ts"]),
+                "model": str(raw_ev.get("model") or "unknown"),
+                "turn_id": tid,
+                "is_response": bool(raw_ev.get("is_response")),
+                "response_id": str(raw_ev.get("response_id") or ""),
+                "last": tuple(raw_ev["last"]) if raw_ev.get("last") is not None else None,
+                "total": tuple(raw_ev["total"]) if raw_ev.get("total") is not None else None,
+                "cwd": eff_cwd,
+            }
+
+            if ev["is_response"] and ev["response_id"]:
+                rk = ev["response_id"]
+                prev = resp_by_id.get(rk)
+                if prev is None or _codex_event_richness(ev) > _codex_event_richness(prev):
+                    resp_by_id[rk] = ev
+            elif ev["total"] is not None:
+                ck = (ev["is_response"], round(ev["ts"], 3), ev["total"])
+                prev = cum_by_key.get(ck)
+                if prev is None or _codex_event_richness(ev) > _codex_event_richness(prev):
+                    cum_by_key[ck] = ev
+            else:
+                base_dk = (ev["is_response"], round(ev["ts"], 3), ev["turn_id"], ev["last"])
+                occ = delta_occ.get(base_dk, 0)
+                delta_occ[base_dk] = occ + 1
+                dk = (*base_dk, occ)
+                prev = delta_by_key.get(dk)
+                if prev is None or _codex_event_richness(ev) > _codex_event_richness(prev):
+                    delta_by_key[dk] = ev
+
+    merged_raw: List[Dict[str, Any]] = list(resp_by_id.values()) + list(cum_by_key.values()) + list(delta_by_key.values())
+
+    # Cross-format cumulative mirror suppression: a legacy token_count with the same cumulative total
+    # as a token_usage_record in the same session is a mirror; inherit any richer metadata first.
+    response_totals: set = {
+        ev["total"] for ev in merged_raw if ev["is_response"] and ev["total"] is not None
+    }
+    legacy_meta_by_total: Dict[CodexTokens, Tuple[str, str, str]] = {}
+    for ev in merged_raw:
+        if not ev["is_response"] and ev["total"] is not None and ev["total"] in response_totals:
+            cur_meta = (ev["model"], ev["cwd"], ev["turn_id"])
+            prev_meta = legacy_meta_by_total.get(ev["total"])
+            if prev_meta is None or (cur_meta[0] != "unknown", bool(cur_meta[1]), bool(cur_meta[2]), cur_meta) > (
+                prev_meta[0] != "unknown",
+                bool(prev_meta[1]),
+                bool(prev_meta[2]),
+                prev_meta,
+            ):
+                legacy_meta_by_total[ev["total"]] = cur_meta
+
+    filtered_raw: List[Dict[str, Any]] = []
+    for ev in merged_raw:
+        if not ev["is_response"] and ev["total"] is not None and ev["total"] in response_totals:
+            continue
+        if ev["is_response"] and ev["total"] is not None and ev["total"] in legacy_meta_by_total:
+            lm, lcwd, ltid = legacy_meta_by_total[ev["total"]]
+            if ev["model"] == "unknown" and lm != "unknown":
+                ev["model"] = lm
+            if not ev["cwd"] and lcwd:
+                ev["cwd"] = lcwd
+            if not ev["turn_id"] and ltid:
+                ev["turn_id"] = ltid
+        filtered_raw.append(ev)
+
+    # Order-independent chronological & cumulative sort
+    filtered_raw.sort(
+        key=lambda e: (
+            e["ts"],
+            0 if e["total"] is not None else 1,
+            sum(e["total"]) if e["total"] is not None else 0,
+            e["total"] or (),
+            0 if e["is_response"] else 1,
+            e["response_id"],
+            e["turn_id"],
+            e["model"],
+            e["cwd"],
+        )
+    )
+
+    prev_total: Optional[CodexTokens] = None
+    last_known_model = "unknown"
+    events: List[CodexUsageEvent] = []
+    for ev in filtered_raw:
+        model = ev["model"]
+        if model != "unknown":
+            last_known_model = model
+        elif last_known_model != "unknown":
+            model = last_known_model
+
+        cur_tuple: Optional[CodexTokens] = ev["total"]
+        last_tuple: Optional[CodexTokens] = ev["last"]
+        d_in = d_cr = d_cw = d_out = d_reason = 0
+
+        if cur_tuple is not None:
+            if ev["is_response"]:
+                if last_tuple is not None:
+                    d_in, d_cr, d_cw, d_out, d_reason = last_tuple
+                prev_total = cur_tuple
+            else:
+                if prev_total is not None:
+                    if cur_tuple == prev_total:
+                        continue
+                    if (
+                        cur_tuple[0] >= prev_total[0]
+                        and cur_tuple[1] >= prev_total[1]
+                        and cur_tuple[2] >= prev_total[2]
+                        and cur_tuple[3] >= prev_total[3]
+                        and cur_tuple[4] >= prev_total[4]
+                    ):
+                        d_in = cur_tuple[0] - prev_total[0]
+                        d_cr = cur_tuple[1] - prev_total[1]
+                        d_cw = cur_tuple[2] - prev_total[2]
+                        d_out = cur_tuple[3] - prev_total[3]
+                        d_reason = cur_tuple[4] - prev_total[4]
+                    elif last_tuple is not None:
+                        d_in, d_cr, d_cw, d_out, d_reason = last_tuple
+                else:
+                    d_in, d_cr, d_cw, d_out, d_reason = cur_tuple
+                prev_total = cur_tuple
+        elif last_tuple is not None:
+            d_in, d_cr, d_cw, d_out, d_reason = last_tuple
 
         if d_in + d_out + d_cr + d_cw + d_reason <= 0:
             continue
-        ev_turn_id = str(payload.get("turn_id") or payload.get("root_turn_id") or current_turn_id or "")
-        ev_cwd = (
-            (turn_cwds.get(ev_turn_id) if ev_turn_id else None)
-            or (turn_cwds.get(active_turn_id) if active_turn_id else None)
-            or pending_turn_cwd
-            or session_cwd
-        )
         events.append(
             CodexUsageEvent(
-                ts,
-                current_model,
-                turn,
+                ev["ts"],
+                model,
+                0,
                 (d_in, d_cr, d_cw, d_out, d_reason),
                 cur_tuple,
-                is_response,
-                turn_id=ev_turn_id,
-                response_id=response_id_str,
-                project_cwd=ev_cwd,
+                ev["is_response"],
+                turn_id=ev["turn_id"],
+                response_id=ev["response_id"],
+                project_cwd=ev["cwd"],
             )
         )
 
-    duplicates = _codex_mirrored_events(events, response_totals)
-    tool_key = "t3_codex" if originator == "T3 Code" else "codex"
+    duplicates, enrichments = _codex_mirrored_events_session(events)
     rows: List[Dict[str, Any]] = []
     seen_session_days: set = set()
-    occ_counts: Dict[Tuple[Any, ...], int] = {}
 
     for index, event in enumerate(events):
         if index in duplicates:
             continue
+        eff_model, eff_cwd = enrichments.get(index, (event.model, event.project_cwd))
         inp, cr, cw, out, reasoning = event.tokens
         non_cached_in = max(0, inp - cr - cw)
         non_reason_out = max(0, out - reasoning)
         tot_tok = non_cached_in + non_reason_out + cr + cw + reasoning
-        rates = pricing.resolve(event.model)
-        cost = pricing.estimate_cost(event.model, non_cached_in, non_reason_out, cr, cw, reasoning)
+        rates = pricing.resolve(eff_model)
+        cost = pricing.estimate_cost(eff_model, non_cached_in, non_reason_out, cr, cw, reasoning)
         sub_cand = cost if rates is not None else None
         unpriced = tot_tok if (cost == 0.0 and rates is None) else 0
         day = _ts_to_day(event.timestamp)
@@ -805,7 +1159,7 @@ def _parse_codex_file_checked(
         row: Dict[str, Any] = {
             "tool": tool_key,
             "day": day,
-            "model": event.model or "unknown",
+            "model": eff_model or "unknown",
             "in": non_cached_in,
             "out": non_reason_out,
             "cr": cr,
@@ -818,44 +1172,23 @@ def _parse_codex_file_checked(
         }
         if sub_cand is not None:
             row["sub_cand"] = round(float(sub_cand), 6)
-        if event.project_cwd:
-            row["project"] = event.project_cwd
-
+        if eff_cwd:
+            row["project"] = eff_cwd
         if session_id:
             row["session_id"] = session_id
-            if event.response_id:
-                dedup_raw = f"resp|{tool_key}|{session_id}|{event.response_id}"
-            elif event.total is not None:
-                base_sig = (
-                    "tot",
-                    tool_key,
-                    session_id,
-                    event.turn_id,
-                    round(event.timestamp, 3),
-                    event.model,
-                    event.total,
-                )
-                occ = occ_counts.get(base_sig, 0)
-                occ_counts[base_sig] = occ + 1
-                dedup_raw = f"tot|{tool_key}|{session_id}|{event.turn_id}|{round(event.timestamp, 3)}|{event.model}|{event.total}|{occ}"
-            else:
-                base_sig = (
-                    "ev",
-                    tool_key,
-                    session_id,
-                    event.turn_id,
-                    round(event.timestamp, 3),
-                    event.model,
-                    event.tokens,
-                )
-                occ = occ_counts.get(base_sig, 0)
-                occ_counts[base_sig] = occ + 1
-                dedup_raw = f"ev|{tool_key}|{session_id}|{event.turn_id}|{round(event.timestamp, 3)}|{event.model}|{event.tokens}|{occ}"
-            row["dedup_id"] = hashlib.sha256(dedup_raw.encode("utf-8")).hexdigest()[:32]
         rows.append(row)
 
-    had_err = res.had_error or struct_error
-    return rows, had_err, res.identity_changed, res.stat_result
+    return rows
+
+
+def _parse_codex_file_checked(
+    path: Path, pricing: PricingTable
+) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[os.stat_result]]:
+    bundle, had_err, changed, st_res = _parse_codex_file_raw(path)
+    if had_err or changed:
+        return [], had_err, changed, st_res
+    rows = _reduce_codex_session_bundles([bundle], pricing)
+    return rows, False, False, st_res
 
 
 def _parse_codex_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
@@ -883,8 +1216,7 @@ def collect_codex_usage(
     files.sort(key=lambda p: str(p))
     files_ok = 0
     files_err = 0
-    seen_event_ids: set = set()
-    seen_session_days: set = set()
+    session_bundles: Dict[str, List[Dict[str, Any]]] = {}
 
     for path in files:
         try:
@@ -894,36 +1226,26 @@ def collect_codex_usage(
         except OSError:
             files_err += 1
             continue
-        rows = cache.get(path, require_codex_dedup=True)
-        if rows is None:
-            rows, had_err, changed, st_res = _parse_codex_file_checked(path, pricing)
+        bundle = cache.get_codex_bundle(path)
+        if bundle is None:
+            bundle, had_err, changed, st_res = _parse_codex_file_raw(path)
             if had_err or changed:
                 files_err += 1
                 continue
-            cache.put(path, rows, stat_result=st_res, codex_dedup=True)
+            single_rows = _reduce_codex_session_bundles([bundle], pricing)
+            cache.put(path, single_rows, stat_result=st_res, codex_dedup=True, codex_bundle=bundle)
         files_ok += 1
 
-        deduped_rows: List[Dict[str, Any]] = []
-        for r in rows:
-            did = r.get("dedup_id")
-            if did:
-                if did in seen_event_ids:
-                    continue
-                seen_event_ids.add(did)
-            sid = r.get("session_id")
-            sess_key = (r["tool"], r["day"], f"sid:{sid}" if sid else f"file:{path}")
-            row_copy = dict(r)
-            if sess_key in seen_session_days:
-                row_copy["sessions"] = 0
-            else:
-                seen_session_days.add(sess_key)
-                row_copy["sessions"] = 1
-            deduped_rows.append(row_copy)
+        sid = bundle.get("session_id") or ""
+        group_key = f"sid:{sid}" if sid else f"file:{path}"
+        session_bundles.setdefault(group_key, []).append(bundle)
 
-        if deduped_rows:
+    for group_key in sorted(session_bundles.keys()):
+        rows = _reduce_codex_session_bundles(session_bundles[group_key], pricing)
+        if rows:
             _merge_rows_into_result(
                 result,
-                deduped_rows,
+                rows,
                 cutoff_day,
                 projects_out=projects_out,
                 billing_acc=billing_acc,
@@ -938,19 +1260,24 @@ def collect_codex_usage(
 # ---------------------------------------------------------------------------
 
 
-def _pick_int(d: Dict[str, Any], *keys: str) -> int:
+def _pick_strict_int(d: Dict[str, Any], *keys: str) -> Tuple[int, bool]:
+    best = 0
     for k in keys:
         if k in d and d[k] is not None:
-            v = _safe_int(d[k])
-            if v > 0:
-                return v
-    return 0
+            v, ok = _parse_strict_nonneg_int(d, k)
+            if not ok:
+                return 0, False
+            if best == 0 and v > 0:
+                best = v
+    return best, True
 
 
-def _detail_int(d: Any, *keys: str) -> int:
+def _detail_strict_int(d: Any, *keys: str) -> Tuple[int, bool]:
+    if d is None:
+        return 0, True
     if not isinstance(d, dict):
-        return 0
-    return _pick_int(d, *keys)
+        return 0, False
+    return _pick_strict_int(d, *keys)
 
 
 def _parse_workbuddy_file_checked(
@@ -966,6 +1293,7 @@ def _parse_workbuddy_file_checked(
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     seen_dedup: set = set()
     project_cwd = ""
+    struct_error = False
 
     for line_no, item in res.records:
         if not project_cwd:
@@ -975,28 +1303,35 @@ def _parse_workbuddy_file_checked(
         if not isinstance(provider, dict):
             provider = {}
 
-        sources = [
-            x
-            for x in (message.get("usage"), provider.get("usage"), provider.get("rawUsage"), item.get("usage"))
-            if isinstance(x, dict) and x
-        ]
+        raw_sources = (message.get("usage"), provider.get("usage"), provider.get("rawUsage"), item.get("usage"))
+        if any(x is not None and not isinstance(x, dict) for x in raw_sources):
+            struct_error = True
+            continue
+        sources = [x for x in raw_sources if isinstance(x, dict) and x]
         if not sources:
             continue
 
         ts = _parse_ts(item.get("timestamp") or item.get("createdAt") or item.get("ts"))
         if ts is None:
+            struct_error = True
             continue
 
         selected = None
         inp_total = out_total = 0
+        bad_field = False
         for src in sources:
-            i_v = _pick_int(src, "input_tokens", "inputTokens", "input", "prompt_tokens")
-            o_v = _pick_int(src, "output_tokens", "outputTokens", "output", "completion_tokens")
-            if i_v + o_v > 0:
+            i_v, ok_i = _pick_strict_int(src, "input_tokens", "inputTokens", "input", "prompt_tokens")
+            o_v, ok_o = _pick_strict_int(src, "output_tokens", "outputTokens", "output", "completion_tokens")
+            if not (ok_i and ok_o):
+                bad_field = True
+                break
+            if selected is None and i_v + o_v > 0:
                 selected = src
                 inp_total = i_v
                 out_total = o_v
-                break
+        if bad_field:
+            struct_error = True
+            continue
         if selected is None:
             continue
 
@@ -1005,44 +1340,44 @@ def _parse_workbuddy_file_checked(
         thoughts = 0
         total_candidates: List[int] = []
         for src in sources:
-            cr = max(
-                cr,
-                _pick_int(
-                    src,
-                    "cache_read_input_tokens",
-                    "cacheReadInputTokens",
-                    "cache_read",
-                    "cacheRead",
-                    "cached_tokens",
-                    "cachedTokens",
-                    "prompt_cache_hit_tokens",
-                ),
-                _detail_int(src.get("inputTokensDetails"), "cached_tokens", "cachedTokens"),
-                _detail_int(src.get("input_tokens_details"), "cached_tokens", "cachedTokens"),
-                _detail_int(src.get("prompt_tokens_details"), "cached_tokens", "cachedTokens"),
+            cr1, ok1 = _pick_strict_int(
+                src,
+                "cache_read_input_tokens",
+                "cacheReadInputTokens",
+                "cache_read",
+                "cacheRead",
+                "cached_tokens",
+                "cachedTokens",
+                "prompt_cache_hit_tokens",
             )
-            cw = max(
-                cw,
-                _pick_int(
-                    src,
-                    "cache_creation_input_tokens",
-                    "cacheCreationInputTokens",
-                    "cache_write_input_tokens",
-                    "cacheWriteInputTokens",
-                    "prompt_cache_write_tokens",
-                    "cache_write",
-                    "cacheWrite",
-                ),
+            cr2, ok2 = _detail_strict_int(src.get("inputTokensDetails"), "cached_tokens", "cachedTokens")
+            cr3, ok3 = _detail_strict_int(src.get("input_tokens_details"), "cached_tokens", "cachedTokens")
+            cr4, ok4 = _detail_strict_int(src.get("prompt_tokens_details"), "cached_tokens", "cachedTokens")
+            cw1, ok5 = _pick_strict_int(
+                src,
+                "cache_creation_input_tokens",
+                "cacheCreationInputTokens",
+                "cache_write_input_tokens",
+                "cacheWriteInputTokens",
+                "prompt_cache_write_tokens",
+                "cache_write",
+                "cacheWrite",
             )
-            thoughts = max(
-                thoughts,
-                _pick_int(src, "reasoning_tokens", "reasoningTokens", "thinking_tokens"),
-                _detail_int(src.get("output_tokens_details"), "reasoning_tokens", "thinking_tokens"),
-                _detail_int(src.get("outputTokensDetails"), "reasoningTokens", "thinkingTokens"),
-            )
-            tot = _pick_int(src, "total_tokens", "totalTokens", "total")
+            th1, ok6 = _pick_strict_int(src, "reasoning_tokens", "reasoningTokens", "thinking_tokens")
+            th2, ok7 = _detail_strict_int(src.get("output_tokens_details"), "reasoning_tokens", "thinking_tokens")
+            th3, ok8 = _detail_strict_int(src.get("outputTokensDetails"), "reasoningTokens", "thinkingTokens")
+            tot, ok9 = _pick_strict_int(src, "total_tokens", "totalTokens", "total")
+            if not (ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 and ok8 and ok9):
+                bad_field = True
+                break
+            cr = max(cr, cr1, cr2, cr3, cr4)
+            cw = max(cw, cw1)
+            thoughts = max(thoughts, th1, th2, th3)
             if tot > 0:
                 total_candidates.append(tot)
+        if bad_field:
+            struct_error = True
+            continue
 
         dedup_id = message.get("id") or item.get("id") or f"{line_no + 1}"
         dedup_key = (str(dedup_id), int(ts))
@@ -1069,7 +1404,12 @@ def _parse_workbuddy_file_checked(
         if not isinstance(model, str):
             model = "unknown"
 
-        cost = _safe_float(selected.get("cost")) or _safe_float(provider.get("cost"))
+        c1, ok_c1 = _parse_strict_nonneg_float(selected, "cost")
+        c2, ok_c2 = _parse_strict_nonneg_float(provider, "cost")
+        if not (ok_c1 and ok_c2):
+            struct_error = True
+            continue
+        cost = (c1 if (c1 is not None and c1 > 0) else 0.0) or (c2 if (c2 is not None and c2 > 0) else 0.0)
         if cost <= 0:
             cost = pricing.estimate_cost(
                 model,
@@ -1093,7 +1433,7 @@ def _parse_workbuddy_file_checked(
             cost_usd=cost,
             requests=1,
         )
-    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+    return _compact_rows(acc, project=project_cwd), (res.had_error or struct_error), res.identity_changed, res.stat_result
 
 
 def _parse_workbuddy_file(path: Path, tool_key: str, pricing: PricingTable) -> List[Dict[str, Any]]:
@@ -1155,6 +1495,7 @@ def _parse_claude_file_checked(
     by_msg: Dict[str, Tuple[float, str, int, int, int, int, int]] = {}
     fallback_seq = 0
     project_cwd = ""
+    struct_error = False
 
     for _, obj in res.records:
         if not project_cwd:
@@ -1163,17 +1504,24 @@ def _parse_claude_file_checked(
         if not isinstance(msg, dict):
             continue
         usage = msg.get("usage")
+        if usage is None:
+            continue
         if not isinstance(usage, dict):
+            struct_error = True
             continue
         ts = _parse_ts(obj.get("timestamp"))
         if ts is None:
+            struct_error = True
             continue
 
-        inp = _safe_int(usage.get("input_tokens"))
-        out = _safe_int(usage.get("output_tokens"))
-        cr = _safe_int(usage.get("cache_read_input_tokens"))
-        cw = _safe_int(usage.get("cache_creation_input_tokens"))
-        thoughts = _detail_int(usage.get("output_tokens_details"), "thinking_tokens", "reasoning_tokens")
+        inp, ok1 = _parse_strict_nonneg_int(usage, "input_tokens")
+        out, ok2 = _parse_strict_nonneg_int(usage, "output_tokens")
+        cr, ok3 = _parse_strict_nonneg_int(usage, "cache_read_input_tokens")
+        cw, ok4 = _parse_strict_nonneg_int(usage, "cache_creation_input_tokens")
+        thoughts, ok5 = _detail_strict_int(usage.get("output_tokens_details"), "thinking_tokens", "reasoning_tokens")
+        if not (ok1 and ok2 and ok3 and ok4 and ok5):
+            struct_error = True
+            continue
         if inp + out + cr + cw + thoughts <= 0:
             continue
 
@@ -1214,7 +1562,7 @@ def _parse_claude_file_checked(
             requests=1,
             sub_cand_usd=sub_cand,
         )
-    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+    return _compact_rows(acc, project=project_cwd), (res.had_error or struct_error), res.identity_changed, res.stat_result
 
 
 def _parse_claude_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
@@ -1283,23 +1631,32 @@ def _parse_pi_file_checked(
 
     acc: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     project_cwd = ""
+    struct_error = False
 
     for _, obj in res.records:
         if not project_cwd and obj.get("type") == "session":
             project_cwd = _normalize_project_path(obj.get("cwd"))
         msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-        usage = msg.get("usage") or obj.get("usage")
-        if not isinstance(usage, dict):
+        raw_usage = msg.get("usage") if "usage" in msg else obj.get("usage")
+        if raw_usage is None:
             continue
+        if not isinstance(raw_usage, dict):
+            struct_error = True
+            continue
+        usage = raw_usage
         ts = _parse_ts(obj.get("timestamp") or msg.get("timestamp"))
         if ts is None:
+            struct_error = True
             continue
 
-        inp = _pick_int(usage, "input", "input_tokens", "inputTokens")
-        out = _pick_int(usage, "output", "output_tokens", "outputTokens")
-        cr = _pick_int(usage, "cacheRead", "cache_read", "cache_read_input_tokens")
-        cw = _pick_int(usage, "cacheWrite", "cache_write", "cache_creation_input_tokens")
-        thoughts = _pick_int(usage, "reasoning", "thoughts", "thinking_tokens")
+        inp, ok1 = _pick_strict_int(usage, "input", "input_tokens", "inputTokens")
+        out, ok2 = _pick_strict_int(usage, "output", "output_tokens", "outputTokens")
+        cr, ok3 = _pick_strict_int(usage, "cacheRead", "cache_read", "cache_read_input_tokens")
+        cw, ok4 = _pick_strict_int(usage, "cacheWrite", "cache_write", "cache_creation_input_tokens")
+        thoughts, ok5 = _pick_strict_int(usage, "reasoning", "thoughts", "thinking_tokens")
+        if not (ok1 and ok2 and ok3 and ok4 and ok5):
+            struct_error = True
+            continue
         if inp + out + cr + cw + thoughts <= 0:
             continue
 
@@ -1307,9 +1664,17 @@ def _parse_pi_file_checked(
         cost_obj = usage.get("cost")
         cost = 0.0
         if isinstance(cost_obj, dict):
-            cost = _safe_float(cost_obj.get("total"))
-        elif isinstance(cost_obj, (int, float)):
-            cost = _safe_float(cost_obj)
+            c_val, ok_c = _parse_strict_nonneg_float(cost_obj, "total")
+            if not ok_c:
+                struct_error = True
+                continue
+            cost = c_val or 0.0
+        elif cost_obj is not None:
+            c_val, ok_c = _parse_strict_nonneg_float(usage, "cost")
+            if not ok_c:
+                struct_error = True
+                continue
+            cost = c_val or 0.0
         if cost <= 0:
             cost = pricing.estimate_cost(
                 model,
@@ -1332,7 +1697,7 @@ def _parse_pi_file_checked(
             cost_usd=cost,
             requests=1,
         )
-    return _compact_rows(acc, project=project_cwd), res.had_error, res.identity_changed, res.stat_result
+    return _compact_rows(acc, project=project_cwd), (res.had_error or struct_error), res.identity_changed, res.stat_result
 
 
 def _parse_pi_file(path: Path, pricing: PricingTable) -> List[Dict[str, Any]]:
@@ -1735,19 +2100,27 @@ def _parse_gemini_file_checked(
         messages = data.get("messages") if isinstance(data, dict) else None
         if not isinstance(messages, list):
             return [], False, False, st_a
+        struct_error = False
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
             tok = msg.get("tokens")
+            if tok is None:
+                continue
             if not isinstance(tok, dict):
+                struct_error = True
                 continue
             ts = _parse_ts(msg.get("timestamp"))
             if ts is None:
+                struct_error = True
                 continue
-            inp_total = _safe_int(tok.get("input"))
-            out = _safe_int(tok.get("output"))
-            cr = _safe_int(tok.get("cached"))
-            thoughts = _safe_int(tok.get("thoughts"))
+            inp_total, ok1 = _parse_strict_nonneg_int(tok, "input")
+            out, ok2 = _parse_strict_nonneg_int(tok, "output")
+            cr, ok3 = _parse_strict_nonneg_int(tok, "cached")
+            thoughts, ok4 = _parse_strict_nonneg_int(tok, "thoughts")
+            if not (ok1 and ok2 and ok3 and ok4):
+                struct_error = True
+                continue
             if inp_total + out + cr + thoughts <= 0:
                 continue
             non_cached_in = max(0, inp_total - cr)
@@ -1761,7 +2134,7 @@ def _parse_gemini_file_checked(
                 reasoning_tokens=thoughts,
             )
             _acc_add(acc, "gemini", _ts_to_day(ts), model, non_cached_in, out, cr, 0, thoughts, cost, 1)
-        return _compact_rows(acc), False, False, st_a
+        return _compact_rows(acc), struct_error, False, st_a
     return [], True, True, None
 
 

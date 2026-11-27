@@ -20,10 +20,12 @@ _VERSION_CLEAN_RE = re.compile(r"[:@].*$")
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
+    if isinstance(val, bool):
+        return default
     try:
         v = float(val)
         return v if v >= 0 and math.isfinite(v) else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
