@@ -20,7 +20,7 @@ struct DashboardViews: View {
     }
 
     var body: some View {
-        let periodStats = store.snapshot?.usage?.periods.stats(for: store.selectedPeriod)
+        let periodStats = store.periodStats(for: store.selectedPeriod)
         let heatmap = store.snapshot?.usage?.heatmap
         let isCopied = store.copiedToast && store.reportError == nil
 
@@ -158,26 +158,50 @@ struct DashboardViews: View {
     }
 
     private func kpiRow(periodStats: PeriodStats?, heatmap: HeatmapPayload?) -> some View {
+        let hasPeriod = periodStats != nil
+        let isWorkUnknown: Bool = {
+            guard let p = periodStats else { return true }
+            if p.isWorkUnknown { return true }
+            if store.selectedPeriod == .today && store.isTodayWorkUnknown { return true }
+            return false
+        }()
         let hrs = store.selectedPeriod == .today
             ? (store.todayLiveSeconds / 3600.0)
             : (periodStats?.agentHours ?? 0.0)
         let tok = periodStats?.totalTokens ?? 0
         let cost = periodStats?.costUsd ?? 0.0
         let unpriced = periodStats?.unpricedTokens ?? 0
-        let hasCostObs = tok > 0 || cost > 0 || unpriced > 0
+        let hasCostObs = hasPeriod && (tok > 0 || cost > 0 || unpriced > 0)
         let hitPct = Int(round((periodStats?.cacheHitRate ?? 0.0) * 100))
         let activeDays = periodStats?.activeDays ?? 0
 
         return HStack(spacing: 8) {
-            kpiBox(title: "AI 有效工时", value: String(format: "%.2fh", hrs), sub: String(format: "%.2f 员工日", hrs / 8.0), tint: liveEmerald)
-            kpiBox(title: "总 Token", value: Formatters.compactTokens(tok), sub: "缓存命中 \(hitPct)%", tint: Color(hex: "#38BDF8"))
+            kpiBox(
+                title: "AI 有效工时",
+                value: isWorkUnknown ? "—" : String(format: "%.2fh", hrs),
+                sub: isWorkUnknown ? "—" : String(format: "%.2f 员工日", hrs / 8.0),
+                tint: isWorkUnknown ? .secondary : liveEmerald
+            )
+            kpiBox(
+                title: "总 Token",
+                value: hasPeriod ? Formatters.compactTokens(tok) : "—",
+                sub: hasPeriod ? "缓存命中 \(hitPct)%" : "暂未获取当期数据",
+                tint: hasPeriod ? Color(hex: "#38BDF8") : .secondary
+            )
             kpiBox(
                 title: "估算 API 成本",
                 value: Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs),
-                sub: unpriced > 0 ? "\(Formatters.compactTokens(unpriced)) Token 未计价" : "\(periodStats?.tools.count ?? 0) 个工具",
-                tint: accentPurple
+                sub: hasPeriod
+                    ? (unpriced > 0 ? "\(Formatters.compactTokens(unpriced)) Token 未计价" : "\(periodStats?.tools.count ?? 0) 个工具")
+                    : "暂未获取当期数据",
+                tint: hasCostObs ? accentPurple : .secondary
             )
-            kpiBox(title: "活跃天数", value: "\(activeDays) 天", sub: "累计 \(heatmap?.totalActiveDays ?? activeDays) 天", tint: Color(hex: "#FB923C"))
+            kpiBox(
+                title: "活跃天数",
+                value: hasPeriod ? "\(activeDays) 天" : "—",
+                sub: heatmap.map { "累计 \($0.totalActiveDays) 天" } ?? (hasPeriod ? "累计 \(activeDays) 天" : "—"),
+                tint: hasPeriod ? Color(hex: "#FB923C") : .secondary
+            )
         }
     }
 
@@ -257,8 +281,11 @@ struct DashboardViews: View {
                                 let d = days[idx]
                                 let val = values[idx]
                                 let isSel = selectedDay?.date == d.date
-                                let hasDayObs = d.totalTokens > 0 || d.costUsd > 0
-                                let dayCostText = Formatters.estimatedUSD(d.costUsd, unpricedTokens: 0, hasObservation: hasDayObs)
+                                let dayCostText = Formatters.estimatedUSD(
+                                    d.costUsd,
+                                    unpricedTokens: d.effectiveUnpricedTokens,
+                                    hasObservation: d.effectiveHasCostObservation
+                                )
                                 Button {
                                     selectedHeatmapDate = d.date
                                 } label: {
@@ -284,8 +311,12 @@ struct DashboardViews: View {
 
             // Selected Day Detail Card
             if let d = selectedDay {
-                let hasDayObs = d.totalTokens > 0 || d.costUsd > 0
-                let dayCostText = Formatters.estimatedUSD(d.costUsd, unpricedTokens: 0, hasObservation: hasDayObs)
+                let hasDayObs = d.effectiveHasCostObservation
+                let dayCostText = Formatters.estimatedUSD(
+                    d.costUsd,
+                    unpricedTokens: d.effectiveUnpricedTokens,
+                    hasObservation: hasDayObs
+                )
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
@@ -315,8 +346,21 @@ struct DashboardViews: View {
                             spacing: 4
                         ) {
                             ForEach(d.tools) { dt in
-                                let dtHasObs = dt.totalTokens > 0 || dt.costUsd > 0
-                                let dtCost = Formatters.estimatedUSD(dt.costUsd, unpricedTokens: 0, hasObservation: dtHasObs)
+                                let dtHasObs = dt.effectiveHasCostObservation
+                                let dtCost = Formatters.estimatedUSD(
+                                    dt.costUsd,
+                                    unpricedTokens: dt.effectiveUnpricedTokens,
+                                    hasObservation: dtHasObs
+                                )
+                                let dtMetricText: String = {
+                                    if dt.totalTokens > 0 {
+                                        return "\(Formatters.compactTokens(dt.totalTokens)) · \(dtCost)"
+                                    }
+                                    if dtHasObs {
+                                        return dtCost
+                                    }
+                                    return String(format: "%.2fh", dt.agentHours)
+                                }()
                                 HStack(spacing: 5) {
                                     Circle()
                                         .fill(Color(hex: dt.color))
@@ -325,7 +369,7 @@ struct DashboardViews: View {
                                         .font(.system(size: 10, weight: .medium))
                                         .lineLimit(1)
                                     Spacer()
-                                    Text(dt.totalTokens > 0 ? "\(Formatters.compactTokens(dt.totalTokens)) · \(dtCost)" : String(format: "%.2fh", dt.agentHours))
+                                    Text(dtMetricText)
                                         .font(.system(size: 9.5, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                 }
@@ -393,7 +437,7 @@ struct DashboardViews: View {
                         : min(1.0, max(0.05, Double(m.totalTokens) / Double(maxTok)))
                     let tint = Color(hex: m.color)
                     let hitPct = Int(round(m.cacheHitRate * 100))
-                    let hasObs = m.totalTokens > 0 || m.costUsd > 0
+                    let hasObs = m.effectiveHasCostObservation
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
@@ -420,7 +464,13 @@ struct DashboardViews: View {
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundStyle(.tertiary)
                             }
-                            Text(Formatters.estimatedUSD(m.costUsd, unpricedTokens: 0, hasObservation: hasObs))
+                            Text(
+                                Formatters.estimatedUSD(
+                                    m.costUsd,
+                                    unpricedTokens: m.effectiveUnpricedTokens,
+                                    hasObservation: hasObs
+                                )
+                            )
                                 .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                                 .foregroundStyle(.primary)
                                 .frame(minWidth: 44, alignment: .trailing)

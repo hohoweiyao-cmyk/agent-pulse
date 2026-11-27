@@ -101,7 +101,18 @@ struct ProjectTrailViews: View {
             }
 
             if rows.isEmpty {
+                let isLegacyNonAll = store.isLegacyProjectFallbackOnlyAll && store.selectedProjectPeriod != .all
+                let emptyIcon = isLegacyNonAll ? "clock.arrow.circlepath" : "folder"
+                let emptyTitle: String = {
+                    if isLegacyNonAll {
+                        return "当前数据暂不支持按「\(store.selectedProjectPeriod.title)」拆分"
+                    }
+                    return query.isEmpty ? "「\(store.selectedProjectPeriod.title)」暂无项目记录" : "未找到匹配「\(query)」的项目"
+                }()
                 let emptyHint: String = {
+                    if isLegacyNonAll {
+                        return "旧版快照仅含历史累计项目，请切换到「全部」查看"
+                    }
                     if !query.isEmpty {
                         return "试试项目名、目录路径或分支名"
                     }
@@ -111,15 +122,32 @@ struct ProjectTrailViews: View {
                     return "可切换到更长周期或「全部」查看历史项目"
                 }()
                 VStack(spacing: 6) {
-                    Image(systemName: "folder")
+                    Image(systemName: emptyIcon)
                         .font(.system(size: 18))
                         .foregroundStyle(.tertiary)
-                    Text(query.isEmpty ? "「\(store.selectedProjectPeriod.title)」暂无项目记录" : "未找到匹配「\(query)」的项目")
+                    Text(emptyTitle)
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
                     Text(emptyHint)
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
+                    if isLegacyNonAll {
+                        Button {
+                            withAnimation(.easeOut(duration: 0.14)) {
+                                store.selectedProjectPeriod = .all
+                            }
+                        } label: {
+                            Text("切换到「全部」")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(colorScheme == .dark ? Color(hex: "#EDE9FE") : accentPurple)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4.5)
+                                .background(accentPurple.opacity(colorScheme == .dark ? 0.28 : 0.14), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .padding(.top, 2)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 34)
@@ -196,8 +224,12 @@ struct ProjectTrailViews: View {
     private func projectRow(_ row: ProjectTrailRow) -> some View {
         let stats = row.stats
         let isExpanded = expandedProjectId == row.id
-        let hasCostObs = stats.totalTokens > 0 || stats.costUsd > 0
-        let costText = Formatters.estimatedUSD(stats.costUsd, unpricedTokens: 0, hasObservation: hasCostObs)
+        let hasCostObs = stats.effectiveHasCostObservation
+        let costText = Formatters.estimatedUSD(
+            stats.costUsd,
+            unpricedTokens: stats.effectiveUnpricedTokens,
+            hasObservation: hasCostObs
+        )
         let hitPct = Int(round(stats.cacheHitRate * 100))
         let hasWorktreeMerge = stats.worktreeSources.count > 1
 

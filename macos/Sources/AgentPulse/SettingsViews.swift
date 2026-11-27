@@ -53,6 +53,7 @@ struct SettingsViews: View {
     // MARK: - Monthly Subscription Payback Card
 
     private var subscriptionPaybackCard: some View {
+        let hasMonthData = store.currentMonthSubscriptionDataAvailable
         let rows = store.subscriptionRows
         let subRows = rows.filter { $0.subscriptionValueUsd != nil || $0.monthlyFeeCents != nil }
         let apiRows = rows.filter { $0.apiActualUsd != nil }
@@ -69,9 +70,26 @@ struct SettingsViews: View {
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(.primary)
                 Spacer()
-                Text("自然月累计")
+                Text(hasMonthData ? "自然月累计" : "待本月数据")
                     .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(hasMonthData ? AnyShapeStyle(.tertiary) : AnyShapeStyle(amberAccent))
+            }
+
+            if !hasMonthData {
+                HStack(spacing: 5.5) {
+                    Image(systemName: "calendar.badge.clock")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(amberAccent)
+                    Text("本月尚无新数据，刷新后将自动统计本月订阅折算与实付")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(colorScheme == .dark ? amberAccent.opacity(0.95) : amberAccent)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 2)
+                }
+                .padding(.horizontal, 8.5)
+                .padding(.vertical, 5)
+                .background(amberAccent.opacity(colorScheme == .dark ? 0.12 : 0.09), in: RoundedRectangle(cornerRadius: 7.5, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 7.5, style: .continuous).strokeBorder(amberAccent.opacity(0.25), lineWidth: 0.6))
             }
 
             // Explicit Two-Column Layout:
@@ -86,10 +104,10 @@ struct SettingsViews: View {
 
                     if subRows.isEmpty {
                         VStack(alignment: .leading, spacing: 5) {
-                            Text("本月暂无订阅折算记录")
+                            Text(hasMonthData ? "本月暂无订阅折算记录" : "本月尚无新数据")
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundStyle(.secondary)
-                            Text("可先设置常用订阅月费，产生用量后自动计算回本倍率")
+                            Text(hasMonthData ? "可先设置常用订阅月费，产生用量后自动计算回本倍率" : "可先配置订阅月费，待获取本月记录后自动计算回本倍率")
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -103,7 +121,7 @@ struct SettingsViews: View {
                     } else {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(subRows) { row in
-                                subscriptionColumnRow(row)
+                                subscriptionColumnRow(row, hasMonthData: hasMonthData)
                             }
                             if !hasCodexRow || !hasClaudeRow {
                                 HStack(spacing: 5) {
@@ -132,10 +150,10 @@ struct SettingsViews: View {
 
                     if apiRows.isEmpty {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("暂无可核实的 API 实付")
+                            Text(hasMonthData ? "暂无可核实的 API 实付" : "本月尚无新数据")
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundStyle(.secondary)
-                            Text("仅统计接口返回的真实扣费，不含按价表估算的费用")
+                            Text(hasMonthData ? "仅统计接口返回的真实扣费，不含按价表估算的费用" : "刷新获取本月记录后，将自动统计接口返回的真实扣费")
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(.tertiary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -213,7 +231,7 @@ struct SettingsViews: View {
         .pointingHandCursor()
     }
 
-    private func subscriptionColumnRow(_ row: SubscriptionRow) -> some View {
+    private func subscriptionColumnRow(_ row: SubscriptionRow, hasMonthData: Bool) -> some View {
         let isEditing = editingToolId == row.tool
         let hasFee = row.monthlyFeeCents != nil
 
@@ -239,7 +257,7 @@ struct SettingsViews: View {
                             in: Capsule()
                         )
                 } else if hasFee {
-                    Text("待用量")
+                    Text(hasMonthData ? "待用量" : "待新数据")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(.tertiary)
                 }
@@ -252,7 +270,7 @@ struct SettingsViews: View {
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("折算 $0.00")
+                    Text(hasMonthData ? "折算 $0.00" : "折算 —")
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }

@@ -21,7 +21,7 @@ struct PopoverRootView: View {
     private var dynamicWidth: CGFloat {
         switch store.selectedPopoverTab {
         case .overview:
-            let toolCount = store.snapshot?.usage?.periods.stats(for: store.selectedPeriod).tools.count ?? 0
+            let toolCount = store.periodStats(for: store.selectedPeriod)?.tools.count ?? 0
             return toolCount >= 2 ? 624 : 460
         case .dashboard:
             return 624

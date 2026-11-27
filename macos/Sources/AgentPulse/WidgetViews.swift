@@ -199,7 +199,7 @@ struct HourlyPulseChartView: View {
     private var chartHeight: CGFloat { compact ? 30 : 40 }
 
     private var peakHour: (hour: Int, seconds: Double)? {
-        guard day.hasHourlyDistribution, day.hourlySeconds.count == 24 else { return nil }
+        guard day.hourlyChartState == .available, day.hourlySeconds.count == 24 else { return nil }
         var bestHour = 0
         var bestSec = 0.0
         for (idx, sec) in day.hourlySeconds.enumerated() where sec > bestSec {
@@ -221,53 +221,67 @@ struct HourlyPulseChartView: View {
                 trailingCaption
             }
 
-            if !day.hasHourlyDistribution && day.agentSeconds > 0 {
-                HStack(spacing: 6) {
-                    Image(systemName: "clock.badge.questionmark")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.tertiary)
-                    Text("该日无小时分布")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: chartHeight + 14)
-                .background(
-                    Color.primary.opacity(colorScheme == .dark ? 0.04 : 0.03),
-                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), lineWidth: 0.5)
-                )
-                .accessibilityLabel("该日无小时分布")
-            } else {
+            switch day.hourlyChartState {
+            case .available:
                 barsSection
+            case .unavailable:
+                placeholderBox(icon: "clock.badge.questionmark", text: "该日无小时分布")
+            case .unknown:
+                placeholderBox(icon: "clock.badge.exclamationmark", text: "暂未获取到工时观测")
             }
         }
     }
 
+    private func placeholderBox(icon: String, text: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+            Text(text)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: chartHeight + 14)
+        .background(
+            Color.primary.opacity(colorScheme == .dark ? 0.04 : 0.03),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), lineWidth: 0.5)
+        )
+        .accessibilityLabel(text)
+    }
+
     @ViewBuilder
     private var trailingCaption: some View {
-        if let hour = hoveredHour, day.hasHourlyDistribution, hour < day.hourlySeconds.count {
-            let sec = day.hourlySeconds[hour]
-            Text(String(format: "%02d:00–%02d:59 · %@", hour, hour, sec > 0 ? Formatters.shortDuration(sec) : "无活跃"))
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(sec > 0 ? accentPurple : .secondary)
-                .transition(.opacity)
-        } else if !day.hasHourlyDistribution && day.agentSeconds > 0 {
+        switch day.hourlyChartState {
+        case .available:
+            if let hour = hoveredHour, hour < day.hourlySeconds.count {
+                let sec = day.hourlySeconds[hour]
+                Text(String(format: "%02d:00–%02d:59 · %@", hour, hour, sec > 0 ? Formatters.shortDuration(sec) : "无活跃"))
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(sec > 0 ? accentPurple : .secondary)
+                    .transition(.opacity)
+            } else if let peak = peakHour {
+                Text(String(format: "峰值 %02d点 · %@", peak.hour, Formatters.shortDuration(peak.seconds)))
+                    .font(.system(size: 10, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("暂无活跃时段")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.tertiary)
+            }
+        case .unavailable:
             Text(day.shortDate)
                 .font(.system(size: 10, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(.tertiary)
-        } else if let peak = peakHour {
-            Text(String(format: "峰值 %02d点 · %@", peak.hour, Formatters.shortDuration(peak.seconds)))
-                .font(.system(size: 10, weight: .medium))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-        } else {
-            Text("暂无活跃时段")
-                .font(.system(size: 10, weight: .medium))
+        case .unknown:
+            Text("—")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }
     }
@@ -708,27 +722,32 @@ struct WidgetRootView: View {
     // MARK: - Hero Section
 
     private func heroSection(day: DayStats) -> some View {
+        let isWorkUnknown = store.isDisplayedDayWorkUnknown || day.isWorkUnknown
         let secs = store.displayedAgentSeconds
         let workdays = secs / (8.0 * 3600.0)
         let lev = day.leverage
-        let levColor: Color = lev >= 1.4 ? liveEmerald : (lev >= 1.15 ? amberAccent : .secondary)
+        let levColor: Color = isWorkUnknown
+            ? .secondary
+            : (lev >= 1.4 ? liveEmerald : (lev >= 1.15 ? amberAccent : .secondary))
 
         return HStack(alignment: .lastTextBaseline, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(Formatters.heroHours(secs))
+                    Text(store.displayedHeroHoursText)
                         .font(.system(size: store.isCompact ? 34 : 40, weight: .bold, design: .rounded))
                         .monospacedDigit()
                         .tracking(-1.0)
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(isWorkUnknown ? .secondary : .primary)
                         .contentTransition(reduceMotion ? .identity : .numericText())
 
-                    Text("h")
-                        .font(.system(size: store.isCompact ? 15 : 17, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.secondary)
+                    if !isWorkUnknown {
+                        Text("h")
+                            .font(.system(size: store.isCompact ? 15 : 17, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
-                Text(Formatters.humanDurationCN(secs))
+                Text(isWorkUnknown ? "—" : Formatters.humanDurationCN(secs))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -738,25 +757,34 @@ struct WidgetRootView: View {
 
             VStack(alignment: .trailing, spacing: 5) {
                 HStack(spacing: 5) {
-                    Text(String(format: "%.2f 员工日", workdays))
+                    Text(isWorkUnknown ? "— 员工日" : String(format: "%.2f 员工日", workdays))
                         .font(.system(size: 11, weight: .semibold))
                         .monospacedDigit()
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(isWorkUnknown ? .secondary : .primary)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
                         .background(Color.primary.opacity(0.07), in: Capsule())
 
-                    Text(store.isCompact ? String(format: "%.2f×", lev) : String(format: "%.2f× 并行", lev))
+                    Text(
+                        isWorkUnknown
+                            ? (store.isCompact ? "—" : "— 并行")
+                            : (store.isCompact ? String(format: "%.2f×", lev) : String(format: "%.2f× 并行", lev))
+                    )
                         .font(.system(size: 11, weight: .bold))
                         .monospacedDigit()
                         .foregroundStyle(levColor)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(levColor.opacity(lev >= 1.15 ? 0.16 : 0.08), in: Capsule())
+                        .background(
+                            isWorkUnknown
+                                ? Color.primary.opacity(0.07)
+                                : levColor.opacity(lev >= 1.15 ? 0.16 : 0.08),
+                            in: Capsule()
+                        )
                         .help("并行杠杆率 = AI 累计工时 ÷ 去重墙钟时长")
                 }
 
-                Text(String(format: "墙钟 %.2fh · %d 轮", day.wallHours, day.runs))
+                Text(isWorkUnknown ? "墙钟 — · — 轮" : String(format: "墙钟 %.2fh · %d 轮", day.wallHours, day.runs))
                     .font(.system(size: 10.5, weight: .medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -1102,7 +1130,7 @@ struct WidgetRootView: View {
     private func compactLegend(tools: [ToolBreakdown]) -> some View {
         HStack(spacing: 10) {
             if tools.isEmpty {
-                Text("今日暂无 AI 工时记录")
+                Text(store.isDisplayedDayWorkUnknown ? "暂未获取到工时观测" : "今日暂无 AI 工时记录")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
@@ -1138,7 +1166,7 @@ struct WidgetRootView: View {
     private func toolsBreakdownList(tools: [ToolBreakdown]) -> some View {
         VStack(spacing: 6) {
             if tools.isEmpty {
-                Text("当天暂无 AI 工时记录")
+                Text(store.isDisplayedDayWorkUnknown ? "暂未获取到工时观测" : "当天暂无 AI 工时记录")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1186,8 +1214,10 @@ struct WidgetRootView: View {
     private var sevenDayChart: some View {
         let days = store.snapshot?.last7Days ?? []
         let summary = store.snapshot?.summary7d
-        let maxHrs = max(1.0, days.map(\.agentHours).max() ?? 1.0)
+        let allUnknown = !days.isEmpty && days.allSatisfy(\.isWorkUnknown)
+        let maxHrs = max(1.0, days.filter { !$0.isWorkUnknown }.map(\.agentHours).max() ?? 1.0)
         let selectedKey = store.displayedDay?.date
+        let currentToday = store.currentShanghaiDay
 
         return VStack(alignment: .leading, spacing: 7) {
             HStack {
@@ -1197,7 +1227,11 @@ struct WidgetRootView: View {
 
                 Spacer()
 
-                if let s = summary {
+                if allUnknown {
+                    Text("—")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else if let s = summary {
                     Text(String(format: "共 %.1fh · 日均 %.1fh", s.totalHours, s.avgDailyHours))
                         .font(.system(size: 10, weight: .medium))
                         .monospacedDigit()
@@ -1209,8 +1243,9 @@ struct WidgetRootView: View {
                 ForEach(days) { d in
                     let isSelected = d.date == selectedKey
                     let isHovered = d.date == hoveredDay
-                    let ratio = min(1.0, max(0.06, d.agentHours / maxHrs))
-                    let barHeight = max(5, CGFloat(ratio) * 46)
+                    let isActualToday = d.date == currentToday
+                    let ratio = d.isWorkUnknown ? 0.06 : min(1.0, max(0.06, d.agentHours / maxHrs))
+                    let barHeight: CGFloat = d.isWorkUnknown ? 5 : max(5, CGFloat(ratio) * 46)
 
                     Button {
                         withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
@@ -1218,11 +1253,11 @@ struct WidgetRootView: View {
                         }
                     } label: {
                         VStack(spacing: 4) {
-                            Text(d.agentHours >= 0.05 ? String(format: "%.1f", d.agentHours) : "0")
+                            Text(d.isWorkUnknown ? "—" : (d.agentHours >= 0.05 ? String(format: "%.1f", d.agentHours) : "0"))
                                 .font(.system(size: 9.5, weight: isSelected ? .bold : .medium))
                                 .monospacedDigit()
                                 .foregroundStyle(isSelected ? .primary : .secondary)
-                                .opacity(isSelected || isHovered || d.agentHours == maxHrs ? 1.0 : 0.55)
+                                .opacity(isSelected || isHovered || (!d.isWorkUnknown && d.agentHours == maxHrs) ? 1.0 : 0.55)
 
                             ZStack(alignment: .bottom) {
                                 RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -1230,12 +1265,16 @@ struct WidgetRootView: View {
                                     .frame(height: 46)
 
                                 RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                    .fill(barFill(isSelected: isSelected, isToday: d.isToday, isHovered: isHovered))
+                                    .fill(
+                                        d.isWorkUnknown
+                                            ? AnyShapeStyle(Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.08))
+                                            : barFill(isSelected: isSelected, isToday: isActualToday, isHovered: isHovered)
+                                    )
                                     .frame(height: barHeight)
                             }
 
-                            Text(Formatters.shortWeekday(d.weekday, isToday: d.isToday))
-                                .font(.system(size: 10, weight: isSelected || d.isToday ? .semibold : .regular))
+                            Text(Formatters.shortWeekday(d.weekday, isToday: isActualToday))
+                                .font(.system(size: 10, weight: isSelected || isActualToday ? .semibold : .regular))
                                 .foregroundStyle(isSelected ? accentPurple : .secondary)
                         }
                         .frame(maxWidth: .infinity)
@@ -1246,7 +1285,11 @@ struct WidgetRootView: View {
                     .onHover { hovering in
                         hoveredDay = hovering ? d.date : (hoveredDay == d.date ? nil : hoveredDay)
                     }
-                    .help("\(d.date) (\(d.weekday)) · \(String(format: "%.2fh", d.agentHours)) · 并行 \(String(format: "%.2f×", d.leverage))")
+                    .help(
+                        d.isWorkUnknown
+                            ? "\(d.date) (\(d.weekday)) · 暂未获取到工时观测"
+                            : "\(d.date) (\(d.weekday)) · \(String(format: "%.2fh", d.agentHours)) · 并行 \(String(format: "%.2f×", d.leverage))"
+                    )
                 }
             }
         }

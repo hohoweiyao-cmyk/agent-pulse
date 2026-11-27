@@ -50,27 +50,11 @@ struct DetailCardsView: View {
         colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.08)
     }
 
-    private func hourlyDayForCurrentPeriod(periodStats: PeriodStats?) -> DayStats? {
-        guard let snap = store.snapshot else { return nil }
-        switch store.selectedPeriod {
-        case .today:
-            return snap.today
-        case .yesterday:
-            if let targetDate = periodStats?.endDate,
-               let matched = snap.days.first(where: { $0.date == targetDate }) {
-                return matched
-            }
-            return snap.days.dropLast().last
-        default:
-            return nil
-        }
-    }
-
     var body: some View {
-        let periodStats = store.snapshot?.usage?.periods.stats(for: store.selectedPeriod)
+        let periodStats = store.periodStats(for: store.selectedPeriod)
         let tools = periodStats?.tools ?? []
         let useTwoColumns = tools.count >= 2
-        let hourlyDay = hourlyDayForCurrentPeriod(periodStats: periodStats)
+        let hourlyDay = store.hourlyDay(for: store.selectedPeriod)
 
         VStack(alignment: .leading, spacing: 10) {
             periodHeaderRow(periodStats: periodStats)
@@ -100,14 +84,19 @@ struct DetailCardsView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 28)
             } else if tools.isEmpty {
+                let isUnobservedPeriod = periodStats == nil
                 VStack(spacing: 6) {
-                    Image(systemName: "tray")
+                    Image(systemName: isUnobservedPeriod ? "clock.badge.exclamationmark" : "tray")
                         .font(.system(size: 18))
                         .foregroundStyle(.tertiary)
-                    Text("「\(store.selectedPeriod.title)」暂无 AI 工具记录")
+                    Text(isUnobservedPeriod ? "「\(store.selectedPeriod.title)」暂未获取到当期数据" : "「\(store.selectedPeriod.title)」暂无 AI 工具记录")
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text(store.selectedPeriod == .all ? "使用 AI 工具产生对话或用量后会自动归集到这里" : "可切换到更长周期或「全部」查看历史明细")
+                    Text(
+                        isUnobservedPeriod
+                            ? "等待刷新获取最新记录，或切换到其他周期查看历史明细"
+                            : (store.selectedPeriod == .all ? "使用 AI 工具产生对话或用量后会自动归集到这里" : "可切换到更长周期或「全部」查看历史明细")
+                    )
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                 }
@@ -211,17 +200,22 @@ struct DetailCardsView: View {
     // MARK: - Top Compact Summary Strip
 
     private func compactSummaryStrip(periodStats: PeriodStats?) -> some View {
+        let isWorkUnknown: Bool = {
+            guard let p = periodStats else { return true }
+            if p.isWorkUnknown { return true }
+            if store.selectedPeriod == .today && store.isTodayWorkUnknown { return true }
+            return false
+        }()
         let hrs = store.selectedPeriod == .today
             ? (store.todayLiveSeconds / 3600.0)
             : (periodStats?.agentHours ?? 0.0)
         let wd = hrs / 8.0
-        let lev = store.selectedPeriod == .today
-            ? (store.snapshot?.today.leverage ?? 1.0)
-            : (periodStats?.leverage ?? 1.0)
+        let lev = periodStats?.leverage ?? 1.0
+        let hasPeriod = periodStats != nil
         let tok = periodStats?.totalTokens ?? 0
         let cost = periodStats?.costUsd ?? 0.0
         let unpriced = periodStats?.unpricedTokens ?? 0
-        let hasCostObs = tok > 0 || cost > 0 || unpriced > 0
+        let hasCostObs = hasPeriod && (tok > 0 || cost > 0 || unpriced > 0)
         let hitPct = Int(round((periodStats?.cacheHitRate ?? 0.0) * 100))
 
         return HStack(spacing: 8) {
@@ -231,13 +225,14 @@ struct DetailCardsView: View {
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.secondary)
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(String(format: "%.2fh", hrs))
+                        Text(isWorkUnknown ? "—" : String(format: "%.2fh", hrs))
                             .font(.system(size: 17, weight: .bold, design: .rounded))
                             .monospacedDigit()
-                        Text(String(format: "%.2f 员工日 · %.2f×", wd, lev))
+                            .foregroundStyle(isWorkUnknown ? .secondary : .primary)
+                        Text(isWorkUnknown ? "— 员工日 · —" : String(format: "%.2f 员工日 · %.2f×", wd, lev))
                             .font(.system(size: 10, weight: .semibold))
                             .monospacedDigit()
-                            .foregroundStyle(liveEmerald)
+                            .foregroundStyle(isWorkUnknown ? .secondary : liveEmerald)
                     }
                 }
                 Spacer(minLength: 0)
@@ -254,13 +249,14 @@ struct DetailCardsView: View {
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.secondary)
                     HStack(alignment: .firstTextBaseline, spacing: 5) {
-                        Text(Formatters.compactTokens(tok))
+                        Text(hasPeriod ? Formatters.compactTokens(tok) : "—")
                             .font(.system(size: 17, weight: .bold, design: .rounded))
                             .monospacedDigit()
+                            .foregroundStyle(hasPeriod ? .primary : .secondary)
                         Text(Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs))
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundStyle(hasCostObs ? accentPurple : Color.secondary.opacity(0.6))
-                        if hitPct > 0 {
+                        if hasPeriod && hitPct > 0 {
                             Text("缓存 \(hitPct)%")
                                 .font(.system(size: 9.5, weight: .medium))
                                 .foregroundStyle(.secondary)
