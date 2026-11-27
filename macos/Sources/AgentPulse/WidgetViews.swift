@@ -21,21 +21,399 @@ struct VisualEffectSurface: NSViewRepresentable {
     }
 }
 
+// MARK: - Shared Pointer Cursor Helper
+
+private struct PointingHandHoverModifier: ViewModifier {
+    let enabled: Bool
+    @State private var isPushed = false
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { hovering in
+                guard enabled else {
+                    if isPushed {
+                        NSCursor.pop()
+                        isPushed = false
+                    }
+                    return
+                }
+                if hovering && !isPushed {
+                    NSCursor.pointingHand.push()
+                    isPushed = true
+                } else if !hovering && isPushed {
+                    NSCursor.pop()
+                    isPushed = false
+                }
+            }
+            .onDisappear {
+                if isPushed {
+                    NSCursor.pop()
+                    isPushed = false
+                }
+            }
+    }
+}
+
+extension View {
+    func pointingHandCursor(_ enabled: Bool = true) -> some View {
+        modifier(PointingHandHoverModifier(enabled: enabled))
+    }
+}
+
+// MARK: - Shared Shanghai Timestamp Formatter
+
+enum ViewTimeFormatters {
+    private static let shanghaiTimeZone = TimeZone(identifier: "Asia/Shanghai") ?? TimeZone(secondsFromGMT: 8 * 3600)!
+
+    static func hhmm(_ epoch: Double?) -> String {
+        guard let epoch, epoch.isFinite, epoch > 0 else { return "--:--" }
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        f.timeZone = shanghaiTimeZone
+        return f.string(from: Date(timeIntervalSince1970: epoch))
+    }
+
+    static func monthDayHHmm(_ epoch: Double, now: Double) -> String {
+        let fDay = DateFormatter()
+        fDay.dateFormat = "yyyy-MM-dd"
+        fDay.timeZone = shanghaiTimeZone
+        let targetDate = Date(timeIntervalSince1970: epoch)
+        let nowDate = Date(timeIntervalSince1970: now)
+        let f = DateFormatter()
+        f.timeZone = shanghaiTimeZone
+        if fDay.string(from: targetDate) == fDay.string(from: nowDate) {
+            f.dateFormat = "HH:mm"
+        } else {
+            f.dateFormat = "MM/dd HH:mm"
+        }
+        return f.string(from: targetDate)
+    }
+}
+
+// MARK: - Shared Freshness Degradation Banner
+
+struct FreshnessBannerView: View {
+    @ObservedObject var store: ClockStore
+    var compact: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var amberAccent: Color {
+        colorScheme == .dark ? Color(hex: "#FBBF24") : Color(hex: "#B45309")
+    }
+    private var neutralMuted: Color {
+        colorScheme == .dark ? Color(hex: "#94A3B8") : Color(hex: "#64748B")
+    }
+
+    var body: some View {
+        let freshness = store.fastFreshness
+        if freshness != .fresh {
+            let tint = freshness == .unavailable ? neutralMuted : amberAccent
+            let icon = iconName(for: freshness)
+            let message = bannerText(for: freshness)
+
+            HStack(spacing: 5.5) {
+                Image(systemName: icon)
+                    .font(.system(size: compact ? 9.5 : 10, weight: .semibold))
+                    .foregroundStyle(tint)
+                Text(message)
+                    .font(.system(size: compact ? 10 : 10.5, weight: .medium))
+                    .foregroundStyle(colorScheme == .dark ? tint.opacity(0.95) : tint)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 2)
+                if let err = store.lastError, !compact {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(tint.opacity(0.75))
+                        .help(err)
+                }
+            }
+            .padding(.horizontal, compact ? 8 : 9)
+            .padding(.vertical, compact ? 4.5 : 5.5)
+            .background(
+                tint.opacity(colorScheme == .dark ? 0.13 : 0.10),
+                in: RoundedRectangle(cornerRadius: compact ? 8 : 8.5, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: compact ? 8 : 8.5, style: .continuous)
+                    .strokeBorder(tint.opacity(0.28), lineWidth: 0.6)
+            )
+            .help(store.lastError ?? message)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(message)
+        }
+    }
+
+    private func iconName(for freshness: FastFreshness) -> String {
+        switch freshness {
+        case .degraded:
+            return "exclamationmark.triangle.fill"
+        case .stale:
+            return "clock.badge.exclamationmark"
+        case .unavailable:
+            return "wifi.slash"
+        case .fresh:
+            return "checkmark.circle.fill"
+        }
+    }
+
+    private func bannerText(for freshness: FastFreshness) -> String {
+        let tsText = ViewTimeFormatters.hhmm(store.lastTrustedSuccessTimestamp)
+        switch freshness {
+        case .degraded:
+            return "部分数据源降级 · 末次成功 \(tsText)"
+        case .stale:
+            if store.isCrossedMidnightFromSnapshot {
+                return "已跨日待同步 · 末次成功 \(tsText)"
+            }
+            if store.lastError != nil {
+                return "数据暂未更新 · 末次成功 \(tsText)"
+            }
+            return "非实时快照 · 末次成功 \(tsText)"
+        case .unavailable:
+            return "暂未连接本机实时快照"
+        case .fresh:
+            return ""
+        }
+    }
+}
+
+// MARK: - Shared 24-Hour Pulse Chart (00-23)
+
+struct HourlyPulseChartView: View {
+    let day: DayStats
+    var compact: Bool = true
+    var titlePrefix: String? = nil
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var hoveredHour: Int?
+
+    private var accentPurple: Color { Color(hex: "#7C6BF5") }
+    private var peakCyan: Color {
+        colorScheme == .dark ? Color(hex: "#38BDF8") : Color(hex: "#0284C7")
+    }
+    private var nightIndigo: Color {
+        colorScheme == .dark ? Color(hex: "#818CF8") : Color(hex: "#6366F1")
+    }
+
+    private var chartHeight: CGFloat { compact ? 30 : 40 }
+
+    private var peakHour: (hour: Int, seconds: Double)? {
+        guard day.hasHourlyDistribution, day.hourlySeconds.count == 24 else { return nil }
+        var bestHour = 0
+        var bestSec = 0.0
+        for (idx, sec) in day.hourlySeconds.enumerated() where sec > bestSec {
+            bestSec = sec
+            bestHour = idx
+        }
+        return bestSec > 0 ? (bestHour, bestSec) : nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: compact ? 5 : 6) {
+            HStack(spacing: 6) {
+                Text(titlePrefix ?? "24h 昼夜脉搏")
+                    .font(.system(size: compact ? 10.5 : 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer(minLength: 4)
+
+                trailingCaption
+            }
+
+            if !day.hasHourlyDistribution && day.agentSeconds > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.badge.questionmark")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                    Text("该日无小时分布")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: chartHeight + 14)
+                .background(
+                    Color.primary.opacity(colorScheme == .dark ? 0.04 : 0.03),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), lineWidth: 0.5)
+                )
+                .accessibilityLabel("该日无小时分布")
+            } else {
+                barsSection
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var trailingCaption: some View {
+        if let hour = hoveredHour, day.hasHourlyDistribution, hour < day.hourlySeconds.count {
+            let sec = day.hourlySeconds[hour]
+            Text(String(format: "%02d:00–%02d:59 · %@", hour, hour, sec > 0 ? Formatters.shortDuration(sec) : "无活跃"))
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(sec > 0 ? accentPurple : .secondary)
+                .transition(.opacity)
+        } else if !day.hasHourlyDistribution && day.agentSeconds > 0 {
+            Text(day.shortDate)
+                .font(.system(size: 10, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+        } else if let peak = peakHour {
+            Text(String(format: "峰值 %02d时 · %@", peak.hour, Formatters.shortDuration(peak.seconds)))
+                .font(.system(size: 10, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        } else {
+            Text("00–23 时基线")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var barsSection: some View {
+        let buckets = day.hourlySeconds.count == 24 ? day.hourlySeconds : Array(repeating: 0.0, count: 24)
+        let maxSec = buckets.max() ?? 0.0
+
+        return VStack(spacing: 3) {
+            ZStack(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.10))
+                    .frame(height: 0.6)
+
+                HStack(alignment: .bottom, spacing: compact ? 2 : 3) {
+                    ForEach(0..<24, id: \.self) { hour in
+                        let sec = buckets[hour]
+                        let isHovered = hoveredHour == hour
+                        let isPeak = maxSec > 0 && sec >= maxSec * 0.99
+                        let ratio = maxSec > 0 ? min(1.0, sec / maxSec) : 0.0
+                        let barHeight: CGFloat = sec > 0
+                            ? max(4, CGFloat(pow(ratio, 0.78)) * chartHeight)
+                            : 2.0
+
+                        ZStack(alignment: .bottom) {
+                            Color.clear
+                                .frame(height: chartHeight)
+
+                            RoundedRectangle(cornerRadius: compact ? 1.8 : 2.2, style: .continuous)
+                                .fill(barStyle(hour: hour, sec: sec, isPeak: isPeak, isHovered: isHovered))
+                                .frame(height: barHeight)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: compact ? 1.8 : 2.2, style: .continuous)
+                                        .strokeBorder(
+                                            isHovered ? Color.primary.opacity(0.45) : Color.clear,
+                                            lineWidth: 0.7
+                                        )
+                                )
+                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                            if hovering {
+                                hoveredHour = hour
+                            } else if hoveredHour == hour {
+                                hoveredHour = nil
+                            }
+                        }
+                        .help(String(format: "%@ %02d:00–%02d:59 · %@", day.date, hour, hour, sec > 0 ? Formatters.humanDurationCN(sec) : "0 分钟"))
+                        .accessibilityLabel(String(format: "%02d点到%02d点59分，工时%@", hour, hour, sec > 0 ? Formatters.humanDurationCN(sec) : "0分钟"))
+                    }
+                }
+            }
+            .frame(height: chartHeight)
+
+            HStack {
+                Text("00")
+                Spacer()
+                Text("06")
+                Spacer()
+                Text("12")
+                Spacer()
+                Text("18")
+                Spacer()
+                Text("23")
+            }
+            .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+            .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func barStyle(hour: Int, sec: Double, isPeak: Bool, isHovered: Bool) -> AnyShapeStyle {
+        if sec <= 0 {
+            return AnyShapeStyle(Color.primary.opacity(isHovered ? 0.25 : (colorScheme == .dark ? 0.11 : 0.09)))
+        }
+        if isHovered {
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [peakCyan, accentPurple],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+        }
+        if isPeak {
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [peakCyan.opacity(0.95), accentPurple],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+        }
+        let isNight = hour < 6 || hour >= 22
+        if isNight {
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [nightIndigo.opacity(0.85), nightIndigo.opacity(0.42)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+        }
+        return AnyShapeStyle(
+            LinearGradient(
+                colors: [Color(hex: "#9B8CFC"), accentPurple.opacity(0.65)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+}
+
+// MARK: - Desktop Widget Root View
+
 struct WidgetRootView: View {
     @ObservedObject var store: ClockStore
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var hoveredDay: String?
+    @State private var hoveredSentinelId: String?
+    @State private var isSentinelExpanded: Bool = false
     @State private var pulseActive = false
+    @State private var errorDismissTask: Task<Void, Never>?
 
     private var cardWidth: CGFloat { store.isCompact ? 276 : 340 }
+    private var accentPurple: Color { Color(hex: "#7C6BF5") }
     private var liveEmerald: Color {
         colorScheme == .dark ? Color(hex: "#34D399") : Color(hex: "#15803D")
     }
     private var amberAccent: Color {
         colorScheme == .dark ? Color(hex: "#FBBF24") : Color(hex: "#B45309")
     }
+    private var finishedSlate: Color {
+        colorScheme == .dark ? Color(hex: "#94A3B8") : Color(hex: "#475569")
+    }
+    private var finishedMint: Color {
+        colorScheme == .dark ? Color(hex: "#5EEAD4") : Color(hex: "#0F766E")
+    }
+
+    private var sentinelDefaultLimit: Int { store.isCompact ? 1 : 2 }
 
     var body: some View {
+        let tasks = store.sentinelTasks
+
         ZStack {
             VisualEffectSurface(material: .hudWindow, blendingMode: .behindWindow)
                 .overlay(
@@ -48,14 +426,24 @@ struct WidgetRootView: View {
                     )
                 )
 
-            VStack(alignment: .leading, spacing: store.isCompact ? 11 : 14) {
-                headerRow
+            VStack(alignment: .leading, spacing: store.isCompact ? 10 : 12.5) {
+                headerRow(tasks: tasks)
 
                 if let day = store.displayedDay {
+                    if store.fastFreshness != .fresh {
+                        FreshnessBannerView(store: store, compact: true)
+                    }
+
                     heroSection(day: day)
 
-                    if store.isViewingToday, let agents = store.snapshot?.activeAgents, !agents.isEmpty {
-                        liveAgentsStrip(agents: agents)
+                    if !tasks.isEmpty {
+                        sentinelSection(tasks: tasks)
+                    }
+
+                    if let actionError = store.projectActionError {
+                        inlineNoticeBanner(message: actionError) {
+                            store.projectActionError = nil
+                        }
                     }
 
                     segmentedBar(tools: day.tools)
@@ -65,11 +453,18 @@ struct WidgetRootView: View {
                     } else {
                         toolsBreakdownList(tools: day.tools)
                         hairlineDivider
+                        HourlyPulseChartView(day: day, compact: true)
+                        hairlineDivider
                         sevenDayChart
                         if store.cardShowQuotaAlert,
-                           let hw = store.quotaSnapshot?.highestWindow,
+                           let hw = store.highestFreshQuotaWindow,
                            hw.usedPercent >= 70.0 {
                             quotaAlertStrip(window: hw)
+                        }
+                        if let repErr = store.reportError {
+                            inlineNoticeBanner(message: repErr) {
+                                store.reportError = nil
+                            }
                         }
                         hairlineDivider
                         footerRow
@@ -108,28 +503,79 @@ struct WidgetRootView: View {
                 )
         )
         .onAppear {
+            syncPulseAnimation()
+        }
+        .onChange(of: reduceMotion) { _ in
+            syncPulseAnimation()
+        }
+        .onChange(of: tasks.count) { count in
+            if count <= sentinelDefaultLimit && isSentinelExpanded {
+                isSentinelExpanded = false
+                notifyPanelLayoutChanged()
+            }
+        }
+        .onChange(of: store.isCompact) { _ in
+            isSentinelExpanded = false
+            notifyPanelLayoutChanged()
+        }
+        .onChange(of: store.projectActionError) { newVal in
+            notifyPanelLayoutChanged()
+            errorDismissTask?.cancel()
+            guard let expected = newVal else { return }
+            errorDismissTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if !Task.isCancelled && store.projectActionError == expected {
+                    store.projectActionError = nil
+                }
+            }
+        }
+        .onChange(of: store.reportError) { _ in
+            notifyPanelLayoutChanged()
+        }
+    }
+
+    private func syncPulseAnimation() {
+        if reduceMotion {
+            pulseActive = false
+        } else {
             withAnimation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
                 pulseActive = true
             }
         }
     }
 
+    private func notifyPanelLayoutChanged() {
+        DispatchQueue.main.async {
+            store.onLayoutChanged?()
+        }
+    }
+
     // MARK: - Header
 
-    private var headerRow: some View {
-        HStack(spacing: 8) {
-            let activeCount = store.snapshot?.activeAgents.count ?? 0
+    private func headerRow(tasks: [SentinelTask]) -> some View {
+        let freshness = store.fastFreshness
+        let waitingCount = tasks.filter { $0.state == .waitingHuman }.count
+        let runningCount = store.todayRunningCount
+        let isStaleOrOffline = freshness == .stale || freshness == .unavailable
+        let dotColor: Color = {
+            if isStaleOrOffline { return amberAccent.opacity(0.85) }
+            if waitingCount > 0 { return amberAccent }
+            if runningCount > 0 { return liveEmerald }
+            return Color.secondary.opacity(0.45)
+        }()
+        let shouldPulse = !reduceMotion && !isStaleOrOffline && runningCount > 0 && waitingCount == 0
 
+        return HStack(spacing: 8) {
             HStack(spacing: 6) {
                 HStack(spacing: 6) {
                     ZStack {
-                        if activeCount > 0 {
+                        if shouldPulse {
                             Circle()
-                                .fill(liveEmerald.opacity(pulseActive ? 0.16 : 0.38))
+                                .fill(liveEmerald.opacity(pulseActive ? 0.14 : 0.36))
                                 .frame(width: 14, height: 14)
                         }
                         Circle()
-                            .fill(activeCount > 0 ? liveEmerald : Color.secondary.opacity(0.45))
+                            .fill(dotColor)
                             .frame(width: 7, height: 7)
                     }
                     .frame(width: 14, height: 14)
@@ -153,16 +599,37 @@ struct WidgetRootView: View {
                                 .font(.system(size: 8.5, weight: .bold))
                         }
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(Color(hex: "#7C6BF5"))
+                        .foregroundStyle(accentPurple)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color(hex: "#7C6BF5").opacity(0.14), in: Capsule())
+                        .background(accentPurple.opacity(0.14), in: Capsule())
                     }
                     .buttonStyle(.plain)
+                    .pointingHandCursor()
                     .help("返回查看今日")
-                } else if activeCount > 0 {
-                    Text("\(activeCount) 在岗")
-                        .font(.system(size: 10.5, weight: .semibold))
+                } else if isStaleOrOffline {
+                    Text("离线")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(amberAccent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(amberAccent.opacity(0.14), in: Capsule())
+                } else if waitingCount > 0 {
+                    HStack(spacing: 3) {
+                        Image(systemName: "hand.raised.fill")
+                            .font(.system(size: 8.5, weight: .bold))
+                        Text(runningCount > 0 ? "\(waitingCount) 待拍板 · \(runningCount)" : "\(waitingCount) 待拍板")
+                            .font(.system(size: 10, weight: .semibold))
+                            .monospacedDigit()
+                    }
+                    .foregroundStyle(amberAccent)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(amberAccent.opacity(0.15), in: Capsule())
+                } else if runningCount > 0 {
+                    Text("\(runningCount) 运行中")
+                        .font(.system(size: 10, weight: .semibold))
+                        .monospacedDigit()
                         .foregroundStyle(liveEmerald)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -197,7 +664,7 @@ struct WidgetRootView: View {
                     symbol: "arrow.clockwise",
                     active: false,
                     tint: .primary,
-                    spinning: store.isRefreshing,
+                    spinning: store.isRefreshing && !reduceMotion,
                     tooltip: "立即刷新"
                 ) {
                     store.refresh()
@@ -227,7 +694,9 @@ struct WidgetRootView: View {
                 )
         }
         .buttonStyle(.plain)
+        .pointingHandCursor()
         .help(tooltip)
+        .accessibilityLabel(tooltip)
     }
 
     // MARK: - Hero Section
@@ -246,7 +715,7 @@ struct WidgetRootView: View {
                         .monospacedDigit()
                         .tracking(-1.0)
                         .foregroundStyle(.primary)
-                        .contentTransition(.numericText())
+                        .contentTransition(reduceMotion ? .identity : .numericText())
 
                     Text("h")
                         .font(.system(size: store.isCompact ? 15 : 17, weight: .semibold, design: .rounded))
@@ -289,53 +758,310 @@ struct WidgetRootView: View {
         }
     }
 
-    // MARK: - Live Running Agents Strip
+    // MARK: - 3-State Command Sentinel Section
 
-    private func liveAgentsStrip(agents: [ActiveAgent]) -> some View {
-        VStack(spacing: 5) {
-            ForEach(agents.prefix(store.isCompact ? 1 : 2)) { agent in
-                let liveElapsed = max(0, store.nowEpoch - agent.startedAt)
-                HStack(spacing: 7) {
+    private func sentinelSection(tasks: [SentinelTask]) -> some View {
+        let limit = sentinelDefaultLimit
+        let hasOverflow = tasks.count > limit
+        let visibleTasks = isSentinelExpanded ? tasks : Array(tasks.prefix(limit))
+        let hiddenCount = max(0, tasks.count - limit)
+        let needsScroll = isSentinelExpanded && visibleTasks.count > (store.isCompact ? 3 : 4)
+
+        return VStack(alignment: .leading, spacing: 5) {
+            if !store.isViewingToday {
+                HStack(spacing: 5) {
                     Circle()
-                        .fill(Color(hex: agent.color))
-                        .frame(width: 6, height: 6)
+                        .fill(liveEmerald)
+                        .frame(width: 5, height: 5)
+                    Text("当前任务")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Text("实时")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(liveEmerald)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(liveEmerald.opacity(0.12), in: Capsule())
+                    Spacer(minLength: 4)
+                    if hasOverflow {
+                        sentinelExpandButton(hiddenCount: hiddenCount, totalCount: tasks.count)
+                    }
+                }
+                .padding(.top, 1)
+            }
 
-                    Text(agent.shortName)
+            if needsScroll {
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(spacing: 5) {
+                        ForEach(visibleTasks) { task in
+                            sentinelTaskRow(task)
+                        }
+                    }
+                    .padding(.trailing, 2)
+                }
+                .frame(maxHeight: store.isCompact ? 156 : 196)
+            } else {
+                VStack(spacing: 5) {
+                    ForEach(visibleTasks) { task in
+                        sentinelTaskRow(task)
+                    }
+                }
+            }
+
+            if store.isViewingToday && hasOverflow {
+                HStack {
+                    Spacer()
+                    sentinelExpandButton(hiddenCount: hiddenCount, totalCount: tasks.count)
+                }
+            }
+        }
+    }
+
+    private func sentinelExpandButton(hiddenCount: Int, totalCount: Int) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
+                isSentinelExpanded.toggle()
+            }
+            notifyPanelLayoutChanged()
+        } label: {
+            HStack(spacing: 3.5) {
+                Text(isSentinelExpanded ? "收起任务" : "+\(hiddenCount) 展开全部 (\(totalCount))")
+                    .font(.system(size: 10, weight: .semibold))
+                    .monospacedDigit()
+                Image(systemName: isSentinelExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .background(Color.primary.opacity(0.06), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .help(isSentinelExpanded ? "收起哨兵任务列表" : "展开查看全部 \(totalCount) 个任务")
+        .accessibilityLabel(isSentinelExpanded ? "收起任务列表" : "展开其余 \(hiddenCount) 个任务")
+    }
+
+    private func sentinelTaskRow(_ task: SentinelTask) -> some View {
+        let style = sentinelVisualStyle(for: task.state)
+        let isHovered = hoveredSentinelId == task.id
+        let timerText = sentinelTimerText(for: task)
+        let waitSubtitle = waitKindHint(task.evidence?.waitKind)
+        let a11yLabel = "\(style.tag)，\(task.displayName)，\(task.label.isEmpty ? "进行中任务" : task.label)，耗时 \(timerText)"
+
+        return Button {
+            store.openSentinelTask(task)
+        } label: {
+            HStack(spacing: 6.5) {
+                // State Indicator: Color + Symbol (not color alone)
+                ZStack {
+                    if style.isPulsing && !reduceMotion && store.fastFreshness == .fresh {
+                        Circle()
+                            .fill(style.tint.opacity(pulseActive ? 0.12 : 0.34))
+                            .frame(width: 16, height: 16)
+                    }
+                    Image(systemName: style.symbol)
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(style.tint)
+                }
+                .frame(width: 16, height: 16)
+
+                // Short State Badge
+                Text(style.tag)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .foregroundStyle(style.tint)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(style.tint.opacity(colorScheme == .dark ? 0.18 : 0.14), in: Capsule())
+                    .fixedSize()
+
+                // Tool Dot + Name + Label
+                HStack(spacing: 4.5) {
+                    Circle()
+                        .fill(Color(hex: task.color))
+                        .frame(width: 5.5, height: 5.5)
+
+                    Text(task.shortName)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.primary)
+                        .fixedSize()
 
-                    if !agent.label.isEmpty {
-                        Text(agent.label)
-                            .font(.system(size: 11))
+                    if !task.label.isEmpty {
+                        Text(task.label)
+                            .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
-
-                    Spacer(minLength: 4)
-
-                    if store.isCompact && agents.count > 1 {
-                        Text("+\(agents.count - 1)")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(liveEmerald)
-                    }
-
-                    Text(Formatters.liveTimer(liveElapsed))
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(liveEmerald)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    liveEmerald.opacity(colorScheme == .dark ? 0.14 : 0.10),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(liveEmerald.opacity(0.26), lineWidth: 0.6)
-                )
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 3.5) {
+                    Text(timerText)
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(style.timerColor)
+
+                    if isHovered {
+                        Image(systemName: "arrow.up.forward")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .foregroundStyle(style.tint.opacity(0.85))
+                            .transition(.opacity)
+                    }
+                }
+                .fixedSize()
             }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(
+                style.backgroundColor.opacity(isHovered ? style.hoverBgAlpha : style.bgAlpha),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(style.tint.opacity(isHovered ? 0.55 : style.borderAlpha), lineWidth: isHovered ? 0.9 : 0.65)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .onHover { hovering in
+            hoveredSentinelId = hovering ? task.id : (hoveredSentinelId == task.id ? nil : hoveredSentinelId)
+        }
+        .help(sentinelTooltip(for: task, stateTag: style.tag, waitSubtitle: waitSubtitle))
+        .accessibilityLabel(a11yLabel)
+        .accessibilityHint("点击在访达中定位项目目录")
+    }
+
+    private struct SentinelVisualStyle {
+        let tint: Color
+        let timerColor: Color
+        let backgroundColor: Color
+        let bgAlpha: Double
+        let hoverBgAlpha: Double
+        let borderAlpha: Double
+        let symbol: String
+        let tag: String
+        let isPulsing: Bool
+    }
+
+    private func sentinelVisualStyle(for state: SentinelTaskState) -> SentinelVisualStyle {
+        switch state {
+        case .waitingHuman:
+            return SentinelVisualStyle(
+                tint: amberAccent,
+                timerColor: amberAccent,
+                backgroundColor: amberAccent,
+                bgAlpha: colorScheme == .dark ? 0.16 : 0.11,
+                hoverBgAlpha: colorScheme == .dark ? 0.24 : 0.17,
+                borderAlpha: 0.36,
+                symbol: "hand.raised.fill",
+                tag: "待拍板",
+                isPulsing: false
+            )
+        case .running:
+            return SentinelVisualStyle(
+                tint: liveEmerald,
+                timerColor: liveEmerald,
+                backgroundColor: liveEmerald,
+                bgAlpha: colorScheme == .dark ? 0.13 : 0.09,
+                hoverBgAlpha: colorScheme == .dark ? 0.21 : 0.15,
+                borderAlpha: 0.28,
+                symbol: "bolt.fill",
+                tag: "运行中",
+                isPulsing: true
+            )
+        case .justFinished:
+            return SentinelVisualStyle(
+                tint: finishedMint,
+                timerColor: finishedSlate,
+                backgroundColor: finishedSlate,
+                bgAlpha: colorScheme == .dark ? 0.14 : 0.08,
+                hoverBgAlpha: colorScheme == .dark ? 0.22 : 0.14,
+                borderAlpha: 0.24,
+                symbol: "checkmark.circle.fill",
+                tag: "刚收工",
+                isPulsing: false
+            )
+        case .unknown:
+            return SentinelVisualStyle(
+                tint: finishedSlate,
+                timerColor: finishedSlate,
+                backgroundColor: finishedSlate,
+                bgAlpha: 0.10,
+                hoverBgAlpha: 0.16,
+                borderAlpha: 0.20,
+                symbol: "circle.dotted",
+                tag: "状态未知",
+                isPulsing: false
+            )
+        }
+    }
+
+    private func sentinelTimerText(for task: SentinelTask) -> String {
+        switch task.state {
+        case .running:
+            if store.fastFreshness == .fresh, let snap = store.snapshot {
+                let delta = max(0, min(ClockStore.fastStaleThresholdSeconds, store.nowEpoch - snap.generatedTs))
+                return Formatters.liveTimer(task.elapsedSeconds + delta)
+            }
+            return Formatters.liveTimer(task.elapsedSeconds)
+        case .waitingHuman, .justFinished, .unknown:
+            // Frozen timer: never ticks for waiting_human or just_finished
+            return Formatters.liveTimer(task.elapsedSeconds)
+        }
+    }
+
+    private func waitKindHint(_ kind: SentinelWaitKind?) -> String? {
+        guard let kind else { return nil }
+        switch kind {
+        case .approval: return "等待审批"
+        case .userInput: return "等待输入"
+        case .secret: return "等待凭据"
+        case .other: return "等待确认"
+        case .unknown: return nil
+        }
+    }
+
+    private func sentinelTooltip(for task: SentinelTask, stateTag: String, waitSubtitle: String?) -> String {
+        var parts = ["[\(stateTag)] \(task.displayName)"]
+        if !task.label.isEmpty {
+            parts.append(task.label)
+        }
+        if let hint = waitSubtitle {
+            parts.append(hint)
+        }
+        if let dir = task.workspacePath ?? task.projectPath, !dir.isEmpty {
+            parts.append("点击在访达中定位：\(dir)")
+        } else {
+            parts.append("点击尝试定位项目目录")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func inlineNoticeBanner(message: String, onDismiss: @escaping () -> Void) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(amberAccent)
+            Text(message)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+            Spacer(minLength: 4)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8.5, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭提示")
+        }
+        .padding(.horizontal, 8.5)
+        .padding(.vertical, 5)
+        .background(amberAccent.opacity(colorScheme == .dark ? 0.14 : 0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(amberAccent.opacity(0.30), lineWidth: 0.6))
     }
 
     // MARK: - Segmented Bar
@@ -456,17 +1182,17 @@ struct WidgetRootView: View {
         let maxHrs = max(1.0, days.map(\.agentHours).max() ?? 1.0)
         let selectedKey = store.displayedDay?.date
 
-        return VStack(alignment: .leading, spacing: 8) {
+        return VStack(alignment: .leading, spacing: 7) {
             HStack {
                 Text("近 7 天工时")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
                 if let s = summary {
                     Text(String(format: "共 %.1fh · 日均 %.1fh", s.totalHours, s.avgDailyHours))
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(.system(size: 10, weight: .medium))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
@@ -477,10 +1203,10 @@ struct WidgetRootView: View {
                     let isSelected = d.date == selectedKey
                     let isHovered = d.date == hoveredDay
                     let ratio = min(1.0, max(0.06, d.agentHours / maxHrs))
-                    let barHeight = max(5, CGFloat(ratio) * 52)
+                    let barHeight = max(5, CGFloat(ratio) * 46)
 
                     Button {
-                        withAnimation(.easeOut(duration: 0.16)) {
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
                             store.selectDate(d.date)
                         }
                     } label: {
@@ -494,7 +1220,7 @@ struct WidgetRootView: View {
                             ZStack(alignment: .bottom) {
                                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                                     .fill(Color.primary.opacity(0.05))
-                                    .frame(height: 52)
+                                    .frame(height: 46)
 
                                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                                     .fill(barFill(isSelected: isSelected, isToday: d.isToday, isHovered: isHovered))
@@ -503,12 +1229,13 @@ struct WidgetRootView: View {
 
                             Text(Formatters.shortWeekday(d.weekday, isToday: d.isToday))
                                 .font(.system(size: 10, weight: isSelected || d.isToday ? .semibold : .regular))
-                                .foregroundStyle(isSelected ? Color(hex: "#7C6BF5") : .secondary)
+                                .foregroundStyle(isSelected ? accentPurple : .secondary)
                         }
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .pointingHandCursor()
                     .onHover { hovering in
                         hoveredDay = hovering ? d.date : (hoveredDay == d.date ? nil : hoveredDay)
                     }
@@ -529,18 +1256,20 @@ struct WidgetRootView: View {
             )
         }
         if isHovered {
-            return AnyShapeStyle(Color(hex: "#7C6BF5").opacity(0.55))
+            return AnyShapeStyle(accentPurple.opacity(0.55))
         }
         if isToday {
-            return AnyShapeStyle(Color(hex: "#7C6BF5").opacity(0.42))
+            return AnyShapeStyle(accentPurple.opacity(0.42))
         }
         return AnyShapeStyle(Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.18))
     }
 
-    // MARK: - Optional Quota Alert Strip (>= 70%)
+    // MARK: - Optional Fresh Quota Alert Strip (>= 70%)
 
     private func quotaAlertStrip(window: HighestQuotaWindow) -> some View {
         let tint = Formatters.quotaColor(for: window.usedPercent, defaultColor: amberAccent)
+        let resetStr = Formatters.relativeReset(window.resetsAt, now: store.nowEpoch)
+
         return Button {
             store.openPopover(tab: .quotas)
         } label: {
@@ -552,11 +1281,13 @@ struct WidgetRootView: View {
                     Text("\(window.providerName) \(window.label)")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
                     Spacer()
-                    Text("\(Int(round(window.usedPercent)))%")
-                        .font(.system(size: 10, weight: .bold))
+                    Text(resetStr.isEmpty ? "\(Int(round(window.usedPercent)))%" : "\(Int(round(window.usedPercent)))% · \(resetStr)")
+                        .font(.system(size: 9.5, weight: .bold))
                         .monospacedDigit()
                         .foregroundStyle(tint)
+                        .lineLimit(1)
                 }
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
@@ -574,67 +1305,78 @@ struct WidgetRootView: View {
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(tint.opacity(0.25), lineWidth: 0.6))
         }
         .buttonStyle(.plain)
-        .help("点击查看订阅额度详情")
+        .pointingHandCursor()
+        .help("点击查看订阅额度与配速详情")
     }
 
-    // MARK: - Footer
+    // MARK: - Footer (Unified 5-State Cost, No "自有" Badge)
 
     private var footerRow: some View {
         let dayTok = store.displayedDayTokens
         let dayCost = store.displayedDayCostUsd
-        let accentPurple = Color(hex: "#7C6BF5")
+        let dayUnpriced = store.displayedDayUnpricedTokens
+        let hasObs = store.displayedDayHasCostObservation
+        let costLabel = Formatters.estimatedUSD(dayCost, unpricedTokens: dayUnpriced, hasObservation: hasObs)
 
         return HStack(spacing: 8) {
-            if dayTok > 0 || dayCost > 0 {
-                Button {
-                    store.openPopover(tab: .overview)
-                } label: {
+            Button {
+                store.openPopover(tab: .overview)
+            } label: {
+                if hasObs {
                     HStack(spacing: 5) {
-                        Text("自有")
-                            .font(.system(size: 8.5, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 4.5)
-                            .padding(.vertical, 1)
-                            .background(accentPurple.opacity(0.75), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-
-                        Text("\(Formatters.compactTokens(dayTok)) tok · \(Formatters.usd(dayCost))")
+                        Text("\(Formatters.compactTokens(dayTok)) tok")
                             .font(.system(size: 10, weight: .semibold))
                             .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Text("·")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                        Text(costLabel)
+                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            .monospacedDigit()
                             .foregroundStyle(colorScheme == .dark ? Color(hex: "#E9D5FF") : accentPurple)
-                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.tertiary)
                     }
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(accentPurple.opacity(colorScheme == .dark ? 0.18 : 0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3.5)
+                    .background(accentPurple.opacity(colorScheme == .dark ? 0.16 : 0.09), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .strokeBorder(accentPurple.opacity(0.32), lineWidth: 0.6)
+                            .strokeBorder(accentPurple.opacity(0.26), lineWidth: 0.6)
                     )
+                } else {
+                    HStack(spacing: 4) {
+                        Text("查看详单")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text(costLabel)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3.5)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                 }
-                .buttonStyle(.plain)
-                .help("AgentPulse 自有增量引擎统计（点击打开菜单栏详单）")
-            } else {
-                Button {
-                    store.openPopover(tab: .overview)
-                } label: {
-                    Text("步间心跳 5m · 点击看详单")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-                .buttonStyle(.plain)
             }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("点击打开菜单栏用量与明细面板")
 
             Spacer(minLength: 4)
 
-            if store.copiedToast {
+            if store.copiedToast && store.reportError == nil {
                 HStack(spacing: 3) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 9.5, weight: .bold))
                     Text("已复制日报")
                         .font(.system(size: 10, weight: .semibold))
                 }
-                .foregroundStyle(Color(hex: "#22C55E"))
+                .foregroundStyle(liveEmerald)
                 .transition(.opacity)
             } else {
                 Text(store.lastUpdatedTimeString)
@@ -652,7 +1394,9 @@ struct WidgetRootView: View {
                         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .help("复制所选日期的融合 Markdown 日报（工时 + Token + 费用）")
+                .pointingHandCursor()
+                .help("复制所选日期的 Markdown 日报（工时 + Token + 费用）")
+                .accessibilityLabel("复制所选日期日报")
             }
         }
     }

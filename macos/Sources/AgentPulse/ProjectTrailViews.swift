@@ -7,59 +7,51 @@ struct ProjectTrailViews: View {
     @State private var expandedProjectId: String?
 
     private var accentPurple: Color { Color(hex: "#7C6BF5") }
+    private var liveEmerald: Color {
+        colorScheme == .dark ? Color(hex: "#34D399") : Color(hex: "#15803D")
+    }
     private var amberAccent: Color {
         colorScheme == .dark ? Color(hex: "#FBBF24") : Color(hex: "#B45309")
     }
     private var cardSurface: Color {
         colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.038)
     }
+    private var innerSurface: Color {
+        colorScheme == .dark ? Color.white.opacity(0.045) : Color.black.opacity(0.03)
+    }
     private var cardBorder: Color {
         colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.08)
     }
 
-    private enum ProjectGroup: String, CaseIterable {
-        case pinned, today, week, earlier, dormant
-
-        var title: String {
-            switch self {
-            case .pinned: return "置顶项目"
-            case .today: return "今日活跃"
-            case .week: return "近 7 天"
-            case .earlier: return "近 30 天"
-            case .dormant: return "更早"
+    private var filteredRows: [ProjectTrailRow] {
+        let all = store.projectTrailRows(for: store.selectedProjectPeriod)
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if q.isEmpty { return all }
+        return all.filter { row in
+            if row.name.lowercased().contains(q) || row.displayPath.lowercased().contains(q) {
+                return true
+            }
+            return row.stats.worktreeSources.contains { src in
+                src.path.lowercased().contains(q) || (src.branch?.lowercased().contains(q) ?? false)
             }
         }
     }
 
-    private var filteredProjects: [ProjectTrailItem] {
-        let all = store.snapshot?.usage?.projects ?? []
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if q.isEmpty { return all }
-        return all.filter {
-            $0.name.lowercased().contains(q) || $0.displayPath.lowercased().contains(q)
-        }
-    }
-
-    private func group(for item: ProjectTrailItem) -> ProjectGroup {
-        if store.pinnedProjectPaths.contains(item.path) { return .pinned }
-        switch item.group {
-        case "today": return .today
-        case "week": return .week
-        case "earlier": return .earlier
-        default: return .dormant
-        }
-    }
-
     var body: some View {
-        let items = filteredProjects
+        let rows = filteredRows
+        let pinnedRows = rows.filter(\.isPinned)
+        let regularRows = rows.filter { !$0.isPinned }
 
         VStack(alignment: .leading, spacing: 9) {
+            // Segmented Period Selector (今日 / 本周 / 本月 / 全部)
+            periodSegmentedBar(totalCount: rows.count)
+
             // Search Bar
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                TextField("按项目名或路径搜索…", text: $query)
+                TextField("按项目名、路径或分支搜索…", text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11.5))
                 if !query.isEmpty {
@@ -73,7 +65,7 @@ struct ProjectTrailViews: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("清除搜索")
                 }
-                Text("\(items.count) 个项目")
+                Text("\(rows.count) 个项目")
                     .font(.system(size: 10, weight: .medium))
                     .monospacedDigit()
                     .foregroundStyle(.tertiary)
@@ -84,20 +76,39 @@ struct ProjectTrailViews: View {
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
 
             if let error = store.projectActionError {
-                Label(error, systemImage: "exclamationmark.circle")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(amberAccent)
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(amberAccent)
+                    Text(error)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Button {
+                        store.projectActionError = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭错误提示")
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5.5)
+                .background(amberAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(amberAccent.opacity(0.28), lineWidth: 0.6))
             }
 
-            if items.isEmpty {
+            if rows.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "folder")
                         .font(.system(size: 18))
                         .foregroundStyle(.tertiary)
-                    Text(query.isEmpty ? "暂未采集到带目录信息的项目消耗" : "未找到匹配「\(query)」的项目")
+                    Text(query.isEmpty ? "「\(store.selectedProjectPeriod.title)」暂无活跃项目记录" : "未找到匹配「\(query)」的项目")
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text("Codex / T3 Code / Claude Code / WorkBuddy / Pi 会自动按 cwd 归集")
+                    Text(query.isEmpty ? "可切换「本周」「本月」或「全部」查看历史项目" : "试试项目目录名、路径或 worktree 分支名")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                 }
@@ -108,74 +119,146 @@ struct ProjectTrailViews: View {
             } else {
                 ScrollView(.vertical, showsIndicators: true) {
                     VStack(alignment: .leading, spacing: 10) {
-                        ForEach(ProjectGroup.allCases, id: \.rawValue) { grp in
-                            let grpItems = items.filter { group(for: $0) == grp }
-                            if !grpItems.isEmpty {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(grp.title)
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundStyle(grp == .pinned ? amberAccent : .secondary)
-                                        .padding(.horizontal, 2)
+                        if !pinnedRows.isEmpty {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("置顶项目")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(amberAccent)
+                                    .padding(.horizontal, 2)
+                                ForEach(pinnedRows) { row in
+                                    projectRow(row)
+                                }
+                            }
+                        }
 
-                                    ForEach(grpItems) { proj in
-                                        projectRow(proj)
-                                    }
+                        if !regularRows.isEmpty {
+                            VStack(alignment: .leading, spacing: 5) {
+                                if !pinnedRows.isEmpty {
+                                    Text("\(store.selectedProjectPeriod.title)活跃")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 2)
+                                }
+                                ForEach(regularRows) { row in
+                                    projectRow(row)
                                 }
                             }
                         }
                     }
                     .padding(.trailing, 2)
                 }
-                .frame(maxHeight: 410)
+                .frame(maxHeight: 390)
             }
         }
     }
 
-    private func projectRow(_ proj: ProjectTrailItem) -> some View {
-        let isPinned = store.pinnedProjectPaths.contains(proj.path)
-        let isExpanded = expandedProjectId == proj.id
-        let hitPct = Int(round(proj.cacheHitRate * 100))
+    private func periodSegmentedBar(totalCount: Int) -> some View {
+        HStack(spacing: 3) {
+            ForEach(ProjectPeriodKey.allCases) { period in
+                let isSel = store.selectedProjectPeriod == period
+                Button {
+                    withAnimation(.easeOut(duration: 0.14)) {
+                        store.selectedProjectPeriod = period
+                    }
+                } label: {
+                    Text(period.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(isSel ? (colorScheme == .dark ? .white : accentPurple) : .secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(
+                            isSel ? accentPurple.opacity(colorScheme == .dark ? 0.30 : 0.16) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                                .strokeBorder(isSel ? accentPurple.opacity(0.42) : Color.clear, lineWidth: 0.6)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+            }
+        }
+        .padding(3)
+        .background(cardSurface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
+    }
+
+    private func projectRow(_ row: ProjectTrailRow) -> some View {
+        let stats = row.stats
+        let isExpanded = expandedProjectId == row.id
+        let hasCostObs = stats.totalTokens > 0 || stats.costUsd > 0
+        let costText = Formatters.estimatedUSD(stats.costUsd, unpricedTokens: 0, hasObservation: hasCostObs)
+        let hitPct = Int(round(stats.cacheHitRate * 100))
+        let hasWorktreeMerge = stats.worktreeSources.count > 1
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 7) {
                 Button {
                     withAnimation(.easeOut(duration: 0.14)) {
-                        store.togglePinProject(proj.path)
+                        store.togglePinProject(row.path)
                     }
                 } label: {
-                    Image(systemName: isPinned ? "star.fill" : "star")
+                    Image(systemName: row.isPinned ? "star.fill" : "star")
                         .font(.system(size: 10.5))
-                        .foregroundStyle(isPinned ? amberAccent : Color.secondary.opacity(0.55))
+                        .foregroundStyle(row.isPinned ? amberAccent : Color.secondary.opacity(0.55))
                         .padding(.top, 2)
                 }
                 .buttonStyle(.plain)
-                .help(isPinned ? "取消置顶" : "置顶项目")
+                .pointingHandCursor()
+                .help(row.isPinned ? "取消置顶" : "置顶项目")
+                .accessibilityLabel(row.isPinned ? "取消置顶 \(row.name)" : "置顶 \(row.name)")
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) {
-                        expandedProjectId = isExpanded ? nil : proj.id
+                        expandedProjectId = isExpanded ? nil : row.id
                     }
                 } label: {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(proj.name)
+                    VStack(alignment: .leading, spacing: 4) {
+                        // Line 1: Project Name + Worktree Merge Count + AI Work Duration
+                        HStack(spacing: 5) {
+                            Text(row.name)
                                 .font(.system(size: 12, weight: .bold))
                                 .foregroundStyle(.primary)
                                 .lineLimit(1)
+
+                            if hasWorktreeMerge {
+                                HStack(spacing: 2.5) {
+                                    Image(systemName: "arrow.triangle.branch")
+                                        .font(.system(size: 8, weight: .semibold))
+                                    Text("\(stats.worktreeSources.count)")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .monospacedDigit()
+                                }
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4.5)
+                                .padding(.vertical, 1.5)
+                                .background(Color.primary.opacity(0.06), in: Capsule())
+                                .help("已归并 \(stats.worktreeSources.count) 个 Git worktree 目录")
+                            }
+
                             Spacer(minLength: 4)
-                            Text(Formatters.usd(proj.costUsd))
-                                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                .foregroundStyle(accentPurple)
+
+                            workDurationBadge(seconds: stats.agentSeconds)
                         }
 
-                        Text(proj.displayPath)
-                            .font(.system(size: 9.5, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        // Line 2: Display Path + Estimated Cost
+                        HStack(spacing: 6) {
+                            Text(row.displayPath)
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 4)
+                            Text(costText)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundStyle(hasCostObs ? accentPurple : Color.secondary.opacity(0.6))
+                        }
 
+                        // Line 3: Tool Badges + Token / Cache / Sessions
                         HStack(spacing: 5) {
-                            ForEach(proj.tools.prefix(3)) { badge in
+                            ForEach(stats.tools.prefix(3)) { badge in
                                 HStack(spacing: 3) {
                                     Circle()
                                         .fill(Color(hex: badge.color))
@@ -188,61 +271,129 @@ struct ProjectTrailViews: View {
                                 .padding(.vertical, 1.5)
                                 .background(Color.primary.opacity(0.06), in: Capsule())
                             }
+                            if stats.tools.count > 3 {
+                                Text("+\(stats.tools.count - 3)")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundStyle(.tertiary)
+                            }
                             Spacer(minLength: 4)
-                            Text("\(Formatters.compactTokens(proj.totalTokens)) · \(hitPct)% · \(proj.sessions)会话")
-                                .font(.system(size: 9.5, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                            if stats.totalTokens > 0 {
+                                Text("\(Formatters.compactTokens(stats.totalTokens)) · \(hitPct)% · \(stats.sessions)会话")
+                                    .font(.system(size: 9.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            } else {
+                                Text(stats.sessions > 0 ? "\(stats.sessions) 会话 · 仅工时" : "仅工时归集")
+                                    .font(.system(size: 9.5))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .pointingHandCursor()
             }
 
             if isExpanded {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 7) {
                     LazyVGrid(
                         columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
                         alignment: .leading,
                         spacing: 4
                     ) {
-                        kv("输入", Formatters.compactTokens(proj.inputTokens))
-                        kv("输出", Formatters.compactTokens(proj.outputTokens))
-                        kv("缓存读", Formatters.compactTokens(proj.cacheReadTokens))
-                        if proj.cacheWriteTokens > 0 {
-                            kv("缓存写", Formatters.compactTokens(proj.cacheWriteTokens))
+                        kv("AI 工时", workDurationPlainText(stats.agentSeconds))
+                        kv("估算费用", costText)
+                        if stats.totalTokens > 0 {
+                            kv("输入", Formatters.compactTokens(stats.inputTokens))
+                            kv("输出", Formatters.compactTokens(stats.outputTokens))
+                            kv("缓存读", Formatters.compactTokens(stats.cacheReadTokens))
+                            if stats.cacheWriteTokens > 0 {
+                                kv("缓存写", Formatters.compactTokens(stats.cacheWriteTokens))
+                            }
+                            if stats.reasoningTokens > 0 {
+                                kv("推理", Formatters.compactTokens(stats.reasoningTokens))
+                            }
                         }
-                        if proj.reasoningTokens > 0 {
-                            kv("推理", Formatters.compactTokens(proj.reasoningTokens))
+                        kv("最近活跃", stats.lastActiveDate)
+                    }
+                    .padding(8)
+                    .background(innerSurface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                    // Worktree Sources Disclosure (when merged or branch info available)
+                    if !stats.worktreeSources.isEmpty && (stats.worktreeSources.count > 1 || stats.worktreeSources.contains { $0.branch != nil }) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.system(size: 8.5, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(stats.worktreeSources.count > 1 ? "已归并工作目录 (\(stats.worktreeSources.count))" : "工作目录与分支")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            ForEach(stats.worktreeSources) { src in
+                                Button {
+                                    store.openProjectInFinder(src.path)
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        if let branch = src.branch, !branch.isEmpty {
+                                            Text(branch)
+                                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                                .foregroundStyle(accentPurple)
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(accentPurple.opacity(0.12), in: Capsule())
+                                                .lineLimit(1)
+                                        }
+                                        Text(abbreviateHome(src.path))
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer(minLength: 2)
+                                        Image(systemName: "arrow.up.forward")
+                                            .font(.system(size: 8))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .pointingHandCursor()
+                                .help("在访达中显示：\(src.path)")
+                            }
                         }
-                        kv("最近活跃", proj.lastActiveDate)
+                        .padding(8)
+                        .background(innerSurface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
 
                     HStack(spacing: 6) {
                         Button {
-                            store.openProjectInFinder(proj.path)
+                            store.openProjectInFinder(row.path)
                         } label: {
                             Label("在访达中显示", systemImage: "folder")
                                 .font(.system(size: 9.5, weight: .semibold))
                                 .foregroundStyle(.primary)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3.5)
-                                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                         }
                         .buttonStyle(.plain)
+                        .pointingHandCursor()
 
                         Button {
-                            store.openProjectInTerminal(proj.path)
+                            store.openProjectInTerminal(row.path)
                         } label: {
                             Label("终端打开", systemImage: "terminal")
                                 .font(.system(size: 9.5, weight: .semibold))
                                 .foregroundStyle(.primary)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3.5)
-                                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                         }
                         .buttonStyle(.plain)
+                        .pointingHandCursor()
                         Spacer()
                     }
                 }
@@ -253,6 +404,49 @@ struct ProjectTrailViews: View {
         .padding(10)
         .background(cardSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
+    }
+
+    @ViewBuilder
+    private func workDurationBadge(seconds: Double?) -> some View {
+        if let sec = seconds, sec > 0 {
+            HStack(spacing: 3) {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 8))
+                Text(Formatters.shortDuration(sec))
+                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                    .monospacedDigit()
+            }
+            .foregroundStyle(liveEmerald)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(liveEmerald.opacity(0.13), in: Capsule())
+        } else if seconds == nil {
+            Text("未归集")
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 1.5)
+                .background(Color.primary.opacity(0.05), in: Capsule())
+                .help("该周期暂无可归集到此项目目录的 AI 工时记录")
+        } else {
+            Text("—")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func workDurationPlainText(_ seconds: Double?) -> String {
+        guard let sec = seconds else { return "未归集" }
+        return sec > 0 ? Formatters.shortDuration(sec) : "—"
+    }
+
+    private func abbreviateHome(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
     }
 
     private func kv(_ k: String, _ v: String) -> some View {

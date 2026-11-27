@@ -109,7 +109,9 @@ final class DesktopPanelController: NSObject, NSWindowDelegate {
         hostingView.layoutSubtreeIfNeeded()
         let targetWidth: CGFloat = store.isCompact ? 276 : 340
         let fit = hostingView.fittingSize
-        let targetSize = NSSize(width: targetWidth, height: max(120, ceil(fit.height)))
+        let maxHeight = maxAllowedPanelHeight(for: panel.frame)
+        let targetHeight = min(maxHeight, max(120, ceil(fit.height)))
+        let targetSize = NSSize(width: targetWidth, height: targetHeight)
         var frame = panel.frame
 
         if anchorTopRight && frame.width > 0 && frame.height > 0 {
@@ -141,6 +143,13 @@ final class DesktopPanelController: NSObject, NSWindowDelegate {
 
     func windowDidMove(_ notification: Notification) {
         saveOrigin()
+    }
+
+    private func maxAllowedPanelHeight(for frame: NSRect) -> CGFloat {
+        let screens = NSScreen.screens
+        let matching = screens.first { $0.frame.intersects(frame) } ?? NSScreen.main ?? screens.first
+        guard let vis = matching?.visibleFrame else { return 760 }
+        return max(260, vis.height - 24)
     }
 
     private func restoreOrPlaceDefaultPosition() {

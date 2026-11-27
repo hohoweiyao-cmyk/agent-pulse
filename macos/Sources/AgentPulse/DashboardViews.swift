@@ -9,6 +9,9 @@ struct DashboardViews: View {
     private var liveEmerald: Color {
         colorScheme == .dark ? Color(hex: "#34D399") : Color(hex: "#15803D")
     }
+    private var amberAccent: Color {
+        colorScheme == .dark ? Color(hex: "#FBBF24") : Color(hex: "#B45309")
+    }
     private var cardSurface: Color {
         colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.038)
     }
@@ -19,6 +22,7 @@ struct DashboardViews: View {
     var body: some View {
         let periodStats = store.snapshot?.usage?.periods.stats(for: store.selectedPeriod)
         let heatmap = store.snapshot?.usage?.heatmap
+        let isCopied = store.copiedToast && store.reportError == nil
 
         ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 10) {
@@ -43,6 +47,7 @@ struct DashboardViews: View {
                                     )
                             }
                             .buttonStyle(.plain)
+                            .pointingHandCursor()
                         }
                     }
 
@@ -77,6 +82,32 @@ struct DashboardViews: View {
                     modelLeaderboardCard(topModels)
                 }
 
+                if let repErr = store.reportError {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(amberAccent)
+                        Text(repErr)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        Spacer(minLength: 4)
+                        Button {
+                            store.reportError = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8.5, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("关闭错误提示")
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5.5)
+                    .background(amberAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(amberAccent.opacity(0.28), lineWidth: 0.6))
+                }
+
                 // Bottom Ledger Utilities
                 HStack {
                     Button {
@@ -91,6 +122,7 @@ struct DashboardViews: View {
                             .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
                     }
                     .buttonStyle(.plain)
+                    .pointingHandCursor()
 
                     if let start = store.snapshot?.usage?.ledgerMeta.workHistoryFrom {
                         Text("工时回溯始于 \(start)")
@@ -101,16 +133,21 @@ struct DashboardViews: View {
                     Spacer()
 
                     Button {
-                        store.copyMarkdownReport()
+                        store.copyMarkdownReport(period: store.selectedPeriod)
                     } label: {
-                        Text(store.copiedToast ? "已复制日报" : "复制今日融合日报")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(colorScheme == .dark ? Color(hex: "#EDE9FE") : accentPurple)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(accentPurple.opacity(0.20), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        HStack(spacing: 4) {
+                            Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(isCopied ? store.selectedPeriod.copiedReportToastTitle : store.selectedPeriod.copyReportButtonTitle)
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
+                        .foregroundStyle(isCopied ? liveEmerald : (colorScheme == .dark ? Color(hex: "#EDE9FE") : accentPurple))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background((isCopied ? liveEmerald : accentPurple).opacity(0.20), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
                     .buttonStyle(.plain)
+                    .pointingHandCursor()
                 }
             }
             .padding(.trailing, 2)
@@ -125,15 +162,19 @@ struct DashboardViews: View {
         let tok = periodStats?.totalTokens ?? 0
         let cost = periodStats?.costUsd ?? 0.0
         let unpriced = periodStats?.unpricedTokens ?? 0
+        let hasCostObs = tok > 0 || cost > 0 || unpriced > 0
         let hitPct = Int(round((periodStats?.cacheHitRate ?? 0.0) * 100))
         let activeDays = periodStats?.activeDays ?? 0
 
         return HStack(spacing: 8) {
             kpiBox(title: "AI 有效工时", value: String(format: "%.2fh", hrs), sub: String(format: "%.2f 员工日", hrs / 8.0), tint: liveEmerald)
             kpiBox(title: "总 Token", value: Formatters.compactTokens(tok), sub: "Cache Hit \(hitPct)%", tint: Color(hex: "#38BDF8"))
-            kpiBox(title: "估算 API 成本", value: Formatters.estimatedUSD(cost, unpricedTokens: unpriced),
-                   sub: unpriced > 0 ? "\(Formatters.compactTokens(unpriced)) Token 未计价" : "\(periodStats?.tools.count ?? 0) 个工具",
-                   tint: accentPurple)
+            kpiBox(
+                title: "估算 API 成本",
+                value: Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs),
+                sub: unpriced > 0 ? "\(Formatters.compactTokens(unpriced)) Token 未计价" : "\(periodStats?.tools.count ?? 0) 个工具",
+                tint: accentPurple
+            )
             kpiBox(title: "活跃天数", value: "\(activeDays) 天", sub: "累计 \(heatmap?.totalActiveDays ?? activeDays) 天", tint: Color(hex: "#FB923C"))
         }
     }
@@ -175,7 +216,6 @@ struct DashboardViews: View {
             return days.last
         }()
 
-        // Arrange 182 days into 26 columns x 7 rows (column-major)
         let weeksCount = max(1, (days.count + 6) / 7)
 
         return VStack(alignment: .leading, spacing: 8) {
@@ -201,6 +241,7 @@ struct DashboardViews: View {
                                 )
                         }
                         .buttonStyle(.plain)
+                        .pointingHandCursor()
                     }
                 }
             }
@@ -214,6 +255,8 @@ struct DashboardViews: View {
                                 let d = days[idx]
                                 let val = values[idx]
                                 let isSel = selectedDay?.date == d.date
+                                let hasDayObs = d.totalTokens > 0 || d.costUsd > 0
+                                let dayCostText = Formatters.estimatedUSD(d.costUsd, unpricedTokens: 0, hasObservation: hasDayObs)
                                 Button {
                                     selectedHeatmapDate = d.date
                                 } label: {
@@ -226,7 +269,7 @@ struct DashboardViews: View {
                                         )
                                 }
                                 .buttonStyle(.plain)
-                                .help("\(d.date) (\(d.weekday)) · \(Formatters.usd(d.costUsd)) · \(Formatters.compactTokens(d.totalTokens)) tok · \(String(format: "%.2fh", d.agentHours))")
+                                .help("\(d.date) (\(d.weekday)) · \(dayCostText) · \(Formatters.compactTokens(d.totalTokens)) tok · \(String(format: "%.2fh", d.agentHours))")
                             } else {
                                 Color.clear.frame(height: 14)
                             }
@@ -238,6 +281,9 @@ struct DashboardViews: View {
 
             // Selected Day Detail Card
             if let d = selectedDay {
+                let hasDayObs = d.totalTokens > 0 || d.costUsd > 0
+                let dayCostText = Formatters.estimatedUSD(d.costUsd, unpricedTokens: 0, hasObservation: hasDayObs)
+
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         Text("\(d.date) \(d.weekday)")
@@ -254,9 +300,9 @@ struct DashboardViews: View {
                             .foregroundStyle(.primary)
                         Text("·")
                             .foregroundStyle(.tertiary)
-                        Text(Formatters.usd(d.costUsd))
+                        Text(dayCostText)
                             .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                            .foregroundStyle(accentPurple)
+                            .foregroundStyle(hasDayObs ? accentPurple : Color.secondary.opacity(0.6))
                     }
 
                     if !d.tools.isEmpty {
@@ -266,6 +312,8 @@ struct DashboardViews: View {
                             spacing: 4
                         ) {
                             ForEach(d.tools) { dt in
+                                let dtHasObs = dt.totalTokens > 0 || dt.costUsd > 0
+                                let dtCost = Formatters.estimatedUSD(dt.costUsd, unpricedTokens: 0, hasObservation: dtHasObs)
                                 HStack(spacing: 5) {
                                     Circle()
                                         .fill(Color(hex: dt.color))
@@ -274,7 +322,7 @@ struct DashboardViews: View {
                                         .font(.system(size: 10, weight: .medium))
                                         .lineLimit(1)
                                     Spacer()
-                                    Text(dt.totalTokens > 0 ? "\(Formatters.compactTokens(dt.totalTokens)) · \(Formatters.usd(dt.costUsd))" : String(format: "%.2fh", dt.agentHours))
+                                    Text(dt.totalTokens > 0 ? "\(Formatters.compactTokens(dt.totalTokens)) · \(dtCost)" : String(format: "%.2fh", dt.agentHours))
                                         .font(.system(size: 9.5, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                 }
@@ -342,6 +390,7 @@ struct DashboardViews: View {
                         : min(1.0, max(0.05, Double(m.totalTokens) / Double(maxTok)))
                     let tint = Color(hex: m.color)
                     let hitPct = Int(round(m.cacheHitRate * 100))
+                    let hasObs = m.totalTokens > 0 || m.costUsd > 0
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
@@ -368,7 +417,7 @@ struct DashboardViews: View {
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundStyle(.tertiary)
                             }
-                            Text(Formatters.usd(m.costUsd))
+                            Text(Formatters.estimatedUSD(m.costUsd, unpricedTokens: 0, hasObservation: hasObs))
                                 .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                                 .foregroundStyle(.primary)
                                 .frame(minWidth: 44, alignment: .trailing)

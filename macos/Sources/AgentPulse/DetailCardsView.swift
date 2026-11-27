@@ -1,6 +1,32 @@
 import AppKit
 import SwiftUI
 
+extension UsagePeriodKey {
+    var copyReportButtonTitle: String {
+        switch self {
+        case .today: return "复制今日日报"
+        case .yesterday: return "复制昨日日报"
+        case .week: return "复制本周战报"
+        case .lastWeek: return "复制上周战报"
+        case .month: return "复制本月战报"
+        case .year: return "复制全年战报"
+        case .all: return "复制全部战报"
+        }
+    }
+
+    var copiedReportToastTitle: String {
+        switch self {
+        case .today: return "已复制今日日报"
+        case .yesterday: return "已复制昨日日报"
+        case .week: return "已复制本周战报"
+        case .lastWeek: return "已复制上周战报"
+        case .month: return "已复制本月战报"
+        case .year: return "已复制全年战报"
+        case .all: return "已复制全部战报"
+        }
+    }
+}
+
 struct DetailCardsView: View {
     @ObservedObject var store: ClockStore
     @Environment(\.colorScheme) private var colorScheme
@@ -24,14 +50,44 @@ struct DetailCardsView: View {
         colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.08)
     }
 
+    private func hourlyDayForCurrentPeriod(periodStats: PeriodStats?) -> DayStats? {
+        guard let snap = store.snapshot else { return nil }
+        switch store.selectedPeriod {
+        case .today:
+            return snap.today
+        case .yesterday:
+            if let targetDate = periodStats?.endDate,
+               let matched = snap.days.first(where: { $0.date == targetDate }) {
+                return matched
+            }
+            return snap.days.dropLast().last
+        default:
+            return nil
+        }
+    }
+
     var body: some View {
         let periodStats = store.snapshot?.usage?.periods.stats(for: store.selectedPeriod)
         let tools = periodStats?.tools ?? []
         let useTwoColumns = tools.count >= 2
+        let hourlyDay = hourlyDayForCurrentPeriod(periodStats: periodStats)
 
         VStack(alignment: .leading, spacing: 10) {
             periodHeaderRow(periodStats: periodStats)
             compactSummaryStrip(periodStats: periodStats)
+
+            if let day = hourlyDay {
+                HourlyPulseChartView(
+                    day: day,
+                    compact: false,
+                    titlePrefix: store.selectedPeriod == .today ? "今日 24h 昼夜脉搏" : "昨日 24h 昼夜脉搏"
+                )
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(cardSurface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
+            }
+
             if let count = periodStats?.unpricedTokens, count > 0 {
                 Text("\(Formatters.compactTokens(count)) Token 未计入费用。")
                     .font(.system(size: 10))
@@ -56,7 +112,7 @@ struct DetailCardsView: View {
                         .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 32)
+                .padding(.vertical, 30)
                 .background(cardSurface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
             } else {
@@ -83,7 +139,11 @@ struct DetailCardsView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 430)
+                .frame(maxHeight: hourlyDay != nil ? 355 : 430)
+            }
+
+            if let repErr = store.reportError {
+                reportErrorBanner(repErr)
             }
 
             bottomActionRow
@@ -117,6 +177,7 @@ struct DetailCardsView: View {
                             )
                     }
                     .buttonStyle(.plain)
+                    .pointingHandCursor()
                 }
             }
 
@@ -159,6 +220,8 @@ struct DetailCardsView: View {
             : (periodStats?.leverage ?? 1.0)
         let tok = periodStats?.totalTokens ?? 0
         let cost = periodStats?.costUsd ?? 0.0
+        let unpriced = periodStats?.unpricedTokens ?? 0
+        let hasCostObs = tok > 0 || cost > 0 || unpriced > 0
         let hitPct = Int(round((periodStats?.cacheHitRate ?? 0.0) * 100))
 
         return HStack(spacing: 8) {
@@ -194,9 +257,9 @@ struct DetailCardsView: View {
                         Text(Formatters.compactTokens(tok))
                             .font(.system(size: 17, weight: .bold, design: .rounded))
                             .monospacedDigit()
-                        Text(Formatters.estimatedUSD(cost, unpricedTokens: periodStats?.unpricedTokens ?? 0))
+                        Text(Formatters.estimatedUSD(cost, unpricedTokens: unpriced, hasObservation: hasCostObs))
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundStyle(accentPurple)
+                            .foregroundStyle(hasCostObs ? accentPurple : Color.secondary.opacity(0.6))
                         if hitPct > 0 {
                             Text("缓存 \(hitPct)%")
                                 .font(.system(size: 9.5, weight: .medium))
@@ -220,7 +283,8 @@ struct DetailCardsView: View {
         let tint = Color(hex: tool.color)
         let isModelsOpen = openModelTools.contains(tool.id)
         let hitPct = tool.effectiveCacheHitRate * 100.0
-        let inlineQuota = matchingQuotaProvider(for: tool.tool)
+        let hasCostObs = tool.totalTokens > 0 || tool.costUsd > 0 || (tool.unpricedTokens ?? 0) > 0
+        let freshQuota = freshInlineQuota(for: tool.tool)
 
         return VStack(alignment: .leading, spacing: 9) {
             // Card Header
@@ -265,10 +329,11 @@ struct DetailCardsView: View {
                         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                 }
                 .buttonStyle(.plain)
+                .pointingHandCursor()
                 .help("复制该工具明细")
             }
 
-            // Hero Headline (Total Tokens + Estimated API Cost)
+            // Hero Headline (Total Tokens + Unified Estimated API Cost)
             HStack(alignment: .lastTextBaseline, spacing: 6) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(tool.totalTokens > 0 ? Formatters.compactTokens(tool.totalTokens) : Formatters.shortDuration(tool.agentSeconds))
@@ -283,12 +348,11 @@ struct DetailCardsView: View {
                 Spacer(minLength: 4)
 
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text(tool.totalTokens == 0 ? "无用量记录" :
-                            Formatters.estimatedUSD(tool.costUsd, unpricedTokens: tool.unpricedTokens ?? 0))
+                    Text(Formatters.estimatedUSD(tool.costUsd, unpricedTokens: tool.unpricedTokens ?? 0, hasObservation: hasCostObs))
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
                         .monospacedDigit()
-                        .foregroundStyle(.primary)
-                    Text(tool.totalTokens > 0 ? "≈ API 成本" : "无 Token 日志")
+                        .foregroundStyle(hasCostObs ? Color.primary : Color.secondary.opacity(0.6))
+                    Text(hasCostObs ? "≈ API 成本" : "无用量记录")
                         .font(.system(size: 9.5))
                         .foregroundStyle(.tertiary)
                 }
@@ -299,9 +363,9 @@ struct DetailCardsView: View {
                 tokenMetricGrid(tool: tool, hitPct: hitPct, tint: tint)
             }
 
-            // Inline Subscription Quota Bars (for Codex / Claude cards)
-            if let qProvider = inlineQuota, !qProvider.windows.isEmpty {
-                inlineQuotaSection(provider: qProvider)
+            // Inline Fresh Subscription Quota Bars (only fresh windows)
+            if let (qProvider, freshWindows) = freshQuota {
+                inlineQuotaSection(provider: qProvider, windows: freshWindows)
             }
 
             // 2-Level Model Disclosure
@@ -331,6 +395,7 @@ struct DetailCardsView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .pointingHandCursor()
 
                     if isModelsOpen {
                         VStack(alignment: .leading, spacing: 5) {
@@ -364,7 +429,6 @@ struct DetailCardsView: View {
             alignment: .leading,
             spacing: 6
         ) {
-            // Cell 1: Cache Hit Ring
             HStack(spacing: 5) {
                 Text("Cache Hit")
                     .font(.system(size: 10))
@@ -384,7 +448,6 @@ struct DetailCardsView: View {
                     .foregroundStyle(tint)
             }
 
-            // Cell 2: Effective Work Hours or Active Days
             metricCell(
                 icon: tool.agentSeconds > 0 ? "bolt.fill" : "calendar",
                 label: tool.agentSeconds > 0 ? "有效工时" : "活跃天数",
@@ -392,14 +455,10 @@ struct DetailCardsView: View {
                 tint: tool.agentSeconds > 0 ? liveEmerald : .secondary
             )
 
-            // Cell 3: Input
             metricCell(icon: "arrow.down", label: "输入", value: Formatters.compactTokens(tool.inputTokens), tint: tint)
-            // Cell 4: Output
             metricCell(icon: "arrow.up", label: "输出", value: Formatters.compactTokens(tool.outputTokens), tint: tint)
-            // Cell 5: Cache Read
             metricCell(icon: "bolt.circle", label: "缓存读", value: Formatters.compactTokens(tool.cacheReadTokens), tint: tint)
 
-            // Cell 6+: Cache Write and/or Reasoning
             if hasCW {
                 metricCell(icon: "square.stack.3d.up", label: "缓存写", value: Formatters.compactTokens(tool.cacheWriteTokens), tint: tint)
             }
@@ -434,25 +493,30 @@ struct DetailCardsView: View {
         }
     }
 
-    private func matchingQuotaProvider(for toolKey: String) -> QuotaProvider? {
+    private func freshInlineQuota(for toolKey: String) -> (QuotaProvider, [QuotaWindow])? {
         guard let providers = store.quotaSnapshot?.providers else { return nil }
+        let matched: QuotaProvider?
         if toolKey == "codex" || toolKey == "t3_codex" {
-            return providers.first { $0.id == "codex" && $0.status != "unavailable" }
+            matched = providers.first { $0.id == "codex" }
+        } else if toolKey == "claude_code" || toolKey == "t3_claude" {
+            matched = providers.first { $0.id == "claude" }
+        } else {
+            matched = nil
         }
-        if toolKey == "claude_code" || toolKey == "t3_claude" {
-            return providers.first { $0.id == "claude" && $0.status != "unavailable" }
-        }
-        return nil
+        guard let provider = matched else { return nil }
+        let freshWindows = provider.windows.filter { store.quotaWindowIsFresh(provider: provider, window: $0) }
+        guard !freshWindows.isEmpty else { return nil }
+        return (provider, freshWindows)
     }
 
-    private func inlineQuotaSection(provider: QuotaProvider) -> some View {
+    private func inlineQuotaSection(provider: QuotaProvider, windows: [QuotaWindow]) -> some View {
         Button {
             withAnimation(.easeOut(duration: 0.14)) {
                 store.selectedPopoverTab = .quotas
             }
         } label: {
             VStack(alignment: .leading, spacing: 5) {
-                ForEach(provider.windows.prefix(2)) { w in
+                ForEach(windows.prefix(2)) { w in
                     let barColor = Formatters.quotaColor(for: w.usedPercent, defaultColor: Color(hex: provider.color))
                     let resetStr = Formatters.relativeReset(w.resetsAt, now: store.nowEpoch)
                     VStack(alignment: .leading, spacing: 2.5) {
@@ -480,13 +544,15 @@ struct DetailCardsView: View {
             .padding(.top, 2)
         }
         .buttonStyle(.plain)
-        .help("点击查看全部订阅额度")
+        .pointingHandCursor()
+        .help("点击查看全部订阅额度与燃尽配速")
     }
 
     private func modelExpandableRow(toolId: String, model: ModelUsageStats, tint: Color) -> some View {
         let key = "\(toolId)::\(model.id)"
         let isExpanded = expandedModels.contains(key)
         let hitPct = Int(round(model.effectiveCacheHitRate * 100))
+        let hasObs = model.totalTokens > 0 || model.costUsd > 0 || (model.unpricedTokens ?? 0) > 0
 
         return VStack(alignment: .leading, spacing: 4) {
             Button {
@@ -523,7 +589,7 @@ struct DetailCardsView: View {
                             .padding(.vertical, 1)
                             .background(Color.primary.opacity(0.07), in: Capsule())
                     }
-                    Text(Formatters.estimatedUSD(model.costUsd, unpricedTokens: model.unpricedTokens ?? 0))
+                    Text(Formatters.estimatedUSD(model.costUsd, unpricedTokens: model.unpricedTokens ?? 0, hasObservation: hasObs))
                         .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(.primary)
                         .frame(minWidth: 38, alignment: .trailing)
@@ -531,6 +597,7 @@ struct DetailCardsView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .pointingHandCursor()
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 4) {
@@ -594,28 +661,57 @@ struct DetailCardsView: View {
         }
     }
 
+    private func reportErrorBanner(_ message: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(amberAccent)
+            Text(message)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+            Spacer(minLength: 4)
+            Button {
+                store.reportError = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8.5, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭错误提示")
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5.5)
+        .background(amberAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(amberAccent.opacity(0.28), lineWidth: 0.6))
+    }
+
     // MARK: - Bottom Action Bar
 
     private var bottomActionRow: some View {
-        HStack(spacing: 6) {
+        let isCopied = store.copiedToast && store.reportError == nil
+
+        return HStack(spacing: 6) {
             Button {
-                store.copyMarkdownReport()
+                store.copyMarkdownReport(period: store.selectedPeriod)
             } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: store.copiedToast ? "checkmark" : "doc.on.doc")
+                    Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
                         .font(.system(size: 10, weight: .semibold))
-                    Text(store.copiedToast ? "已复制日报" : "复制融合日报")
+                    Text(isCopied ? store.selectedPeriod.copiedReportToastTitle : store.selectedPeriod.copyReportButtonTitle)
                         .font(.system(size: 10.5, weight: .semibold))
                 }
-                .foregroundStyle(store.copiedToast ? liveEmerald : (colorScheme == .dark ? Color(hex: "#EDE9FE") : accentPurple))
+                .foregroundStyle(isCopied ? liveEmerald : (colorScheme == .dark ? Color(hex: "#EDE9FE") : accentPurple))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 .background(
-                    (store.copiedToast ? liveEmerald : accentPurple).opacity(0.18),
+                    (isCopied ? liveEmerald : accentPurple).opacity(0.18),
                     in: RoundedRectangle(cornerRadius: 7, style: .continuous)
                 )
             }
             .buttonStyle(.plain)
+            .pointingHandCursor()
 
             Text("成本按 API 价估算，非订阅实付")
                 .font(.system(size: 9))
@@ -636,6 +732,7 @@ struct DetailCardsView: View {
                     .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
             }
             .buttonStyle(.plain)
+            .pointingHandCursor()
 
             Button {
                 store.windowLayer = store.windowLayer.toggledPrimary()
@@ -648,6 +745,7 @@ struct DetailCardsView: View {
                     .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(cardBorder, lineWidth: 0.6))
             }
             .buttonStyle(.plain)
+            .pointingHandCursor()
             .help("当前：\(store.windowLayer.title)（点击切换桌面层 / 悬浮置顶）")
         }
     }
